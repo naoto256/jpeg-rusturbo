@@ -16,12 +16,13 @@
 //!      single `u32` per symbol. One load per symbol, no struct field
 //!      offsetting.
 //!
-//!   4. **NEON-assisted AC zero scan** (aarch64 only) — the AC RLE loop
-//!      walks 63 coefficients counting zero runs. With NEON we load 8
-//!      `i16` at a time, take `vmaxvq_u16(abs)`, and skip 8 coefficients
-//!      at once when the whole group is zero. Falls back to scalar inside
-//!      a non-zero group, and to fully-scalar on non-aarch64 / when
-//!      `force-scalar` is enabled.
+//!   4. **AC zero scan, 8 at a time** — the AC RLE loop walks 63
+//!      coefficients counting zero runs. We delegate the per-group
+//!      zero check to `crate::arch::backend::huffman::group_of_8_is_zero`,
+//!      which on aarch64 is a 1-load, 1-compare NEON op and on the
+//!      scalar backend is a tight loop that LLVM autovectorizes.
+//!      Either way we skip 8 coefficients at once whenever the group
+//!      is fully zero.
 //!
 //!   5. **Internal byte buffer** — the bit accumulator drains into a
 //!      `Vec<u8>` we own, and we only call the user's `Write` when
@@ -242,16 +243,14 @@ pub fn encode_block<W: io::Write>(
     let mut zero_run: u32 = 0;
     let mut k: usize = 1;
     while k <= last_nonzero {
-        // ---- Skip a zero group of 8 with NEON when possible. ----
-        // Only useful when we're aligned at the start of a zig-zag group
-        // of 8 AND there's at least 8 elements left to look at AND the
-        // current zero run wouldn't get into a ZRL situation.
-        #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+        // ---- Skip a zero group of 8 when possible. ----
+        // Useful when we're aligned at the start of a zig-zag group of
+        // 8 AND there's at least 8 elements left in the AC scan.
+        while k + 8 <= last_nonzero + 1
+            && crate::arch::backend::huffman::group_of_8_is_zero(block, k)
         {
-            while k + 8 <= last_nonzero + 1 && group_of_8_is_zero(block, k) {
-                zero_run += 8;
-                k += 8;
-            }
+            zero_run += 8;
+            k += 8;
         }
 
         let coef = block[k];
@@ -301,28 +300,6 @@ fn find_last_nonzero(block: &[i16; 64]) -> usize {
         }
     }
     0
-}
-
-/// NEON helper: is `block[k..k+8]` all zero?
-///
-/// Loads 8 i16 lanes, takes the unsigned max of their absolute values
-/// (signed-min-int isn't reachable here — quantized DCT outputs fit in
-/// `i16` range with margin), and asks whether that max is zero.
-/// Returns `false` (not all zero) on overflow corner cases too — that
-/// just falls through to the scalar path inside the group.
-#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
-#[inline(always)]
-fn group_of_8_is_zero(block: &[i16; 64], k: usize) -> bool {
-    use std::arch::aarch64::{vabsq_s16, vld1q_s16, vmaxvq_u16, vreinterpretq_u16_s16};
-    debug_assert!(k + 8 <= 64);
-    // SAFETY: `k + 8 <= 64`, `block` is contiguous, and the NEON intrinsics
-    // are unconditionally available on aarch64.
-    unsafe {
-        let v = vld1q_s16(block.as_ptr().add(k));
-        let abs = vabsq_s16(v);
-        let max = vmaxvq_u16(vreinterpretq_u16_s16(abs));
-        max == 0
-    }
 }
 
 /// JPEG "magnitude category" (Annex F.1.2):
