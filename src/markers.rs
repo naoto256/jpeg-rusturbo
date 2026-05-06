@@ -27,13 +27,13 @@ pub fn write_eoi<W: Write>(w: &mut W) -> io::Result<()> {
 /// payload with no thumbnail. (B.5)
 pub fn write_app0_jfif<W: Write>(w: &mut W) -> io::Result<()> {
     w.write_all(&[0xFF, 0xE0])?;
-    write_be_u16(w, 16)?;            // segment length (excludes marker, includes itself)
-    w.write_all(b"JFIF\0")?;          // identifier
-    w.write_all(&[1, 1])?;            // version 1.01
-    w.write_all(&[0])?;               // units = 0 (no aspect ratio)
-    write_be_u16(w, 1)?;             // X density
-    write_be_u16(w, 1)?;             // Y density
-    w.write_all(&[0, 0])?;            // X/Y thumbnail
+    write_be_u16(w, 16)?; // segment length (excludes marker, includes itself)
+    w.write_all(b"JFIF\0")?; // identifier
+    w.write_all(&[1, 1])?; // version 1.01
+    w.write_all(&[0])?; // units = 0 (no aspect ratio)
+    write_be_u16(w, 1)?; // X density
+    write_be_u16(w, 1)?; // Y density
+    w.write_all(&[0, 0])?; // X/Y thumbnail
     Ok(())
 }
 
@@ -42,8 +42,8 @@ pub fn write_app0_jfif<W: Write>(w: &mut W) -> io::Result<()> {
 /// emitted in zig-zag order. (B.2.4.1)
 pub fn write_dqt<W: Write>(w: &mut W, tq: u8, table: &[u8; 64]) -> io::Result<()> {
     w.write_all(&[0xFF, 0xDB])?;
-    write_be_u16(w, 67)?;            // length: 2 + 1 + 64
-    w.write_all(&[tq & 0x0F])?;       // precision (0 = 8-bit) | dest id
+    write_be_u16(w, 67)?; // length: 2 + 1 + 64
+    w.write_all(&[tq & 0x0F])?; // precision (0 = 8-bit) | dest id
     for &k in &ZIGZAG {
         w.write_all(&[table[k]])?;
     }
@@ -63,8 +63,8 @@ pub fn write_sof0<W: Write>(
 ) -> io::Result<()> {
     w.write_all(&[0xFF, 0xC0])?;
     let n = components.len() as u16;
-    write_be_u16(w, 8 + 3 * n)?;     // length
-    w.write_all(&[8])?;               // sample precision (8-bit)
+    write_be_u16(w, 8 + 3 * n)?; // length
+    w.write_all(&[8])?; // sample precision (8-bit)
     write_be_u16(w, height)?;
     write_be_u16(w, width)?;
     w.write_all(&[n as u8])?;
@@ -76,12 +76,7 @@ pub fn write_sof0<W: Write>(
 
 /// DHT — Define Huffman Table. Writes one table (DC or AC) at class
 /// `tc` (0 = DC, 1 = AC), destination `th`. (B.2.4.2)
-pub fn write_dht<W: Write>(
-    w: &mut W,
-    tc: u8,
-    th: u8,
-    table: &StdHuffman,
-) -> io::Result<()> {
+pub fn write_dht<W: Write>(w: &mut W, tc: u8, th: u8, table: &StdHuffman) -> io::Result<()> {
     let n_values = table.values.len() as u16;
     w.write_all(&[0xFF, 0xC4])?;
     write_be_u16(w, 2 + 1 + 16 + n_values)?;
@@ -96,10 +91,7 @@ pub fn write_dht<W: Write>(
 /// interleaved scan over all components (baseline sequential).
 ///
 /// `components` items: (component id, dc_tab_id, ac_tab_id).
-pub fn write_sos<W: Write>(
-    w: &mut W,
-    components: &[(u8, u8, u8)],
-) -> io::Result<()> {
+pub fn write_sos<W: Write>(w: &mut W, components: &[(u8, u8, u8)]) -> io::Result<()> {
     w.write_all(&[0xFF, 0xDA])?;
     let n = components.len() as u16;
     write_be_u16(w, 6 + 2 * n)?;

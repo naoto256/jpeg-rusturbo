@@ -111,7 +111,20 @@ impl<W: Write> JpegEncoder<W> {
                 "image dimensions must be non-zero",
             ));
         }
-        let needed = (width as usize) * (height as usize) * layout.bpp;
+        // `width * height * bpp` must fit in `usize`. On 64-bit hosts
+        // `u32 * u32 ≤ u64::MAX` so the check is mostly belt-and-braces;
+        // on 32-bit (e.g. wasm32) it's load-bearing — without it a wrapped
+        // small `needed` could allow oversized inputs through and OOB the
+        // pixel buffer downstream.
+        let needed = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(layout.bpp))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "image dimensions overflow usize (width * height * bpp)",
+                )
+            })?;
         if pixels.len() < needed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -178,18 +191,36 @@ impl<W: Write> JpegEncoder<W> {
         let mut bw = BitWriter::new(&mut self.out);
         // Crude upper bound: ~1 byte per pixel for q=80 typical content;
         // the bitwriter resizes as needed but starting close avoids the
-        // first few reallocations on large frames.
-        bw.reserve((width as usize) * (height as usize));
+        // first few reallocations on large frames. Reuse `needed` so we
+        // benefit from the same overflow check as the input validation
+        // above.
+        bw.reserve(needed);
         match self.subsampling {
             ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
-                pixels, width, height, layout,
-                &mut bw, &div_luma, &div_chroma,
-                &dc_luma, &ac_luma, &dc_chroma, &ac_chroma,
+                pixels,
+                width,
+                height,
+                layout,
+                &mut bw,
+                &div_luma,
+                &div_chroma,
+                &dc_luma,
+                &ac_luma,
+                &dc_chroma,
+                &ac_chroma,
             )?,
             ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
-                pixels, width, height, layout,
-                &mut bw, &div_luma, &div_chroma,
-                &dc_luma, &ac_luma, &dc_chroma, &ac_chroma,
+                pixels,
+                width,
+                height,
+                layout,
+                &mut bw,
+                &div_luma,
+                &div_chroma,
+                &dc_luma,
+                &ac_luma,
+                &dc_chroma,
+                &ac_chroma,
             )?,
         }
         bw.flush_to_byte_boundary()?;
@@ -198,7 +229,6 @@ impl<W: Write> JpegEncoder<W> {
         markers::write_eoi(&mut self.out)?;
         Ok(())
     }
-
 }
 
 /// Per-MCU running DC predictor for the three components. Difference-coded
@@ -269,13 +299,33 @@ impl SamplingScheme for Yuv444Scheme {
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
         color::extract_block_ycbcr(
-            pixels, width, height, layout,
-            mx * Self::MCU_W, my * Self::MCU_H,
-            &mut y_blk, &mut cb_blk, &mut cr_blk,
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blk,
+            &mut cb_blk,
+            &mut cr_blk,
         );
         prev_dc.y = encode_one_block(bw, &mut y_blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
-        prev_dc.cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc.cb, dc_chroma, ac_chroma)?;
-        prev_dc.cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc.cr, dc_chroma, ac_chroma)?;
+        prev_dc.cb = encode_one_block(
+            bw,
+            &mut cb_blk,
+            div_chroma,
+            prev_dc.cb,
+            dc_chroma,
+            ac_chroma,
+        )?;
+        prev_dc.cr = encode_one_block(
+            bw,
+            &mut cr_blk,
+            div_chroma,
+            prev_dc.cr,
+            dc_chroma,
+            ac_chroma,
+        )?;
         Ok(())
     }
 }
@@ -306,15 +356,35 @@ impl SamplingScheme for Yuv420Scheme {
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
         color::extract_mcu_420(
-            pixels, width, height, layout,
-            mx * Self::MCU_W, my * Self::MCU_H,
-            &mut y_blocks, &mut cb_blk, &mut cr_blk,
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
         );
         for blk in y_blocks.iter_mut() {
             prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
         }
-        prev_dc.cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc.cb, dc_chroma, ac_chroma)?;
-        prev_dc.cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc.cr, dc_chroma, ac_chroma)?;
+        prev_dc.cb = encode_one_block(
+            bw,
+            &mut cb_blk,
+            div_chroma,
+            prev_dc.cb,
+            dc_chroma,
+            ac_chroma,
+        )?;
+        prev_dc.cr = encode_one_block(
+            bw,
+            &mut cr_blk,
+            div_chroma,
+            prev_dc.cr,
+            dc_chroma,
+            ac_chroma,
+        )?;
         Ok(())
     }
 }
@@ -339,10 +409,20 @@ fn encode_scan<S: SamplingScheme, W: Write>(
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
             S::encode_one_mcu(
-                bw, pixels, width, height, layout, mx, my,
+                bw,
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
                 &mut prev_dc,
-                div_luma, div_chroma,
-                dc_luma, ac_luma, dc_chroma, ac_chroma,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
             )?;
         }
     }

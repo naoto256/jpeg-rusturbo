@@ -38,26 +38,26 @@ pub mod color {
     // F_0_337 = F_0_587 - F_0_250 = 38470 - 16384 = 22086.
     // PW_F0299_F0337 — Y: pair (R, G) with [F_0_299, F_0_337].
     static PW_F0299_F0337: Aligned<[i16; 16]> = Aligned([
-        19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086,
-        19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086,
+        19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086, 19595,
+        22086, 19595, 22086,
     ]);
 
     // PW_F0114_F0250 — Y: pair (B, G) with [F_0_114, F_0_250].
     static PW_F0114_F0250: Aligned<[i16; 16]> = Aligned([
-        7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384,
-        7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384,
+        7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384,
+        7471, 16384,
     ]);
 
     // PW_MF016_MF033 — Cb: pair (R, G) with [-F_0_168, -F_0_331].
     static PW_MF016_MF033: Aligned<[i16; 16]> = Aligned([
-        -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709,
-        -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709,
+        -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709, -11059,
+        -21709, -11059, -21709, -11059, -21709,
     ]);
 
     // PW_MF008_MF041 — Cr: pair (B, G) with [-F_0_081, -F_0_418].
     static PW_MF008_MF041: Aligned<[i16; 16]> = Aligned([
-        -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439,
-        -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439,
+        -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439,
+        -5329, -27439, -5329, -27439,
     ]);
 
     // PD_ONEHALF — Y rounding bias = 1 << 15.
@@ -108,6 +108,9 @@ pub mod color {
         }
     }
 
+    /// # Safety
+    /// AVX2 must be available (the runtime gate in
+    /// `h2v2_downsample` checks). `src` / `dst` are fixed-size refs.
     #[target_feature(enable = "avx2")]
     unsafe fn h2v2_avx2(src: &[u8; 256], dst: &mut [i16; 64]) {
         unsafe {
@@ -126,8 +129,7 @@ pub mod color {
             for j in 0..4 {
                 let row_off = j * 4 * 16;
                 let r01 = _mm256_loadu_si256(src.as_ptr().add(row_off) as *const __m256i);
-                let r23 =
-                    _mm256_loadu_si256(src.as_ptr().add(row_off + 32) as *const __m256i);
+                let r23 = _mm256_loadu_si256(src.as_ptr().add(row_off + 32) as *const __m256i);
 
                 // Pairwise horizontal byte sums per 128-bit lane:
                 //   s01 = [pair sums of input row 4j+0, pair sums of 4j+1] (each 8 i16)
@@ -144,20 +146,14 @@ pub mod color {
                 let hi_halves = _mm256_permute2x128_si256::<0x31>(s01, s23);
 
                 // Vertical sum + bias = 2x2 box sums.
-                let sums = _mm256_add_epi16(
-                    _mm256_add_epi16(lo_halves, hi_halves),
-                    bias,
-                );
+                let sums = _mm256_add_epi16(_mm256_add_epi16(lo_halves, hi_halves), bias);
                 // /4 (avg).
                 let avg = _mm256_srli_epi16::<2>(sums);
                 // Level-shift to centered i16 range.
                 let signed = _mm256_sub_epi16(avg, level_shift);
 
                 // Store 16 i16 = 32 bytes = 2 output rows.
-                _mm256_storeu_si256(
-                    dst.as_mut_ptr().add(j * 16) as *mut __m256i,
-                    signed,
-                );
+                _mm256_storeu_si256(dst.as_mut_ptr().add(j * 16) as *mut __m256i, signed);
             }
             _mm256_zeroupper();
         }
@@ -170,15 +166,17 @@ pub mod color {
     /// 4-byte groups within each 128-bit lane, then vpermd across both
     /// ymm to produce 16 contiguous bytes per channel in lo 128, then
     /// vpmovzxbw to widen to 16 u16 lanes.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled. Relies on inlining into a
+    /// `#[target_feature(enable = "avx2")]` function. Inputs are
+    /// by-value vector lanes; no memory access.
     #[inline(always)]
-    unsafe fn deinterleave_rgba16(
-        p0: __m256i,
-        p1: __m256i,
-    ) -> (__m256i, __m256i, __m256i) {
+    unsafe fn deinterleave_rgba16(p0: __m256i, p1: __m256i) -> (__m256i, __m256i, __m256i) {
         // mask: per 128-bit lane, place RRRRGGGGBBBBAAAA at byte 0..15.
         let shuf = _mm256_setr_epi8(
-            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
-            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6,
+            10, 14, 3, 7, 11, 15,
         );
         // After vpshufb (per-lane):
         //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
@@ -226,6 +224,9 @@ pub mod color {
     /// the residual term — for Y this is the `(B, G) madd` partial; for
     /// Cb/Cr it's `0.5 * B` (resp. `0.5 * R`) computed via the
     /// `vpunpcklwd(0, X) >> 1` trick.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled. By-value vector inputs only.
     #[inline(always)]
     unsafe fn finalize_component(
         rg_or_bg_lo: __m256i,
@@ -251,6 +252,10 @@ pub mod color {
     }
 
     /// Pack 16 u16 (in one ymm) → 16 u8 in low 128 bits, then store.
+    ///
+    /// # Safety
+    /// - Caller must have AVX2 enabled.
+    /// - `out` must be writable for at least 16 bytes.
     #[inline(always)]
     unsafe fn pack_and_store_u16x16(v: __m256i, out: *mut u8) {
         let lo = _mm256_castsi256_si128(v);
@@ -259,6 +264,11 @@ pub mod color {
         _mm_storeu_si128(out as *mut __m128i, packed);
     }
 
+    /// # Safety
+    /// - AVX2 must be available (the runtime gate in `rgb_row_to_ycc`
+    ///   checks; `target_feature` enforces the compile-time half).
+    /// - `pixels` must be readable for at least 64 bytes (16 RGBA pixels).
+    /// - `y`, `cb`, `cr` must each be writable for at least 16 bytes.
     #[target_feature(enable = "avx2")]
     unsafe fn rgba16_avx2(pixels: *const u8, y: *mut u8, cb: *mut u8, cr: *mut u8) {
         unsafe {
@@ -301,12 +311,10 @@ pub mod color {
             let y_u16 = finalize_component(rg_lo, rg_hi, c_y_rg, y_extra_lo, y_extra_hi, bias_y);
 
             // Cb: madd(R,G; -F_0_168, -F_0_331) + 0.5*B + bias
-            let cb_u16 =
-                finalize_component(rg_lo, rg_hi, c_cb_rg, half_b_lo, half_b_hi, bias_cbcr);
+            let cb_u16 = finalize_component(rg_lo, rg_hi, c_cb_rg, half_b_lo, half_b_hi, bias_cbcr);
 
             // Cr: madd(B,G; -F_0_081, -F_0_418) + 0.5*R + bias
-            let cr_u16 =
-                finalize_component(bg_lo, bg_hi, c_cr_bg, half_r_lo, half_r_hi, bias_cbcr);
+            let cr_u16 = finalize_component(bg_lo, bg_hi, c_cr_bg, half_r_lo, half_r_hi, bias_cbcr);
 
             pack_and_store_u16x16(y_u16, y);
             pack_and_store_u16x16(cb_u16, cb);
@@ -339,6 +347,9 @@ pub mod quant {
         }
     }
 
+    /// # Safety
+    /// AVX2 must be available (the runtime gate in `quantize_natural`
+    /// checks). All inputs are fixed-size references.
     #[target_feature(enable = "avx2")]
     unsafe fn quantize_avx2(block: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) {
         unsafe {
@@ -386,32 +397,32 @@ pub mod dct {
     //   times 4 dw (F_0_541 + F_0_765),  F_0_541
     //   times 4 dw (F_0_541 - F_1_847),  F_0_541
     static PW_F130_F054_MF130_F054: Aligned16<[i16; 16]> = Aligned16([
-        10703, 4433, 10703, 4433, 10703, 4433, 10703, 4433,
-        -10704, 4433, -10704, 4433, -10704, 4433, -10704, 4433,
+        10703, 4433, 10703, 4433, 10703, 4433, 10703, 4433, -10704, 4433, -10704, 4433, -10704,
+        4433, -10704, 4433,
     ]);
 
     // PW_MF078_F117_F078_F117:
     //   times 4 dw (F_1_175 - F_1_961),  F_1_175
     //   times 4 dw (F_1_175 - F_0_390),  F_1_175
     static PW_MF078_F117_F078_F117: Aligned16<[i16; 16]> = Aligned16([
-        -6436, 9633, -6436, 9633, -6436, 9633, -6436, 9633,
-        6437, 9633, 6437, 9633, 6437, 9633, 6437, 9633,
+        -6436, 9633, -6436, 9633, -6436, 9633, -6436, 9633, 6437, 9633, 6437, 9633, 6437, 9633,
+        6437, 9633,
     ]);
 
     // PW_MF060_MF089_MF050_MF256:
     //   times 4 dw (F_0_298 - F_0_899), -F_0_899
     //   times 4 dw (F_2_053 - F_2_562), -F_2_562
     static PW_MF060_MF089_MF050_MF256: Aligned16<[i16; 16]> = Aligned16([
-        -4927, -7373, -4927, -7373, -4927, -7373, -4927, -7373,
-        -4176, -20995, -4176, -20995, -4176, -20995, -4176, -20995,
+        -4927, -7373, -4927, -7373, -4927, -7373, -4927, -7373, -4176, -20995, -4176, -20995,
+        -4176, -20995, -4176, -20995,
     ]);
 
     // PW_F050_MF256_F060_MF089:
     //   times 4 dw (F_3_072 - F_2_562), -F_2_562
     //   times 4 dw (F_1_501 - F_0_899), -F_0_899
     static PW_F050_MF256_F060_MF089: Aligned16<[i16; 16]> = Aligned16([
-        4177, -20995, 4177, -20995, 4177, -20995, 4177, -20995,
-        4926, -7373, 4926, -7373, 4926, -7373, 4926, -7373,
+        4177, -20995, 4177, -20995, 4177, -20995, 4177, -20995, 4926, -7373, 4926, -7373, 4926,
+        -7373, 4926, -7373,
     ]);
 
     // PD_DESCALE_P1 = 8 × (1 << (DESCALE_P1 - 1)) = 8 × 1024
@@ -426,10 +437,8 @@ pub mod dct {
     // PW_1_NEG1: 8×1 then 8×-1 — used as the second operand of vpsignw
     // to flip the sign of the high 128 bits while leaving the low 128
     // alone (encoding "tmp10_neg11" packed swap).
-    static PW_1_NEG1: Aligned16<[i16; 16]> = Aligned16([
-        1, 1, 1, 1, 1, 1, 1, 1,
-        -1, -1, -1, -1, -1, -1, -1, -1,
-    ]);
+    static PW_1_NEG1: Aligned16<[i16; 16]> =
+        Aligned16([1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1]);
 
     /// 8x8 forward integer DCT (LL&M "islow"), in-place. Bit-exact
     /// equivalent to `arch::scalar::dct::fdct_islow`.
@@ -441,6 +450,9 @@ pub mod dct {
         }
     }
 
+    /// # Safety
+    /// - Caller must have AVX2 enabled (relies on inlining).
+    /// - `p` must point to at least 32 readable bytes.
     #[inline(always)]
     unsafe fn load(p: *const i16) -> __m256i {
         _mm256_loadu_si256(p as *const __m256i)
@@ -450,9 +462,11 @@ pub mod dct {
     /// 4 input ymm each holding two rows packed (low/high 128 bits) →
     /// 4 output ymm where each holds two columns packed.
     ///
+    /// # Safety
     /// Caller must have AVX2 enabled (we rely on inlining into a
     /// `#[target_feature(enable = "avx2")]` function to satisfy the
-    /// instruction-availability requirement).
+    /// instruction-availability requirement). By-value vector inputs
+    /// only.
     #[inline(always)]
     unsafe fn dotranspose(
         m1: __m256i,
@@ -489,8 +503,11 @@ pub mod dct {
     /// DESCALE_P2=15) and the small "PASS1_BITS round + shift" that is
     /// only present in pass 2.
     ///
-    /// Returns `(data0_4, data3_1, data2_6, data7_5)`. Caller must
-    /// have AVX2 enabled (relies on inlining; see `dotranspose`).
+    /// Returns `(data0_4, data3_1, data2_6, data7_5)`.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled (relies on inlining; see
+    /// `dotranspose`). By-value vector inputs only.
     #[inline(always)]
     unsafe fn dodct<const PASS: i32>(
         m1: __m256i,
@@ -624,6 +641,9 @@ pub mod dct {
         }
     }
 
+    /// # Safety
+    /// AVX2 must be available (the runtime gate in `fdct_islow`
+    /// checks). `data` is a fixed-size mut reference.
     #[target_feature(enable = "avx2")]
     unsafe fn fdct_avx2(data: &mut [i16; 64]) {
         unsafe {
@@ -705,10 +725,14 @@ mod tests {
     }
 
     fn random_block(seed: u64) -> [i16; 64] {
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let mut b = [0i16; 64];
         for v in &mut b {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((s >> 33) as i32 % 256 - 128) as i16;
         }
         b
@@ -852,9 +876,7 @@ mod tests {
         let mut y_s = [0u8; 16];
         let mut cb_s = [0u8; 16];
         let mut cr_s = [0u8; 16];
-        scalar::color::rgb_row_to_ycc(
-            &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
-        );
+        scalar::color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s);
 
         let mut y_a = [0u8; 16];
         let mut cb_a = [0u8; 16];
@@ -873,11 +895,11 @@ mod tests {
         }
         use crate::color::RGBA;
         let panels: [[u8; 4]; 5] = [
-            [0, 0, 0, 255],     // black
+            [0, 0, 0, 255],       // black
             [255, 255, 255, 255], // white
-            [255, 0, 0, 255],   // red
-            [0, 255, 0, 255],   // green
-            [0, 0, 255, 255],   // blue
+            [255, 0, 0, 255],     // red
+            [0, 255, 0, 255],     // green
+            [0, 0, 255, 255],     // blue
         ];
         for color in &panels {
             let mut pixels = [0u8; 16 * 4];
@@ -887,9 +909,7 @@ mod tests {
             let mut y_s = [0u8; 16];
             let mut cb_s = [0u8; 16];
             let mut cr_s = [0u8; 16];
-            scalar::color::rgb_row_to_ycc(
-                &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
-            );
+            scalar::color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s);
             let mut y_a = [0u8; 16];
             let mut cb_a = [0u8; 16];
             let mut cr_a = [0u8; 16];
@@ -911,7 +931,9 @@ mod tests {
         for _ in 0..30 {
             let mut pixels = [0u8; 16 * 4];
             for i in 0..16 {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 pixels[i * 4] = (state >> 24) as u8;
                 pixels[i * 4 + 1] = (state >> 32) as u8;
                 pixels[i * 4 + 2] = (state >> 40) as u8;
@@ -920,9 +942,7 @@ mod tests {
             let mut y_s = [0u8; 16];
             let mut cb_s = [0u8; 16];
             let mut cr_s = [0u8; 16];
-            scalar::color::rgb_row_to_ycc(
-                &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
-            );
+            scalar::color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s);
             let mut y_a = [0u8; 16];
             let mut cb_a = [0u8; 16];
             let mut cr_a = [0u8; 16];

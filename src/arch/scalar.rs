@@ -131,8 +131,7 @@ pub mod dct {
             data[off + 4] = ((tmp10 - tmp11) << PASS1_BITS) as i16;
 
             let z1 = (tmp12 + tmp13) * FIX_0_541_196_100;
-            data[off + 2] =
-                descale(z1 + tmp13 * FIX_0_765_366_865, CONST_BITS - PASS1_BITS) as i16;
+            data[off + 2] = descale(z1 + tmp13 * FIX_0_765_366_865, CONST_BITS - PASS1_BITS) as i16;
             data[off + 6] =
                 descale(z1 + tmp12 * (-FIX_1_847_759_065), CONST_BITS - PASS1_BITS) as i16;
 
@@ -282,7 +281,7 @@ pub mod huffman {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::{RGBA, RGB};
+    use crate::color::{RGB, RGBA};
 
     #[test]
     fn black_pixel_yields_zero_y() {

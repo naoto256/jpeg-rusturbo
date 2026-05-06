@@ -61,6 +61,10 @@ pub mod color {
         }
     }
 
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON is available, so this
+    /// function is only "unsafe" in the syntactic `target_feature`
+    /// sense. All inputs are by-value vector lanes; no memory access.
     #[target_feature(enable = "neon")]
     unsafe fn rgb16_to_ycc(
         consts: uint16x8_t,
@@ -105,6 +109,11 @@ pub mod color {
         (y_u16, cb_u16, cr_u16)
     }
 
+    /// # Safety
+    /// - `inptr` must be readable for at least `16 * bpp` bytes.
+    /// - `outy`, `outcb`, `outcr` must each be writable for at least 16 bytes.
+    /// - `bpp` must be 3 or 4.
+    /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
     unsafe fn rgb_row_16_inner(
         inptr: *const u8,
@@ -112,29 +121,36 @@ pub mod color {
         outy: *mut u8,
         outcb: *mut u8,
         outcr: *mut u8,
-    ) { unsafe {
-        let consts = vld1q_u16(CONSTS.as_ptr());
-        let bias = vdupq_n_u32(CHROMA_BIAS);
-        let (r, g, b) = if bpp == 4 {
-            let p = vld4q_u8(inptr);
-            (p.0, p.1, p.2)
-        } else {
-            let p = vld3q_u8(inptr);
-            (p.0, p.1, p.2)
-        };
-        let r_l = vmovl_u8(vget_low_u8(r));
-        let g_l = vmovl_u8(vget_low_u8(g));
-        let b_l = vmovl_u8(vget_low_u8(b));
-        let r_h = vmovl_u8(vget_high_u8(r));
-        let g_h = vmovl_u8(vget_high_u8(g));
-        let b_h = vmovl_u8(vget_high_u8(b));
-        let (y_l, cb_l, cr_l) = rgb16_to_ycc(consts, bias, r_l, g_l, b_l);
-        let (y_h, cb_h, cr_h) = rgb16_to_ycc(consts, bias, r_h, g_h, b_h);
-        vst1q_u8(outy, vcombine_u8(vmovn_u16(y_l), vmovn_u16(y_h)));
-        vst1q_u8(outcb, vcombine_u8(vmovn_u16(cb_l), vmovn_u16(cb_h)));
-        vst1q_u8(outcr, vcombine_u8(vmovn_u16(cr_l), vmovn_u16(cr_h)));
-    }}
+    ) {
+        unsafe {
+            let consts = vld1q_u16(CONSTS.as_ptr());
+            let bias = vdupq_n_u32(CHROMA_BIAS);
+            let (r, g, b) = if bpp == 4 {
+                let p = vld4q_u8(inptr);
+                (p.0, p.1, p.2)
+            } else {
+                let p = vld3q_u8(inptr);
+                (p.0, p.1, p.2)
+            };
+            let r_l = vmovl_u8(vget_low_u8(r));
+            let g_l = vmovl_u8(vget_low_u8(g));
+            let b_l = vmovl_u8(vget_low_u8(b));
+            let r_h = vmovl_u8(vget_high_u8(r));
+            let g_h = vmovl_u8(vget_high_u8(g));
+            let b_h = vmovl_u8(vget_high_u8(b));
+            let (y_l, cb_l, cr_l) = rgb16_to_ycc(consts, bias, r_l, g_l, b_l);
+            let (y_h, cb_h, cr_h) = rgb16_to_ycc(consts, bias, r_h, g_h, b_h);
+            vst1q_u8(outy, vcombine_u8(vmovn_u16(y_l), vmovn_u16(y_h)));
+            vst1q_u8(outcb, vcombine_u8(vmovn_u16(cb_l), vmovn_u16(cb_h)));
+            vst1q_u8(outcr, vcombine_u8(vmovn_u16(cr_l), vmovn_u16(cr_h)));
+        }
+    }
 
+    /// # Safety
+    /// - `inptr` must be readable for at least `8 * bpp` bytes.
+    /// - `outy`, `outcb`, `outcr` must each be writable for at least 8 bytes.
+    /// - `bpp` must be 3 or 4.
+    /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
     unsafe fn rgb_row_8_inner(
         inptr: *const u8,
@@ -142,24 +158,26 @@ pub mod color {
         outy: *mut u8,
         outcb: *mut u8,
         outcr: *mut u8,
-    ) { unsafe {
-        let consts = vld1q_u16(CONSTS.as_ptr());
-        let bias = vdupq_n_u32(CHROMA_BIAS);
-        let (r, g, b) = if bpp == 4 {
-            let p = vld4_u8(inptr);
-            (p.0, p.1, p.2)
-        } else {
-            let p = vld3_u8(inptr);
-            (p.0, p.1, p.2)
-        };
-        let r = vmovl_u8(r);
-        let g = vmovl_u8(g);
-        let b = vmovl_u8(b);
-        let (y, cb, cr) = rgb16_to_ycc(consts, bias, r, g, b);
-        vst1_u8(outy, vmovn_u16(y));
-        vst1_u8(outcb, vmovn_u16(cb));
-        vst1_u8(outcr, vmovn_u16(cr));
-    }}
+    ) {
+        unsafe {
+            let consts = vld1q_u16(CONSTS.as_ptr());
+            let bias = vdupq_n_u32(CHROMA_BIAS);
+            let (r, g, b) = if bpp == 4 {
+                let p = vld4_u8(inptr);
+                (p.0, p.1, p.2)
+            } else {
+                let p = vld3_u8(inptr);
+                (p.0, p.1, p.2)
+            };
+            let r = vmovl_u8(r);
+            let g = vmovl_u8(g);
+            let b = vmovl_u8(b);
+            let (y, cb, cr) = rgb16_to_ycc(consts, bias, r, g, b);
+            vst1_u8(outy, vmovn_u16(y));
+            vst1_u8(outcb, vmovn_u16(cb));
+            vst1_u8(outcr, vmovn_u16(cr));
+        }
+    }
 
     /// 16x16 → 8x8 box-average chroma downsample with libjpeg's biased
     /// rounding (alternating +1 / +2 across output columns).
@@ -167,25 +185,31 @@ pub mod color {
         unsafe { h2v2_inner(src, dst) }
     }
 
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON is available. `src` /
+    /// `dst` are fixed-size references — no caller-side invariants
+    /// beyond the standard reference rules.
     #[target_feature(enable = "neon")]
-    unsafe fn h2v2_inner(src: &[u8; 256], dst: &mut [i16; 64]) { unsafe {
-        // Row 0 bias { 1, 0, 1, 0, ... } and row 1 bias { 0, 2, 0, 2, ... }
-        // combined into one row pair = { 1, 2, 1, 2, ... } over 16-bit lanes.
-        let bias = vreinterpretq_u16_u32(vdupq_n_u32(0x0002_0001));
-        let level_shift = vdupq_n_s16(128);
-        for j in 0..8 {
-            let row0_off = j * 2 * 16;
-            let row1_off = row0_off + 16;
-            let r0 = vld1q_u8(src.as_ptr().add(row0_off));
-            let r1 = vld1q_u8(src.as_ptr().add(row1_off));
-            let sums = vpadalq_u8(bias, r0);
-            let sums = vpadalq_u8(sums, r1);
-            let avg_u8 = vshrn_n_u16::<2>(sums);
-            let avg_u16 = vmovl_u8(avg_u8);
-            let signed = vsubq_s16(vreinterpretq_s16_u16(avg_u16), level_shift);
-            vst1q_s16(dst.as_mut_ptr().add(j * 8), signed);
+    unsafe fn h2v2_inner(src: &[u8; 256], dst: &mut [i16; 64]) {
+        unsafe {
+            // Row 0 bias { 1, 0, 1, 0, ... } and row 1 bias { 0, 2, 0, 2, ... }
+            // combined into one row pair = { 1, 2, 1, 2, ... } over 16-bit lanes.
+            let bias = vreinterpretq_u16_u32(vdupq_n_u32(0x0002_0001));
+            let level_shift = vdupq_n_s16(128);
+            for j in 0..8 {
+                let row0_off = j * 2 * 16;
+                let row1_off = row0_off + 16;
+                let r0 = vld1q_u8(src.as_ptr().add(row0_off));
+                let r1 = vld1q_u8(src.as_ptr().add(row1_off));
+                let sums = vpadalq_u8(bias, r0);
+                let sums = vpadalq_u8(sums, r1);
+                let avg_u8 = vshrn_n_u16::<2>(sums);
+                let avg_u16 = vmovl_u8(avg_u8);
+                let signed = vsubq_s16(vreinterpretq_s16_u16(avg_u16), level_shift);
+                vst1q_s16(dst.as_mut_ptr().add(j * 8), signed);
+            }
         }
-    }}
+    }
 }
 
 // ===========================================================================
@@ -213,287 +237,291 @@ pub mod dct {
         unsafe { fdct_islow_inner(data) }
     }
 
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. `data` is a
+    /// fixed-size mut reference; no caller-side invariants beyond
+    /// the standard reference rules.
     #[target_feature(enable = "neon")]
     unsafe fn fdct_islow_inner(data: &mut [i16; 64]) {
         unsafe {
-        let consts1 = vld1_s16(CONSTS.as_ptr());
-        let consts2 = vld1_s16(CONSTS.as_ptr().add(4));
-        let consts3 = vld1_s16(CONSTS.as_ptr().add(8));
+            let consts1 = vld1_s16(CONSTS.as_ptr());
+            let consts2 = vld1_s16(CONSTS.as_ptr().add(4));
+            let consts3 = vld1_s16(CONSTS.as_ptr().add(8));
 
-        // Load 8 rows, then transpose so each register holds one column.
-        let s_rows_0123 = vld4q_s16(data.as_ptr());
-        let s_rows_4567 = vld4q_s16(data.as_ptr().add(4 * 8));
+            // Load 8 rows, then transpose so each register holds one column.
+            let s_rows_0123 = vld4q_s16(data.as_ptr());
+            let s_rows_4567 = vld4q_s16(data.as_ptr().add(4 * 8));
 
-        let cols_04 = vuzpq_s16(s_rows_0123.0, s_rows_4567.0);
-        let cols_15 = vuzpq_s16(s_rows_0123.1, s_rows_4567.1);
-        let cols_26 = vuzpq_s16(s_rows_0123.2, s_rows_4567.2);
-        let cols_37 = vuzpq_s16(s_rows_0123.3, s_rows_4567.3);
+            let cols_04 = vuzpq_s16(s_rows_0123.0, s_rows_4567.0);
+            let cols_15 = vuzpq_s16(s_rows_0123.1, s_rows_4567.1);
+            let cols_26 = vuzpq_s16(s_rows_0123.2, s_rows_4567.2);
+            let cols_37 = vuzpq_s16(s_rows_0123.3, s_rows_4567.3);
 
-        let mut col0 = cols_04.0;
-        let mut col1 = cols_15.0;
-        let mut col2 = cols_26.0;
-        let mut col3 = cols_37.0;
-        let mut col4 = cols_04.1;
-        let mut col5 = cols_15.1;
-        let mut col6 = cols_26.1;
-        let mut col7 = cols_37.1;
+            let mut col0 = cols_04.0;
+            let mut col1 = cols_15.0;
+            let mut col2 = cols_26.0;
+            let mut col3 = cols_37.0;
+            let mut col4 = cols_04.1;
+            let mut col5 = cols_15.1;
+            let mut col6 = cols_26.1;
+            let mut col7 = cols_37.1;
 
-        // -------- Pass 1: rows (registers currently hold columns). --------
-        let tmp0 = vaddq_s16(col0, col7);
-        let tmp7 = vsubq_s16(col0, col7);
-        let tmp1 = vaddq_s16(col1, col6);
-        let tmp6 = vsubq_s16(col1, col6);
-        let tmp2 = vaddq_s16(col2, col5);
-        let tmp5 = vsubq_s16(col2, col5);
-        let tmp3 = vaddq_s16(col3, col4);
-        let tmp4 = vsubq_s16(col3, col4);
+            // -------- Pass 1: rows (registers currently hold columns). --------
+            let tmp0 = vaddq_s16(col0, col7);
+            let tmp7 = vsubq_s16(col0, col7);
+            let tmp1 = vaddq_s16(col1, col6);
+            let tmp6 = vsubq_s16(col1, col6);
+            let tmp2 = vaddq_s16(col2, col5);
+            let tmp5 = vsubq_s16(col2, col5);
+            let tmp3 = vaddq_s16(col3, col4);
+            let tmp4 = vsubq_s16(col3, col4);
 
-        let tmp10 = vaddq_s16(tmp0, tmp3);
-        let tmp13 = vsubq_s16(tmp0, tmp3);
-        let tmp11 = vaddq_s16(tmp1, tmp2);
-        let tmp12 = vsubq_s16(tmp1, tmp2);
+            let tmp10 = vaddq_s16(tmp0, tmp3);
+            let tmp13 = vsubq_s16(tmp0, tmp3);
+            let tmp11 = vaddq_s16(tmp1, tmp2);
+            let tmp12 = vsubq_s16(tmp1, tmp2);
 
-        col0 = vshlq_n_s16(vaddq_s16(tmp10, tmp11), PASS1_BITS as _);
-        col4 = vshlq_n_s16(vsubq_s16(tmp10, tmp11), PASS1_BITS as _);
+            col0 = vshlq_n_s16(vaddq_s16(tmp10, tmp11), PASS1_BITS as _);
+            col4 = vshlq_n_s16(vsubq_s16(tmp10, tmp11), PASS1_BITS as _);
 
-        let tmp12_add_tmp13 = vaddq_s16(tmp12, tmp13);
-        let z1_l = vmull_lane_s16::<2>(vget_low_s16(tmp12_add_tmp13), consts1);
-        let z1_h = vmull_lane_s16::<2>(vget_high_s16(tmp12_add_tmp13), consts1);
+            let tmp12_add_tmp13 = vaddq_s16(tmp12, tmp13);
+            let z1_l = vmull_lane_s16::<2>(vget_low_s16(tmp12_add_tmp13), consts1);
+            let z1_h = vmull_lane_s16::<2>(vget_high_s16(tmp12_add_tmp13), consts1);
 
-        let col2_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp13), consts1);
-        let col2_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp13), consts1);
-        col2 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(col2_l),
-            vrshrn_n_s32::<DESCALE_P1>(col2_h),
-        );
+            let col2_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp13), consts1);
+            let col2_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp13), consts1);
+            col2 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(col2_l),
+                vrshrn_n_s32::<DESCALE_P1>(col2_h),
+            );
 
-        let col6_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp12), consts2);
-        let col6_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp12), consts2);
-        col6 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(col6_l),
-            vrshrn_n_s32::<DESCALE_P1>(col6_h),
-        );
+            let col6_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp12), consts2);
+            let col6_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp12), consts2);
+            col6 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(col6_l),
+                vrshrn_n_s32::<DESCALE_P1>(col6_h),
+            );
 
-        // Odd part.
-        let z1 = vaddq_s16(tmp4, tmp7);
-        let z2 = vaddq_s16(tmp5, tmp6);
-        let z3 = vaddq_s16(tmp4, tmp6);
-        let z4 = vaddq_s16(tmp5, tmp7);
-        let mut z5_l = vmull_lane_s16::<1>(vget_low_s16(z3), consts2);
-        let mut z5_h = vmull_lane_s16::<1>(vget_high_s16(z3), consts2);
-        z5_l = vmlal_lane_s16::<1>(z5_l, vget_low_s16(z4), consts2);
-        z5_h = vmlal_lane_s16::<1>(z5_h, vget_high_s16(z4), consts2);
+            // Odd part.
+            let z1 = vaddq_s16(tmp4, tmp7);
+            let z2 = vaddq_s16(tmp5, tmp6);
+            let z3 = vaddq_s16(tmp4, tmp6);
+            let z4 = vaddq_s16(tmp5, tmp7);
+            let mut z5_l = vmull_lane_s16::<1>(vget_low_s16(z3), consts2);
+            let mut z5_h = vmull_lane_s16::<1>(vget_high_s16(z3), consts2);
+            z5_l = vmlal_lane_s16::<1>(z5_l, vget_low_s16(z4), consts2);
+            z5_h = vmlal_lane_s16::<1>(z5_h, vget_high_s16(z4), consts2);
 
-        let mut tmp4_l = vmull_lane_s16::<0>(vget_low_s16(tmp4), consts1);
-        let mut tmp4_h = vmull_lane_s16::<0>(vget_high_s16(tmp4), consts1);
-        let mut tmp5_l = vmull_lane_s16::<1>(vget_low_s16(tmp5), consts3);
-        let mut tmp5_h = vmull_lane_s16::<1>(vget_high_s16(tmp5), consts3);
-        let mut tmp6_l = vmull_lane_s16::<3>(vget_low_s16(tmp6), consts3);
-        let mut tmp6_h = vmull_lane_s16::<3>(vget_high_s16(tmp6), consts3);
-        let mut tmp7_l = vmull_lane_s16::<2>(vget_low_s16(tmp7), consts2);
-        let mut tmp7_h = vmull_lane_s16::<2>(vget_high_s16(tmp7), consts2);
+            let mut tmp4_l = vmull_lane_s16::<0>(vget_low_s16(tmp4), consts1);
+            let mut tmp4_h = vmull_lane_s16::<0>(vget_high_s16(tmp4), consts1);
+            let mut tmp5_l = vmull_lane_s16::<1>(vget_low_s16(tmp5), consts3);
+            let mut tmp5_h = vmull_lane_s16::<1>(vget_high_s16(tmp5), consts3);
+            let mut tmp6_l = vmull_lane_s16::<3>(vget_low_s16(tmp6), consts3);
+            let mut tmp6_h = vmull_lane_s16::<3>(vget_high_s16(tmp6), consts3);
+            let mut tmp7_l = vmull_lane_s16::<2>(vget_low_s16(tmp7), consts2);
+            let mut tmp7_h = vmull_lane_s16::<2>(vget_high_s16(tmp7), consts2);
 
-        let z1_l = vmull_lane_s16::<0>(vget_low_s16(z1), consts2);
-        let z1_h = vmull_lane_s16::<0>(vget_high_s16(z1), consts2);
-        let z2_l = vmull_lane_s16::<2>(vget_low_s16(z2), consts3);
-        let z2_h = vmull_lane_s16::<2>(vget_high_s16(z2), consts3);
-        let mut z3_l = vmull_lane_s16::<0>(vget_low_s16(z3), consts3);
-        let mut z3_h = vmull_lane_s16::<0>(vget_high_s16(z3), consts3);
-        let mut z4_l = vmull_lane_s16::<1>(vget_low_s16(z4), consts1);
-        let mut z4_h = vmull_lane_s16::<1>(vget_high_s16(z4), consts1);
+            let z1_l = vmull_lane_s16::<0>(vget_low_s16(z1), consts2);
+            let z1_h = vmull_lane_s16::<0>(vget_high_s16(z1), consts2);
+            let z2_l = vmull_lane_s16::<2>(vget_low_s16(z2), consts3);
+            let z2_h = vmull_lane_s16::<2>(vget_high_s16(z2), consts3);
+            let mut z3_l = vmull_lane_s16::<0>(vget_low_s16(z3), consts3);
+            let mut z3_h = vmull_lane_s16::<0>(vget_high_s16(z3), consts3);
+            let mut z4_l = vmull_lane_s16::<1>(vget_low_s16(z4), consts1);
+            let mut z4_h = vmull_lane_s16::<1>(vget_high_s16(z4), consts1);
 
-        z3_l = vaddq_s32(z3_l, z5_l);
-        z3_h = vaddq_s32(z3_h, z5_h);
-        z4_l = vaddq_s32(z4_l, z5_l);
-        z4_h = vaddq_s32(z4_h, z5_h);
+            z3_l = vaddq_s32(z3_l, z5_l);
+            z3_h = vaddq_s32(z3_h, z5_h);
+            z4_l = vaddq_s32(z4_l, z5_l);
+            z4_h = vaddq_s32(z4_h, z5_h);
 
-        tmp4_l = vaddq_s32(tmp4_l, z1_l);
-        tmp4_h = vaddq_s32(tmp4_h, z1_h);
-        tmp4_l = vaddq_s32(tmp4_l, z3_l);
-        tmp4_h = vaddq_s32(tmp4_h, z3_h);
-        col7 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(tmp4_l),
-            vrshrn_n_s32::<DESCALE_P1>(tmp4_h),
-        );
+            tmp4_l = vaddq_s32(tmp4_l, z1_l);
+            tmp4_h = vaddq_s32(tmp4_h, z1_h);
+            tmp4_l = vaddq_s32(tmp4_l, z3_l);
+            tmp4_h = vaddq_s32(tmp4_h, z3_h);
+            col7 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(tmp4_l),
+                vrshrn_n_s32::<DESCALE_P1>(tmp4_h),
+            );
 
-        tmp5_l = vaddq_s32(tmp5_l, z2_l);
-        tmp5_h = vaddq_s32(tmp5_h, z2_h);
-        tmp5_l = vaddq_s32(tmp5_l, z4_l);
-        tmp5_h = vaddq_s32(tmp5_h, z4_h);
-        col5 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(tmp5_l),
-            vrshrn_n_s32::<DESCALE_P1>(tmp5_h),
-        );
+            tmp5_l = vaddq_s32(tmp5_l, z2_l);
+            tmp5_h = vaddq_s32(tmp5_h, z2_h);
+            tmp5_l = vaddq_s32(tmp5_l, z4_l);
+            tmp5_h = vaddq_s32(tmp5_h, z4_h);
+            col5 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(tmp5_l),
+                vrshrn_n_s32::<DESCALE_P1>(tmp5_h),
+            );
 
-        tmp6_l = vaddq_s32(tmp6_l, z2_l);
-        tmp6_h = vaddq_s32(tmp6_h, z2_h);
-        tmp6_l = vaddq_s32(tmp6_l, z3_l);
-        tmp6_h = vaddq_s32(tmp6_h, z3_h);
-        col3 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(tmp6_l),
-            vrshrn_n_s32::<DESCALE_P1>(tmp6_h),
-        );
+            tmp6_l = vaddq_s32(tmp6_l, z2_l);
+            tmp6_h = vaddq_s32(tmp6_h, z2_h);
+            tmp6_l = vaddq_s32(tmp6_l, z3_l);
+            tmp6_h = vaddq_s32(tmp6_h, z3_h);
+            col3 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(tmp6_l),
+                vrshrn_n_s32::<DESCALE_P1>(tmp6_h),
+            );
 
-        tmp7_l = vaddq_s32(tmp7_l, z1_l);
-        tmp7_h = vaddq_s32(tmp7_h, z1_h);
-        tmp7_l = vaddq_s32(tmp7_l, z4_l);
-        tmp7_h = vaddq_s32(tmp7_h, z4_h);
-        col1 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P1>(tmp7_l),
-            vrshrn_n_s32::<DESCALE_P1>(tmp7_h),
-        );
+            tmp7_l = vaddq_s32(tmp7_l, z1_l);
+            tmp7_h = vaddq_s32(tmp7_h, z1_h);
+            tmp7_l = vaddq_s32(tmp7_l, z4_l);
+            tmp7_h = vaddq_s32(tmp7_h, z4_h);
+            col1 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P1>(tmp7_l),
+                vrshrn_n_s32::<DESCALE_P1>(tmp7_h),
+            );
 
-        // Transpose so each register now holds a row.
-        let cols_01 = vtrnq_s16(col0, col1);
-        let cols_23 = vtrnq_s16(col2, col3);
-        let cols_45 = vtrnq_s16(col4, col5);
-        let cols_67 = vtrnq_s16(col6, col7);
+            // Transpose so each register now holds a row.
+            let cols_01 = vtrnq_s16(col0, col1);
+            let cols_23 = vtrnq_s16(col2, col3);
+            let cols_45 = vtrnq_s16(col4, col5);
+            let cols_67 = vtrnq_s16(col6, col7);
 
-        let cols_0145_l = vtrnq_s32(
-            vreinterpretq_s32_s16(cols_01.0),
-            vreinterpretq_s32_s16(cols_45.0),
-        );
-        let cols_0145_h = vtrnq_s32(
-            vreinterpretq_s32_s16(cols_01.1),
-            vreinterpretq_s32_s16(cols_45.1),
-        );
-        let cols_2367_l = vtrnq_s32(
-            vreinterpretq_s32_s16(cols_23.0),
-            vreinterpretq_s32_s16(cols_67.0),
-        );
-        let cols_2367_h = vtrnq_s32(
-            vreinterpretq_s32_s16(cols_23.1),
-            vreinterpretq_s32_s16(cols_67.1),
-        );
+            let cols_0145_l = vtrnq_s32(
+                vreinterpretq_s32_s16(cols_01.0),
+                vreinterpretq_s32_s16(cols_45.0),
+            );
+            let cols_0145_h = vtrnq_s32(
+                vreinterpretq_s32_s16(cols_01.1),
+                vreinterpretq_s32_s16(cols_45.1),
+            );
+            let cols_2367_l = vtrnq_s32(
+                vreinterpretq_s32_s16(cols_23.0),
+                vreinterpretq_s32_s16(cols_67.0),
+            );
+            let cols_2367_h = vtrnq_s32(
+                vreinterpretq_s32_s16(cols_23.1),
+                vreinterpretq_s32_s16(cols_67.1),
+            );
 
-        let rows_04 = vzipq_s32(cols_0145_l.0, cols_2367_l.0);
-        let rows_15 = vzipq_s32(cols_0145_h.0, cols_2367_h.0);
-        let rows_26 = vzipq_s32(cols_0145_l.1, cols_2367_l.1);
-        let rows_37 = vzipq_s32(cols_0145_h.1, cols_2367_h.1);
+            let rows_04 = vzipq_s32(cols_0145_l.0, cols_2367_l.0);
+            let rows_15 = vzipq_s32(cols_0145_h.0, cols_2367_h.0);
+            let rows_26 = vzipq_s32(cols_0145_l.1, cols_2367_l.1);
+            let rows_37 = vzipq_s32(cols_0145_h.1, cols_2367_h.1);
 
-        let mut row0 = vreinterpretq_s16_s32(rows_04.0);
-        let mut row1 = vreinterpretq_s16_s32(rows_15.0);
-        let mut row2 = vreinterpretq_s16_s32(rows_26.0);
-        let mut row3 = vreinterpretq_s16_s32(rows_37.0);
-        let mut row4 = vreinterpretq_s16_s32(rows_04.1);
-        let mut row5 = vreinterpretq_s16_s32(rows_15.1);
-        let mut row6 = vreinterpretq_s16_s32(rows_26.1);
-        let mut row7 = vreinterpretq_s16_s32(rows_37.1);
+            let mut row0 = vreinterpretq_s16_s32(rows_04.0);
+            let mut row1 = vreinterpretq_s16_s32(rows_15.0);
+            let mut row2 = vreinterpretq_s16_s32(rows_26.0);
+            let mut row3 = vreinterpretq_s16_s32(rows_37.0);
+            let mut row4 = vreinterpretq_s16_s32(rows_04.1);
+            let mut row5 = vreinterpretq_s16_s32(rows_15.1);
+            let mut row6 = vreinterpretq_s16_s32(rows_26.1);
+            let mut row7 = vreinterpretq_s16_s32(rows_37.1);
 
-        // -------- Pass 2: columns. --------
-        let tmp0 = vaddq_s16(row0, row7);
-        let tmp7 = vsubq_s16(row0, row7);
-        let tmp1 = vaddq_s16(row1, row6);
-        let tmp6 = vsubq_s16(row1, row6);
-        let tmp2 = vaddq_s16(row2, row5);
-        let tmp5 = vsubq_s16(row2, row5);
-        let tmp3 = vaddq_s16(row3, row4);
-        let tmp4 = vsubq_s16(row3, row4);
+            // -------- Pass 2: columns. --------
+            let tmp0 = vaddq_s16(row0, row7);
+            let tmp7 = vsubq_s16(row0, row7);
+            let tmp1 = vaddq_s16(row1, row6);
+            let tmp6 = vsubq_s16(row1, row6);
+            let tmp2 = vaddq_s16(row2, row5);
+            let tmp5 = vsubq_s16(row2, row5);
+            let tmp3 = vaddq_s16(row3, row4);
+            let tmp4 = vsubq_s16(row3, row4);
 
-        let tmp10 = vaddq_s16(tmp0, tmp3);
-        let tmp13 = vsubq_s16(tmp0, tmp3);
-        let tmp11 = vaddq_s16(tmp1, tmp2);
-        let tmp12 = vsubq_s16(tmp1, tmp2);
+            let tmp10 = vaddq_s16(tmp0, tmp3);
+            let tmp13 = vsubq_s16(tmp0, tmp3);
+            let tmp11 = vaddq_s16(tmp1, tmp2);
+            let tmp12 = vsubq_s16(tmp1, tmp2);
 
-        row0 = vrshrq_n_s16::<PASS1_BITS>(vaddq_s16(tmp10, tmp11));
-        row4 = vrshrq_n_s16::<PASS1_BITS>(vsubq_s16(tmp10, tmp11));
+            row0 = vrshrq_n_s16::<PASS1_BITS>(vaddq_s16(tmp10, tmp11));
+            row4 = vrshrq_n_s16::<PASS1_BITS>(vsubq_s16(tmp10, tmp11));
 
-        let tmp12_add_tmp13 = vaddq_s16(tmp12, tmp13);
-        let z1_l = vmull_lane_s16::<2>(vget_low_s16(tmp12_add_tmp13), consts1);
-        let z1_h = vmull_lane_s16::<2>(vget_high_s16(tmp12_add_tmp13), consts1);
+            let tmp12_add_tmp13 = vaddq_s16(tmp12, tmp13);
+            let z1_l = vmull_lane_s16::<2>(vget_low_s16(tmp12_add_tmp13), consts1);
+            let z1_h = vmull_lane_s16::<2>(vget_high_s16(tmp12_add_tmp13), consts1);
 
-        let row2_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp13), consts1);
-        let row2_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp13), consts1);
-        row2 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(row2_l),
-            vrshrn_n_s32::<DESCALE_P2>(row2_h),
-        );
+            let row2_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp13), consts1);
+            let row2_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp13), consts1);
+            row2 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(row2_l),
+                vrshrn_n_s32::<DESCALE_P2>(row2_h),
+            );
 
-        let row6_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp12), consts2);
-        let row6_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp12), consts2);
-        row6 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(row6_l),
-            vrshrn_n_s32::<DESCALE_P2>(row6_h),
-        );
+            let row6_l = vmlal_lane_s16::<3>(z1_l, vget_low_s16(tmp12), consts2);
+            let row6_h = vmlal_lane_s16::<3>(z1_h, vget_high_s16(tmp12), consts2);
+            row6 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(row6_l),
+                vrshrn_n_s32::<DESCALE_P2>(row6_h),
+            );
 
-        let z1 = vaddq_s16(tmp4, tmp7);
-        let z2 = vaddq_s16(tmp5, tmp6);
-        let z3 = vaddq_s16(tmp4, tmp6);
-        let z4 = vaddq_s16(tmp5, tmp7);
+            let z1 = vaddq_s16(tmp4, tmp7);
+            let z2 = vaddq_s16(tmp5, tmp6);
+            let z3 = vaddq_s16(tmp4, tmp6);
+            let z4 = vaddq_s16(tmp5, tmp7);
 
-        let mut z5_l = vmull_lane_s16::<1>(vget_low_s16(z3), consts2);
-        let mut z5_h = vmull_lane_s16::<1>(vget_high_s16(z3), consts2);
-        z5_l = vmlal_lane_s16::<1>(z5_l, vget_low_s16(z4), consts2);
-        z5_h = vmlal_lane_s16::<1>(z5_h, vget_high_s16(z4), consts2);
+            let mut z5_l = vmull_lane_s16::<1>(vget_low_s16(z3), consts2);
+            let mut z5_h = vmull_lane_s16::<1>(vget_high_s16(z3), consts2);
+            z5_l = vmlal_lane_s16::<1>(z5_l, vget_low_s16(z4), consts2);
+            z5_h = vmlal_lane_s16::<1>(z5_h, vget_high_s16(z4), consts2);
 
-        let mut tmp4_l = vmull_lane_s16::<0>(vget_low_s16(tmp4), consts1);
-        let mut tmp4_h = vmull_lane_s16::<0>(vget_high_s16(tmp4), consts1);
-        let mut tmp5_l = vmull_lane_s16::<1>(vget_low_s16(tmp5), consts3);
-        let mut tmp5_h = vmull_lane_s16::<1>(vget_high_s16(tmp5), consts3);
-        let mut tmp6_l = vmull_lane_s16::<3>(vget_low_s16(tmp6), consts3);
-        let mut tmp6_h = vmull_lane_s16::<3>(vget_high_s16(tmp6), consts3);
-        let mut tmp7_l = vmull_lane_s16::<2>(vget_low_s16(tmp7), consts2);
-        let mut tmp7_h = vmull_lane_s16::<2>(vget_high_s16(tmp7), consts2);
+            let mut tmp4_l = vmull_lane_s16::<0>(vget_low_s16(tmp4), consts1);
+            let mut tmp4_h = vmull_lane_s16::<0>(vget_high_s16(tmp4), consts1);
+            let mut tmp5_l = vmull_lane_s16::<1>(vget_low_s16(tmp5), consts3);
+            let mut tmp5_h = vmull_lane_s16::<1>(vget_high_s16(tmp5), consts3);
+            let mut tmp6_l = vmull_lane_s16::<3>(vget_low_s16(tmp6), consts3);
+            let mut tmp6_h = vmull_lane_s16::<3>(vget_high_s16(tmp6), consts3);
+            let mut tmp7_l = vmull_lane_s16::<2>(vget_low_s16(tmp7), consts2);
+            let mut tmp7_h = vmull_lane_s16::<2>(vget_high_s16(tmp7), consts2);
 
-        let z1_l = vmull_lane_s16::<0>(vget_low_s16(z1), consts2);
-        let z1_h = vmull_lane_s16::<0>(vget_high_s16(z1), consts2);
-        let z2_l = vmull_lane_s16::<2>(vget_low_s16(z2), consts3);
-        let z2_h = vmull_lane_s16::<2>(vget_high_s16(z2), consts3);
-        let mut z3_l = vmull_lane_s16::<0>(vget_low_s16(z3), consts3);
-        let mut z3_h = vmull_lane_s16::<0>(vget_high_s16(z3), consts3);
-        let mut z4_l = vmull_lane_s16::<1>(vget_low_s16(z4), consts1);
-        let mut z4_h = vmull_lane_s16::<1>(vget_high_s16(z4), consts1);
+            let z1_l = vmull_lane_s16::<0>(vget_low_s16(z1), consts2);
+            let z1_h = vmull_lane_s16::<0>(vget_high_s16(z1), consts2);
+            let z2_l = vmull_lane_s16::<2>(vget_low_s16(z2), consts3);
+            let z2_h = vmull_lane_s16::<2>(vget_high_s16(z2), consts3);
+            let mut z3_l = vmull_lane_s16::<0>(vget_low_s16(z3), consts3);
+            let mut z3_h = vmull_lane_s16::<0>(vget_high_s16(z3), consts3);
+            let mut z4_l = vmull_lane_s16::<1>(vget_low_s16(z4), consts1);
+            let mut z4_h = vmull_lane_s16::<1>(vget_high_s16(z4), consts1);
 
-        z3_l = vaddq_s32(z3_l, z5_l);
-        z3_h = vaddq_s32(z3_h, z5_h);
-        z4_l = vaddq_s32(z4_l, z5_l);
-        z4_h = vaddq_s32(z4_h, z5_h);
+            z3_l = vaddq_s32(z3_l, z5_l);
+            z3_h = vaddq_s32(z3_h, z5_h);
+            z4_l = vaddq_s32(z4_l, z5_l);
+            z4_h = vaddq_s32(z4_h, z5_h);
 
-        tmp4_l = vaddq_s32(tmp4_l, z1_l);
-        tmp4_h = vaddq_s32(tmp4_h, z1_h);
-        tmp4_l = vaddq_s32(tmp4_l, z3_l);
-        tmp4_h = vaddq_s32(tmp4_h, z3_h);
-        row7 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(tmp4_l),
-            vrshrn_n_s32::<DESCALE_P2>(tmp4_h),
-        );
+            tmp4_l = vaddq_s32(tmp4_l, z1_l);
+            tmp4_h = vaddq_s32(tmp4_h, z1_h);
+            tmp4_l = vaddq_s32(tmp4_l, z3_l);
+            tmp4_h = vaddq_s32(tmp4_h, z3_h);
+            row7 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(tmp4_l),
+                vrshrn_n_s32::<DESCALE_P2>(tmp4_h),
+            );
 
-        tmp5_l = vaddq_s32(tmp5_l, z2_l);
-        tmp5_h = vaddq_s32(tmp5_h, z2_h);
-        tmp5_l = vaddq_s32(tmp5_l, z4_l);
-        tmp5_h = vaddq_s32(tmp5_h, z4_h);
-        row5 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(tmp5_l),
-            vrshrn_n_s32::<DESCALE_P2>(tmp5_h),
-        );
+            tmp5_l = vaddq_s32(tmp5_l, z2_l);
+            tmp5_h = vaddq_s32(tmp5_h, z2_h);
+            tmp5_l = vaddq_s32(tmp5_l, z4_l);
+            tmp5_h = vaddq_s32(tmp5_h, z4_h);
+            row5 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(tmp5_l),
+                vrshrn_n_s32::<DESCALE_P2>(tmp5_h),
+            );
 
-        tmp6_l = vaddq_s32(tmp6_l, z2_l);
-        tmp6_h = vaddq_s32(tmp6_h, z2_h);
-        tmp6_l = vaddq_s32(tmp6_l, z3_l);
-        tmp6_h = vaddq_s32(tmp6_h, z3_h);
-        row3 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(tmp6_l),
-            vrshrn_n_s32::<DESCALE_P2>(tmp6_h),
-        );
+            tmp6_l = vaddq_s32(tmp6_l, z2_l);
+            tmp6_h = vaddq_s32(tmp6_h, z2_h);
+            tmp6_l = vaddq_s32(tmp6_l, z3_l);
+            tmp6_h = vaddq_s32(tmp6_h, z3_h);
+            row3 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(tmp6_l),
+                vrshrn_n_s32::<DESCALE_P2>(tmp6_h),
+            );
 
-        tmp7_l = vaddq_s32(tmp7_l, z1_l);
-        tmp7_h = vaddq_s32(tmp7_h, z1_h);
-        tmp7_l = vaddq_s32(tmp7_l, z4_l);
-        tmp7_h = vaddq_s32(tmp7_h, z4_h);
-        row1 = vcombine_s16(
-            vrshrn_n_s32::<DESCALE_P2>(tmp7_l),
-            vrshrn_n_s32::<DESCALE_P2>(tmp7_h),
-        );
+            tmp7_l = vaddq_s32(tmp7_l, z1_l);
+            tmp7_h = vaddq_s32(tmp7_h, z1_h);
+            tmp7_l = vaddq_s32(tmp7_l, z4_l);
+            tmp7_h = vaddq_s32(tmp7_h, z4_h);
+            row1 = vcombine_s16(
+                vrshrn_n_s32::<DESCALE_P2>(tmp7_l),
+                vrshrn_n_s32::<DESCALE_P2>(tmp7_h),
+            );
 
-        let p = data.as_mut_ptr();
-        vst1q_s16(p, row0);
-        vst1q_s16(p.add(8), row1);
-        vst1q_s16(p.add(16), row2);
-        vst1q_s16(p.add(24), row3);
-        vst1q_s16(p.add(32), row4);
-        vst1q_s16(p.add(40), row5);
-        vst1q_s16(p.add(48), row6);
-        vst1q_s16(p.add(56), row7);
+            let p = data.as_mut_ptr();
+            vst1q_s16(p, row0);
+            vst1q_s16(p.add(8), row1);
+            vst1q_s16(p.add(16), row2);
+            vst1q_s16(p.add(24), row3);
+            vst1q_s16(p.add(32), row4);
+            vst1q_s16(p.add(40), row5);
+            vst1q_s16(p.add(48), row6);
+            vst1q_s16(p.add(56), row7);
         }
     }
 }
@@ -513,56 +541,62 @@ pub mod quant {
         unsafe { quantize_inner(block, div, out) }
     }
 
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. All inputs are
+    /// fixed-size references; no caller-side invariants beyond the
+    /// standard reference rules.
     #[target_feature(enable = "neon")]
-    unsafe fn quantize_inner(workspace: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) { unsafe {
-        let ws = workspace.as_ptr();
-        let recipp = div.recip.as_ptr();
-        let corrp = div.corr.as_ptr();
-        let shiftp = div.shift.as_ptr();
-        let outp = out.as_mut_ptr();
+    unsafe fn quantize_inner(workspace: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) {
+        unsafe {
+            let ws = workspace.as_ptr();
+            let recipp = div.recip.as_ptr();
+            let corrp = div.corr.as_ptr();
+            let shiftp = div.shift.as_ptr();
+            let outp = out.as_mut_ptr();
 
-        // Process 8 rows in two batches of 4 (matches the C unroll).
-        let mut i = 0usize;
-        while i < 8 {
-            for k in 0..4usize {
-                let row_off = (i + k) * 8;
-                let row = vld1q_s16(ws.add(row_off));
-                let recip = vld1q_u16(recipp.add(row_off));
-                let corr = vld1q_u16(corrp.add(row_off));
-                let shift = vld1q_s16(shiftp.add(row_off));
+            // Process 8 rows in two batches of 4 (matches the C unroll).
+            let mut i = 0usize;
+            while i < 8 {
+                for k in 0..4usize {
+                    let row_off = (i + k) * 8;
+                    let row = vld1q_s16(ws.add(row_off));
+                    let recip = vld1q_u16(recipp.add(row_off));
+                    let corr = vld1q_u16(corrp.add(row_off));
+                    let shift = vld1q_s16(shiftp.add(row_off));
 
-                // Sign-extract: -1 for negative lanes, 0 otherwise.
-                let sign = vshrq_n_s16::<15>(row);
-                // Absolute value, reinterpreted as u16.
-                let absv = vreinterpretq_u16_s16(vabsq_s16(row));
-                let biased = vaddq_u16(absv, corr);
+                    // Sign-extract: -1 for negative lanes, 0 otherwise.
+                    let sign = vshrq_n_s16::<15>(row);
+                    // Absolute value, reinterpreted as u16.
+                    let absv = vreinterpretq_u16_s16(vabsq_s16(row));
+                    let biased = vaddq_u16(absv, corr);
 
-                // 16x16 → 32 multiply, then narrow back via shrn(16) to
-                // pull the high half. This is libjpeg's SIMD pattern.
-                let prod_l = vmull_u16(vget_low_u16(biased), vget_low_u16(recip));
-                let prod_h = vmull_u16(vget_high_u16(biased), vget_high_u16(recip));
-                let high16 = vcombine_s16(
-                    vshrn_n_s32::<16>(vreinterpretq_s32_u32(prod_l)),
-                    vshrn_n_s32::<16>(vreinterpretq_s32_u32(prod_h)),
-                );
+                    // 16x16 → 32 multiply, then narrow back via shrn(16) to
+                    // pull the high half. This is libjpeg's SIMD pattern.
+                    let prod_l = vmull_u16(vget_low_u16(biased), vget_low_u16(recip));
+                    let prod_h = vmull_u16(vget_high_u16(biased), vget_high_u16(recip));
+                    let high16 = vcombine_s16(
+                        vshrn_n_s32::<16>(vreinterpretq_s32_u32(prod_l)),
+                        vshrn_n_s32::<16>(vreinterpretq_s32_u32(prod_h)),
+                    );
 
-                // Variable right shift (shift values are >= 0 in
-                // practice; they encode "additional" shifts beyond the
-                // 16 we just did via shrn). NEON only has variable
-                // *left* shift, so negate.
-                let shifted = vreinterpretq_s16_u16(vshlq_u16(
-                    vreinterpretq_u16_s16(high16),
-                    vnegq_s16(shift),
-                ));
+                    // Variable right shift (shift values are >= 0 in
+                    // practice; they encode "additional" shifts beyond the
+                    // 16 we just did via shrn). NEON only has variable
+                    // *left* shift, so negate.
+                    let shifted = vreinterpretq_s16_u16(vshlq_u16(
+                        vreinterpretq_u16_s16(high16),
+                        vnegq_s16(shift),
+                    ));
 
-                // Restore sign: XOR with sign mask, then subtract sign
-                // mask. (For negative lanes: ~q + 1 = -q.)
-                let signed = vsubq_s16(veorq_s16(shifted, sign), sign);
-                vst1q_s16(outp.add(row_off), signed);
+                    // Restore sign: XOR with sign mask, then subtract sign
+                    // mask. (For negative lanes: ~q + 1 = -q.)
+                    let signed = vsubq_s16(veorq_s16(shifted, sign), sign);
+                    vst1q_s16(outp.add(row_off), signed);
+                }
+                i += 4;
             }
-            i += 4;
         }
-    }}
+    }
 }
 
 // ===========================================================================
@@ -598,10 +632,14 @@ mod tests {
     use crate::color::RGBA;
 
     fn random_block(seed: u64) -> [i16; 64] {
-        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let mut b = [0i16; 64];
         for v in &mut b {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((s >> 33) as i32 % 256 - 128) as i16;
         }
         b

@@ -53,6 +53,19 @@ impl HuffmanTable {
         // assigning the next consecutive code to each value, with a
         // left-shift between length groups. This is exactly how a JPEG
         // decoder reconstructs the same table from the DHT segment.
+        //
+        // Pre-check the integrity of the input: `bits.iter().sum() ==
+        // values.len()` is the canonical-Huffman invariant. The standard
+        // tables in `tables.rs` satisfy this; the assert is here so a
+        // future caller building a custom `StdHuffman` gets a clear
+        // error instead of a silent OOB index.
+        let total_codes: usize = table.bits.iter().map(|&b| b as usize).sum();
+        debug_assert_eq!(
+            total_codes,
+            table.values.len(),
+            "StdHuffman::bits sum must equal values.len()",
+        );
+
         let mut packed: [u32; 256] = [0; 256];
         let mut next_code: u32 = 0;
         let mut value_idx: usize = 0;
@@ -267,6 +280,15 @@ pub fn encode_block<W: io::Write>(
             zero_run -= 16;
         }
         let (size, bits) = magnitude_category(coef as i32);
+        // Baseline 8-bit JPEG bounds AC magnitude category at 10 (DC at
+        // 11). With our fixed-point scale + clamped quant tables, post-
+        // quant ACs land well within size ≤ 11. Guard the symbol packing
+        // so a future change that breaks this invariant fails loudly
+        // instead of silently truncating into a different AC code.
+        debug_assert!(
+            size <= 15,
+            "AC magnitude category {size} exceeds 4-bit symbol field",
+        );
         let symbol = ((zero_run as usize) << 4) | (size as usize & 0x0F);
         let entry = ac_tab.packed[symbol];
         bw.write_bits(entry & 0xFFFF, entry >> 16)?;
@@ -405,7 +427,11 @@ mod tests {
         }
         impl RefBW {
             fn new() -> Self {
-                Self { out: Vec::new(), buf: 0, n: 0 }
+                Self {
+                    out: Vec::new(),
+                    buf: 0,
+                    n: 0,
+                }
             }
             fn write(&mut self, value: u32, nb: u32) {
                 if nb == 0 {
@@ -500,7 +526,10 @@ mod tests {
         let acc = HuffmanTable::from_std(&STD_CHROMA_AC);
         let r2 = reference_encode(block, prev_dc, &dcc, &acc);
         let o2 = opt_encode(block, prev_dc, &dcc, &acc);
-        assert_eq!(o2, r2, "{label} (chroma): optimized output diverges from reference");
+        assert_eq!(
+            o2, r2,
+            "{label} (chroma): optimized output diverges from reference"
+        );
     }
 
     #[test]
@@ -526,7 +555,9 @@ mod tests {
         let mut state: u64 = 0x1234_5678_9ABC_DEF0;
         let mut block = [0i16; 64];
         for v in block.iter_mut() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((state >> 53) as i16).wrapping_sub(512); // -512..=511 ≈ 11 bits incl. sign
         }
         assert_eq_blocks("full_random", &block, 0);
