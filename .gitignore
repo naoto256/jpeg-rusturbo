@@ -4,3 +4,6 @@
 .DS_Store
 ._*
 Cargo.lock
+
+# Local audit receipts (operator-internal, see code-audit skill).
+.audit/

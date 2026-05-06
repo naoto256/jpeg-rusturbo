@@ -27,7 +27,7 @@
 //!   entropy-coded bytes (with 0xFF → 0xFF 0x00 stuffing)
 //! ```
 //!
-//! See `LICENSES/` for attribution; the SIMD kernels are translations
+//! See `NOTICE.md` for attribution; the SIMD kernels are translations
 //! of libjpeg-turbo (BSD-3-Clause + IJG).
 
 mod arch;
