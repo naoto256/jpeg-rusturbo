@@ -146,8 +146,8 @@ impl<W: Write> JpegEncoder<W> {
         markers::write_dqt(&mut self.out, 1, &chroma_q)?;
 
         let (h_y, v_y) = match self.subsampling {
-            ChromaSubsampling::Yuv444 => (1, 1),
-            ChromaSubsampling::Yuv420 => (2, 2),
+            ChromaSubsampling::Yuv444 => Yuv444Scheme::H_V,
+            ChromaSubsampling::Yuv420 => Yuv420Scheme::H_V,
         };
         markers::write_sof0(
             &mut self.out,
@@ -181,12 +181,12 @@ impl<W: Write> JpegEncoder<W> {
         // first few reallocations on large frames.
         bw.reserve((width as usize) * (height as usize));
         match self.subsampling {
-            ChromaSubsampling::Yuv444 => encode_scan_444(
+            ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
                 pixels, width, height, layout,
                 &mut bw, &div_luma, &div_chroma,
                 &dc_luma, &ac_luma, &dc_chroma, &ac_chroma,
             )?,
-            ChromaSubsampling::Yuv420 => encode_scan_420(
+            ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
                 pixels, width, height, layout,
                 &mut bw, &div_luma, &div_chroma,
                 &dc_luma, &ac_luma, &dc_chroma, &ac_chroma,
@@ -201,52 +201,131 @@ impl<W: Write> JpegEncoder<W> {
 
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_scan_444<BW: Write>(
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-    layout: PixelLayout,
-    bw: &mut BitWriter<BW>,
-    div_luma: &Divisors,
-    div_chroma: &Divisors,
-    dc_luma: &HuffmanTable,
-    ac_luma: &HuffmanTable,
-    dc_chroma: &HuffmanTable,
-    ac_chroma: &HuffmanTable,
-) -> io::Result<()> {
-    let mcus_x = width.div_ceil(8);
-    let mcus_y = height.div_ceil(8);
-    let mut prev_dc_y = 0i16;
-    let mut prev_dc_cb = 0i16;
-    let mut prev_dc_cr = 0i16;
-    let mut y_blk = [0i16; 64];
-    let mut cb_blk = [0i16; 64];
-    let mut cr_blk = [0i16; 64];
+/// Per-MCU running DC predictor for the three components. Difference-coded
+/// across MCUs within a scan (F.1.2.1).
+#[derive(Default)]
+struct DcPredictors {
+    y: i16,
+    cb: i16,
+    cr: i16,
+}
 
-    for my in 0..mcus_y {
-        for mx in 0..mcus_x {
-            color::extract_block_ycbcr(
-                pixels, width, height, layout,
-                mx * 8, my * 8,
-                &mut y_blk, &mut cb_blk, &mut cr_blk,
-            );
+/// One chroma-subsampling scheme (4:4:4, 4:2:0, future: 4:2:2 …).
+///
+/// Each impl owns its MCU geometry and the per-MCU encode work — the
+/// generic `encode_scan` below just iterates MCUs and forwards. Adding a
+/// new scheme is "impl this trait + add a variant + add two match arms",
+/// no scan-level surgery required (Rule of Three: prep work at 2 instances).
+trait SamplingScheme {
+    /// `(h_factor, v_factor)` for the Y component in SOF0. Cb/Cr are
+    /// always (1, 1) in the schemes we support.
+    const H_V: (u8, u8);
+    /// One MCU's pixel footprint `(width, height)`.
+    const MCU_W: u32;
+    const MCU_H: u32;
 
-            prev_dc_y = encode_one_block(bw, &mut y_blk, div_luma, prev_dc_y, dc_luma, ac_luma)?;
-            prev_dc_cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc_cb, dc_chroma, ac_chroma)?;
-            prev_dc_cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc_cr, dc_chroma, ac_chroma)?;
-        }
+    #[allow(clippy::too_many_arguments)]
+    fn encode_one_mcu<W: Write>(
+        bw: &mut BitWriter<W>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        prev_dc: &mut DcPredictors,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        dc_luma: &HuffmanTable,
+        ac_luma: &HuffmanTable,
+        dc_chroma: &HuffmanTable,
+        ac_chroma: &HuffmanTable,
+    ) -> io::Result<()>;
+}
+
+struct Yuv444Scheme;
+impl SamplingScheme for Yuv444Scheme {
+    const H_V: (u8, u8) = (1, 1);
+    const MCU_W: u32 = 8;
+    const MCU_H: u32 = 8;
+
+    fn encode_one_mcu<W: Write>(
+        bw: &mut BitWriter<W>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        prev_dc: &mut DcPredictors,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        dc_luma: &HuffmanTable,
+        ac_luma: &HuffmanTable,
+        dc_chroma: &HuffmanTable,
+        ac_chroma: &HuffmanTable,
+    ) -> io::Result<()> {
+        let mut y_blk = [0i16; 64];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_block_ycbcr(
+            pixels, width, height, layout,
+            mx * Self::MCU_W, my * Self::MCU_H,
+            &mut y_blk, &mut cb_blk, &mut cr_blk,
+        );
+        prev_dc.y = encode_one_block(bw, &mut y_blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+        prev_dc.cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc.cb, dc_chroma, ac_chroma)?;
+        prev_dc.cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc.cr, dc_chroma, ac_chroma)?;
+        Ok(())
     }
-    Ok(())
+}
+
+struct Yuv420Scheme;
+impl SamplingScheme for Yuv420Scheme {
+    const H_V: (u8, u8) = (2, 2);
+    const MCU_W: u32 = 16;
+    const MCU_H: u32 = 16;
+
+    fn encode_one_mcu<W: Write>(
+        bw: &mut BitWriter<W>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        prev_dc: &mut DcPredictors,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        dc_luma: &HuffmanTable,
+        ac_luma: &HuffmanTable,
+        dc_chroma: &HuffmanTable,
+        ac_chroma: &HuffmanTable,
+    ) -> io::Result<()> {
+        let mut y_blocks = [[0i16; 64]; 4];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_mcu_420(
+            pixels, width, height, layout,
+            mx * Self::MCU_W, my * Self::MCU_H,
+            &mut y_blocks, &mut cb_blk, &mut cr_blk,
+        );
+        for blk in y_blocks.iter_mut() {
+            prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+        }
+        prev_dc.cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc.cb, dc_chroma, ac_chroma)?;
+        prev_dc.cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc.cr, dc_chroma, ac_chroma)?;
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_scan_420<BW: Write>(
+fn encode_scan<S: SamplingScheme, W: Write>(
     pixels: &[u8],
     width: u32,
     height: u32,
     layout: PixelLayout,
-    bw: &mut BitWriter<BW>,
+    bw: &mut BitWriter<W>,
     div_luma: &Divisors,
     div_chroma: &Divisors,
     dc_luma: &HuffmanTable,
@@ -254,28 +333,17 @@ fn encode_scan_420<BW: Write>(
     dc_chroma: &HuffmanTable,
     ac_chroma: &HuffmanTable,
 ) -> io::Result<()> {
-    let mcus_x = width.div_ceil(16);
-    let mcus_y = height.div_ceil(16);
-    let mut prev_dc_y = 0i16;
-    let mut prev_dc_cb = 0i16;
-    let mut prev_dc_cr = 0i16;
-    let mut y_blocks = [[0i16; 64]; 4];
-    let mut cb_blk = [0i16; 64];
-    let mut cr_blk = [0i16; 64];
-
+    let mcus_x = width.div_ceil(S::MCU_W);
+    let mcus_y = height.div_ceil(S::MCU_H);
+    let mut prev_dc = DcPredictors::default();
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
-            color::extract_mcu_420(
-                pixels, width, height, layout,
-                mx * 16, my * 16,
-                &mut y_blocks, &mut cb_blk, &mut cr_blk,
-            );
-
-            for blk in y_blocks.iter_mut() {
-                prev_dc_y = encode_one_block(bw, blk, div_luma, prev_dc_y, dc_luma, ac_luma)?;
-            }
-            prev_dc_cb = encode_one_block(bw, &mut cb_blk, div_chroma, prev_dc_cb, dc_chroma, ac_chroma)?;
-            prev_dc_cr = encode_one_block(bw, &mut cr_blk, div_chroma, prev_dc_cr, dc_chroma, ac_chroma)?;
+            S::encode_one_mcu(
+                bw, pixels, width, height, layout, mx, my,
+                &mut prev_dc,
+                div_luma, div_chroma,
+                dc_luma, ac_luma, dc_chroma, ac_chroma,
+            )?;
         }
     }
     Ok(())
