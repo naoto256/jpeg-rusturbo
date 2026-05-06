@@ -1,12 +1,14 @@
 //! x86_64 SIMD kernels — translations of libjpeg-turbo's
 //! `simd/x86_64/*-avx2.asm`. See `LICENSES/libjpeg-turbo.txt`.
 //!
-//! Backend status (incremental port):
-//!   - `quant`    — AVX2
-//!   - `dct`      — AVX2
-//!   - `color`    — AVX2 for n=16 RGBA (the 4:2:0 hot path); scalar fallback
-//!                  for n=8 / RGB / non-AVX2 CPU
-//!   - `huffman`  — delegate to scalar (TODO)
+//! Backend status:
+//!   - `quant`           — AVX2
+//!   - `dct`             — AVX2
+//!   - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
+//!                              scalar fallback for n=8 / RGB / non-AVX2
+//!   - `color::h2v2_downsample` — AVX2
+//!   - `huffman`         — delegate to scalar (the AC zero-scan helper
+//!                         autovectorizes well in scalar form)
 //!
 //! Runtime feature detection: AVX2 is the only target we ever dispatch
 //! to from x86_64. Non-AVX2 CPUs hit the scalar fallback at runtime via
@@ -95,9 +97,71 @@ pub mod color {
         }
     }
 
-    /// 16x16 → 8x8 chroma 4:2:0 box-average. AVX2 not yet ported for
-    /// downsample (step 3d); fall through to scalar.
-    pub use crate::arch::scalar::color::h2v2_downsample;
+    /// 16x16 → 8x8 chroma 4:2:0 box-average with libjpeg-turbo's biased
+    /// rounding (`{1, 2, 1, 2, ...}` per output column). Bit-exact
+    /// equivalent to `arch::scalar::color::h2v2_downsample`.
+    pub fn h2v2_downsample(src: &[u8; 256], dst: &mut [i16; 64]) {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { h2v2_avx2(src, dst) }
+        } else {
+            crate::arch::scalar::color::h2v2_downsample(src, dst)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn h2v2_avx2(src: &[u8; 256], dst: &mut [i16; 64]) {
+        unsafe {
+            // bias `{1, 2, 1, 2, ...}` = u32 lanes of 0x0002_0001
+            // broadcast — same encoding NEON uses, gives +1 on even
+            // output columns and +2 on odd.
+            let bias = _mm256_set1_epi32(0x0002_0001u32 as i32);
+            let level_shift = _mm256_set1_epi16(128);
+            // `_mm256_maddubs_epi16(a, ones)` sums adjacent byte pairs:
+            // `result_lane[i] = a[2i] + a[2i+1]` (saturating to i16, but
+            // the sum of two u8 fits comfortably).
+            let ones = _mm256_set1_epi8(1);
+
+            // Each iteration consumes 4 input rows = 64 bytes, emits
+            // 2 output rows = 32 bytes.
+            for j in 0..4 {
+                let row_off = j * 4 * 16;
+                let r01 = _mm256_loadu_si256(src.as_ptr().add(row_off) as *const __m256i);
+                let r23 =
+                    _mm256_loadu_si256(src.as_ptr().add(row_off + 32) as *const __m256i);
+
+                // Pairwise horizontal byte sums per 128-bit lane:
+                //   s01 = [pair sums of input row 4j+0, pair sums of 4j+1] (each 8 i16)
+                //   s23 = [pair sums of 4j+2, pair sums of 4j+3]
+                let s01 = _mm256_maddubs_epi16(r01, ones);
+                let s23 = _mm256_maddubs_epi16(r23, ones);
+
+                // Cross-pair the lo/hi halves so each ymm holds, in its
+                // two 128-bit lanes, the 8 pair-sums for output rows
+                // (2j, 2j+1):
+                //   lo_halves = [s01_lo, s23_lo] = [row 4j+0, row 4j+2]
+                //   hi_halves = [s01_hi, s23_hi] = [row 4j+1, row 4j+3]
+                let lo_halves = _mm256_permute2x128_si256::<0x20>(s01, s23);
+                let hi_halves = _mm256_permute2x128_si256::<0x31>(s01, s23);
+
+                // Vertical sum + bias = 2x2 box sums.
+                let sums = _mm256_add_epi16(
+                    _mm256_add_epi16(lo_halves, hi_halves),
+                    bias,
+                );
+                // /4 (avg).
+                let avg = _mm256_srli_epi16::<2>(sums);
+                // Level-shift to centered i16 range.
+                let signed = _mm256_sub_epi16(avg, level_shift);
+
+                // Store 16 i16 = 32 bytes = 2 output rows.
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(j * 16) as *mut __m256i,
+                    signed,
+                );
+            }
+            _mm256_zeroupper();
+        }
+    }
 
     /// Deinterleave 16 RGBA pixels (= 64 bytes from `pixels`) into three
     /// `__m256i` registers carrying 16 u16 lanes of R, G, B respectively.
@@ -716,6 +780,59 @@ mod tests {
         scalar::dct::fdct_islow(&mut a);
         dct::fdct_islow(&mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn h2v2_downsample_avx2_matches_scalar_random() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut src = [0u8; 256];
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = ((i * 53 + 17) % 256) as u8;
+        }
+        let mut a = [0i16; 64];
+        let mut b = [0i16; 64];
+        scalar::color::h2v2_downsample(&src, &mut a);
+        color::h2v2_downsample(&src, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn h2v2_downsample_avx2_matches_scalar_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // All-zero, all-max, alternating, and a vertical/horizontal
+        // gradient panel — exercises the bias rounding on inputs where
+        // it matters.
+        let panels: [[u8; 256]; 4] = [
+            [0u8; 256],
+            [255u8; 256],
+            {
+                let mut a = [0u8; 256];
+                for (i, v) in a.iter_mut().enumerate() {
+                    *v = if i % 2 == 0 { 1 } else { 0 };
+                }
+                a
+            },
+            {
+                let mut a = [0u8; 256];
+                for (i, v) in a.iter_mut().enumerate() {
+                    let row = i / 16;
+                    let col = i % 16;
+                    *v = ((row * 16 + col) % 256) as u8;
+                }
+                a
+            },
+        ];
+        for src in &panels {
+            let mut a = [0i16; 64];
+            let mut b = [0i16; 64];
+            scalar::color::h2v2_downsample(src, &mut a);
+            color::h2v2_downsample(src, &mut b);
+            assert_eq!(a, b);
+        }
     }
 
     #[test]
