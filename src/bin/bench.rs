@@ -1,10 +1,11 @@
-//! Phase 2 micro-benchmark: time `JpegEncoder::encode_rgba` over a few
+//! Micro-benchmark: time `JpegEncoder::encode_rgba` over a few
 //! representative resolutions. Prints per-iteration milliseconds and a
 //! crude ms/MPx figure so we can compare runs at a glance.
 //!
 //! Build with `cargo run -p jpeg-rusturbo --release --bin bench`.
-//! Numbers in `BENCH.md` are from `--release` on Apple M-series silicon
-//! (aarch64); on x86_64 the same binary exercises the scalar fallback.
+//! Build label reflects the active arch backend selected at compile
+//! time, including the partial AVX2 mix while x86_64 kernels are
+//! ported in stages.
 
 use std::time::Instant;
 
@@ -20,8 +21,12 @@ fn main() {
             "aarch64 (NEON kernels enabled)"
         } else if cfg!(target_arch = "aarch64") {
             "aarch64 (force-scalar — NEON kernels disabled)"
+        } else if cfg!(all(target_arch = "x86_64", not(feature = "force-scalar"))) {
+            "x86_64 (AVX2: quant; scalar: color/dct/huffman)"
+        } else if cfg!(target_arch = "x86_64") {
+            "x86_64 (force-scalar — AVX2 kernels disabled)"
         } else {
-            "scalar (non-aarch64)"
+            "scalar (other arch)"
         },
         profile = if cfg!(debug_assertions) {
             "debug (numbers will be useless)"

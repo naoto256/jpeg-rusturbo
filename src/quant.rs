@@ -13,13 +13,20 @@
 //! per coefficient (recip / corr / shift), exactly as libjpeg-turbo
 //! does in `jcdctmgr.c::compute_reciprocal`.
 //!
-//! Layout of `Divisors` (4 × 64 × i16 = 512 bytes):
-//!     [0..64)    reciprocals (interpreted as u16 at use)
-//!     [64..128)  correction biases (u16)
-//!     [128..192) "scale" — unused in our scalar path but reserved for
-//!                NEON's `vqdmulhq` variant (we use the wider mul→shrn
-//!                pattern instead, mirroring libjpeg's WITH_SIMD path)
-//!     [192..256) shift amount (i16, signed because some entries are 0)
+//! Layout of `Divisors`:
+//!     recip[64]  reciprocals (u16)
+//!     corr[64]   correction biases (u16, ≈ d/2 with rounding adjustment)
+//!     scale[64]  AVX2-only secondary multiplier (u16, = `1 << (32 - r)`)
+//!     shift[64]  scalar/NEON post-shift (i16, signed for the d=1 identity)
+//!
+//! Backends use different subsets:
+//!   - scalar / NEON: `(|x|+corr) * recip >> 16, then >> shift`
+//!   - AVX2:          `(|x|+corr) * recip >> 16, then * scale >> 16`
+//!
+//! The two are algebraically equivalent because `scale = 1 << (16-shift)`
+//! (so `* scale >> 16` and `>> shift` produce the same result modulo
+//! the high 16 bits being implicitly chopped by the multiply, which is
+//! exactly the `vpmulhuw` semantics).
 
 use crate::arch;
 use crate::tables::ZIGZAG;
@@ -30,6 +37,7 @@ use crate::tables::ZIGZAG;
 pub struct Divisors {
     pub recip: [u16; 64],
     pub corr: [u16; 64],
+    pub scale: [u16; 64],
     pub shift: [i16; 64],
 }
 
@@ -37,46 +45,56 @@ pub struct Divisors {
 /// 8-bit DQT values (already scaled by quality). The `<<3` here is
 /// what folds the LL&M DCT's overall scale of 8 into the divide.
 pub fn build_divisors(quant: &[u8; 64]) -> Divisors {
-    let mut d = Divisors { recip: [0; 64], corr: [0; 64], shift: [0; 64] };
+    let mut d = Divisors {
+        recip: [0; 64],
+        corr: [0; 64],
+        scale: [0; 64],
+        shift: [0; 64],
+    };
     for (i, &q) in quant.iter().enumerate() {
         let divisor = (q as u32) << 3;
-        let (recip, corr, shift) = compute_reciprocal(divisor);
+        let (recip, corr, scale, shift) = compute_reciprocal(divisor);
         d.recip[i] = recip;
         d.corr[i] = corr;
+        d.scale[i] = scale;
         d.shift[i] = shift;
     }
     d
 }
 
-/// Compute a 16-bit reciprocal/correction/shift triple such that
-/// `((x + corr) * recip) >> (shift + 16)` equals `(x + divisor/2) /
-/// divisor` for all `x` in `0..=2^15`.
+/// Compute the (recip, corr, scale, shift) tuple such that
+///   `((|x| + corr) * recip) >> 16) >> shift`         (scalar / NEON)
+/// and
+///   `(((|x| + corr) * recip) >> 16) * scale) >> 16`  (AVX2 via vpmulhuw)
+/// both equal `(|x| + divisor/2) / divisor` for every `|x|` in `0..=2^15`.
 ///
 /// Port of libjpeg-turbo's `compute_reciprocal` for `sizeof(DCTELEM)
-/// == 2`. We always go through the SIMD-shaped path (recip < 2^16,
-/// shift relative to a 16-bit narrow); our scalar quantize uses the
-/// same pre-shift pattern so divisors are interchangeable.
-fn compute_reciprocal(divisor: u32) -> (u16, u16, i16) {
+/// == 2`. The two backends differ only in how they apply the residual
+/// post-`>>16` shift: scalar/NEON have hardware variable-shift, AVX2
+/// fakes it with another high-half multiply (`scale = 1 << (32 - r)`).
+fn compute_reciprocal(divisor: u32) -> (u16, u16, u16, i16) {
     if divisor <= 1 {
         // Identity quantization: dividing by 1 is the same as no op.
-        // We encode that as recip=1, corr=0, shift=-16 so that
-        // (x + 0) * 1 >> (16 + -16) = x.
-        return (1, 0, -16);
+        // Scalar / NEON encode as recip=1, corr=0, shift=-16.
+        // AVX2 path uses scale=1 (irrelevant; the libjpeg-turbo C code
+        // marks this case as "scale is irrelevant" because the C path
+        // is selected for d=1 even in WITH_SIMD builds).
+        return (1, 0, 1, -16);
     }
     // b = position of MSB of `divisor` (0-based, so divisor in [1,2] →
-    // b=0, [2,4) → b=1, etc.). flss-1 in libjpeg.
+    // b=0, [2,4) → b=1, etc.). `flss(d) - 1` in libjpeg.
     let b = 31 - divisor.leading_zeros();
     // r = sizeof(DCTELEM)*8 + b = 16 + b.
-    let r = 16u32 + b;
+    let r0 = 16u32 + b;
 
-    let mut fq = (1u64 << r) / divisor as u64;
-    let fr = (1u64 << r) % divisor as u64;
+    let mut fq = (1u64 << r0) / divisor as u64;
+    let fr = (1u64 << r0) % divisor as u64;
     let mut c = (divisor / 2) as u64;
-    let mut r_eff = r;
+    let mut r = r0;
     if fr == 0 {
         // Power-of-two divisor: fq is one bit too big, drop one.
         fq >>= 1;
-        r_eff -= 1;
+        r -= 1;
     } else if fr <= (divisor as u64 / 2) {
         c += 1;
     } else {
@@ -85,8 +103,12 @@ fn compute_reciprocal(divisor: u32) -> (u16, u16, i16) {
 
     let recip = fq as u16; // fits because fq < 2^16 by construction.
     let corr = c as u16;
-    let shift = r_eff as i32 - 16;
-    (recip, corr, shift as i16)
+    // scale = 1 << (sizeof(DCTELEM)*8*2 - r) = 1 << (32 - r). Since
+    // `(q << 3) >= 8` in our caller, `b >= 3` (max b=10 for q=255),
+    // so `r ∈ [18, 26]` and `scale ∈ [64, 16384]` — fits in u16.
+    let scale = (1u32 << (32 - r)) as u16;
+    let shift = r as i32 - 16;
+    (recip, corr, scale, shift as i16)
 }
 
 /// Quantize a block (in natural order) and emit zig-zag-reordered output.

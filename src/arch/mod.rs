@@ -9,10 +9,12 @@
 //! Selection rules:
 //!
 //! - `aarch64` + `not(force-scalar)`  → `neon`
+//! - `x86_64`  + `not(force-scalar)`  → `x86_64` (AVX2 with scalar fallback
+//!                                                at runtime when AVX2 absent)
 //! - everything else                  → `scalar`
 //!
-//! `x86_64` has its own module reserved for an upcoming AVX2 port; it
-//! is currently empty and not wired into the dispatch.
+//! On x86_64, individual kernels in `arch::x86_64` may currently delegate
+//! to scalar pending their AVX2 port (incremental Step 3 work).
 
 pub mod scalar;
 
@@ -25,5 +27,11 @@ pub mod x86_64;
 #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
 pub use neon as backend;
 
-#[cfg(not(all(target_arch = "aarch64", not(feature = "force-scalar"))))]
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+pub use x86_64 as backend;
+
+#[cfg(any(
+    feature = "force-scalar",
+    not(any(target_arch = "aarch64", target_arch = "x86_64"))
+))]
 pub use scalar as backend;
