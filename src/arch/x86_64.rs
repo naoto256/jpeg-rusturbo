@@ -1,5 +1,5 @@
 //! x86_64 SIMD kernels — translations of libjpeg-turbo's
-//! `simd/x86_64/*-avx2.asm`. See `LICENSES/libjpeg-turbo.txt`.
+//! `simd/x86_64/*-avx2.asm`. See `NOTICE.md`.
 //!
 //! Backend status:
 //!   - `quant`           — AVX2

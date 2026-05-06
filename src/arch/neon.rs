@@ -1,6 +1,6 @@
 //! AArch64 NEON kernels — translations of libjpeg-turbo's
 //! `simd/arm/jccolor-neon.c`, `jcsample-neon.c`, `jfdctint-neon.c`, and
-//! `jquanti-neon.c`. See `LICENSES/libjpeg-turbo.txt` for the upstream
+//! `jquanti-neon.c`. See `NOTICE.md` for the upstream
 //! BSD-3-Clause + IJG notice.
 //!
 //! Output is bit-exact identical to `arch::scalar` — the cross-check

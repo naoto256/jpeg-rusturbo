@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Baseline JPEG encoder with integer LL&M DCT and per-arch SIMD kernels (AArch64 NEON, x86_64 AVX2)."
+readme = "README.md"
+keywords = ["jpeg", "encoder", "simd", "neon", "avx2"]
+categories = ["multimedia::images", "encoding"]
 
 [lib]
 path = "src/lib.rs"
