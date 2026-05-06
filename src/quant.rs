@@ -33,7 +33,11 @@ use crate::tables::ZIGZAG;
 
 /// Per-coefficient quantization helper. Indexed in *natural* order
 /// (NOT zig-zag). The `quantize_and_zigzag` function reorders on output.
-#[derive(Clone, Copy)]
+///
+/// `Debug` is derived for diagnostics, but the default `[u16; 64] × 3 +
+/// [i16; 64]` formatting is verbose; expect ~256 lines of integers if
+/// you actually print one.
+#[derive(Clone, Copy, Debug)]
 pub struct Divisors {
     pub recip: [u16; 64],
     pub corr: [u16; 64],

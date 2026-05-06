@@ -2,10 +2,8 @@
 //! representative resolutions. Prints per-iteration milliseconds and a
 //! crude ms/MPx figure so we can compare runs at a glance.
 //!
-//! Build with `cargo run -p jpeg-rusturbo --release --bin bench`.
-//! Build label reflects the active arch backend selected at compile
-//! time, including the partial AVX2 mix while x86_64 kernels are
-//! ported in stages.
+//! Build with `cargo run -p jpeg-rusturbo --release --bin bench`. The
+//! build label reflects the active arch backend selected at compile time.
 
 use std::time::Instant;
 

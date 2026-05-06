@@ -13,8 +13,23 @@
 //!                                                at runtime when AVX2 absent)
 //! - everything else                  → `scalar`
 //!
-//! On x86_64, individual kernels in `arch::x86_64` may currently delegate
-//! to scalar pending their AVX2 port (incremental Step 3 work).
+//! `arch::x86_64::huffman` intentionally stays scalar — its AC zero-scan
+//! helper autovectorizes well in the trivial scalar form, and the
+//! entropy loop is too branchy for SIMD to win. See BENCH.md.
+//!
+//! ## Adding a new backend
+//!
+//! 1. Create `arch/<name>.rs` with four inline modules (`color`, `dct`,
+//!    `quant`, `huffman`), each exposing the kernel functions named in
+//!    `arch::scalar` (use `pub use crate::arch::scalar::<kernel>::*;`
+//!    for any kernel you don't override).
+//! 2. Declare the module here under the appropriate `#[cfg(target_arch
+//!    = "...")]` gate.
+//! 3. Add a `pub use <name> as backend;` cfg arm so it gets selected.
+//! 4. Update `bin/bench.rs`'s `arch` label to print the right string.
+//! 5. Mirror the cross-check tests pattern from `arch::neon::tests` /
+//!    `arch::x86_64::tests` (compare each kernel against scalar on a
+//!    panel of inputs).
 
 pub mod scalar;
 

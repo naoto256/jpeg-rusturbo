@@ -35,7 +35,7 @@ pub(crate) const CR_B: u32 = 5329;
 pub(crate) const CHROMA_BIAS: u32 = (128 << 16) + 32767;
 
 /// Pixel-stride descriptor: bytes per pixel.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelLayout {
     pub bpp: usize,
 }
