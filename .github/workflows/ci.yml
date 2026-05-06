@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Test the four combinations that matter for this crate:
+  #   ubuntu-latest      × default       → x86_64 AVX2 (with runtime detect)
+  #   ubuntu-latest      × force-scalar  → scalar fallback on x86_64
+  #   macos-14 (M-series) × default       → aarch64 NEON
+  #   macos-14            × force-scalar  → scalar fallback on aarch64
+  # Each path runs the full test suite + doctests; bit-exact equivalence
+  # against scalar is asserted in the cross-check unit tests within each
+  # SIMD backend.
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        features:
+          - ""
+          - "--features force-scalar"
+        include:
+          - features: ""
+            label: default-simd
+          - features: "--features force-scalar"
+            label: force-scalar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.label }}
+
+      - name: Build
+        run: cargo build --release ${{ matrix.features }} --all-targets
+
+      - name: Test
+        run: cargo test --release ${{ matrix.features }}
+
+      # Doctests only run on the default-feature build (the doc examples
+      # don't depend on force-scalar; running them once is enough).
+      - name: Doctests
+        if: matrix.features == ''
+        run: cargo test --release --doc
+
+  # Static checks: rustfmt + clippy. Run only on Linux x86_64 — these
+  # don't depend on the active SIMD backend.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+  # Build rustdoc with broken-link / missing-attribution checks turned
+  # into hard errors. This catches doc rot before docs.rs sees it.
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      - name: cargo doc
+        run: cargo doc --no-deps --release
