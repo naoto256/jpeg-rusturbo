@@ -1,34 +1,90 @@
-//! Baseline JPEG encoder — integer LL&M DCT + per-arch SIMD kernels.
+//! Baseline JPEG encoder — drop-in for [`image::codecs::jpeg::JpegEncoder`]
+//! with NEON / AVX2 / scalar SIMD backends.
 //!
-//! Hot kernels live behind a single `arch::backend` dispatch chosen at
-//! compile time (`aarch64 + !force-scalar` → NEON; everything else →
-//! scalar reference). All SIMD backends produce bit-exact-equivalent
-//! output to the scalar reference; cross-check tests assert this in
-//! `arch::neon`'s test module.
+//! [`image::codecs::jpeg::JpegEncoder`]: https://docs.rs/image/latest/image/codecs/jpeg/struct.JpegEncoder.html
 //!
-//! Pipeline:
+//! # Quick start
+//!
+//! ```
+//! use jpeg_rusturbo::JpegEncoder;
+//!
+//! let pixels = vec![128u8; 16 * 16 * 4]; // 16x16 mid-gray RGBA
+//! let mut out: Vec<u8> = Vec::new();
+//! let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+//! enc.encode_rgba(&pixels, 16, 16)?;
+//! assert_eq!(&out[..2], &[0xFF, 0xD8]); // SOI marker
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Choosing chroma subsampling
+//!
+//! ```
+//! use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};
+//!
+//! let mut out: Vec<u8> = Vec::new();
+//! let mut enc = JpegEncoder::new_with_quality(&mut out, 90);
+//! enc.set_subsampling(ChromaSubsampling::Yuv444); // higher chroma fidelity
+//! # let pixels = vec![0u8; 8 * 8 * 4];
+//! # enc.encode_rgba(&pixels, 8, 8)?;
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! Default is [`ChromaSubsampling::Yuv420`] (matches what mainstream
+//! JPEG encoders ship). [`ChromaSubsampling::Yuv444`] preserves chroma
+//! at full resolution, useful for graphic / text content.
+//!
+//! # Performance
+//!
+//! Per-architecture SIMD kernels (NEON on aarch64, AVX2 on x86_64)
+//! are translated from libjpeg-turbo with bit-exact output guarantees
+//! against the scalar reference. Whole-pipeline speedup vs scalar is
+//! around 1.7-1.9x at 1080p / 4K on Apple Silicon and recent Intel /
+//! AMD x86_64. See [`BENCH.md`] in the repository for detailed
+//! numbers.
+//!
+//! [`BENCH.md`]: https://github.com/example/jpeg-rusturbo/blob/main/BENCH.md
+//!
+//! On x86_64, AVX2 dispatch is gated by a runtime
+//! `is_x86_feature_detected!("avx2")` check; CPUs without AVX2 fall
+//! through to the scalar path automatically.
+//!
+//! The `force-scalar` Cargo feature opts every target out of SIMD
+//! (used by the bench harness to compare scalar vs SIMD on the same
+//! hardware).
+//!
+//! # Implementation notes
+//!
+//! Hot kernels live behind `arch::backend::*` selected at compile
+//! time. The pipeline:
 //!
 //! ```text
 //!   RGB(A) bytes
-//!       │ color::extract_*                    (orchestration)
+//!       │ block / MCU extraction (orchestration)
 //!       │   └─ arch::backend::color::rgb_row_to_ycc
 //!       ▼
 //!   8x8 i16 blocks (level-shifted)
 //!       │ arch::backend::dct::fdct_islow      (12-mul integer LL&M DCT)
 //!       ▼
 //!   8x8 i16 DCT coefficients (scaled by 8)
-//!       │ quant::quantize_and_zigzag
-//!       │   └─ arch::backend::quant::quantize_natural + scalar zig-zag
+//!       │ quantize + zig-zag
+//!       │   └─ arch::backend::quant::quantize_natural
 //!       ▼
 //!   8x8 i16 zig-zag coefficients
-//!       │ huffman::encode_block               (Phase 2.5: u64 accumulator,
+//!       │ Huffman entropy code
 //!       │   └─ arch::backend::huffman::group_of_8_is_zero (8-skip)
 //!       ▼
 //!   entropy-coded bytes (with 0xFF → 0xFF 0x00 stuffing)
 //! ```
 //!
-//! See `NOTICE.md` for attribution; the SIMD kernels are translations
-//! of libjpeg-turbo (BSD-3-Clause + IJG).
+//! See [`docs/ARCHITECTURE.md`] for the full internal design and the
+//! "adding a new arch backend" recipe.
+//!
+//! [`docs/ARCHITECTURE.md`]: https://github.com/example/jpeg-rusturbo/blob/main/docs/ARCHITECTURE.md
+//!
+//! # Attribution
+//!
+//! The SIMD kernels are translations of libjpeg-turbo (BSD-3-Clause +
+//! IJG). See `NOTICE.md` in the repository for the full attribution.
 
 mod arch;
 mod color;
@@ -47,20 +103,53 @@ use crate::tables::{
     scale_quant_table,
 };
 
-/// Chroma subsampling mode. We support 4:4:4 (no subsample) and 4:2:0
-/// (2x2 chroma block per luma block — what every conventional baseline
-/// JPEG ships).
+/// Chroma subsampling mode for the encoded JPEG.
+///
+/// JPEG stores Y separately from Cb / Cr. Subsampling reduces chroma
+/// resolution because the human visual system is much more sensitive
+/// to luma than chroma; trading chroma detail for smaller files is
+/// usually invisible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChromaSubsampling {
-    /// Y, Cb, Cr at full resolution.
+    /// 4:4:4 — Y, Cb, Cr all at full resolution.
+    ///
+    /// No chroma loss. Bigger files. Right choice for synthetic
+    /// content (text, line art, screenshots) where chroma edges
+    /// matter.
     Yuv444,
-    /// Y at full resolution, Cb/Cr at half resolution in both axes.
+    /// 4:2:0 — Y at full resolution, Cb / Cr at half resolution in
+    /// both axes (one chroma sample per 2×2 luma quad).
+    ///
+    /// Default. What most cameras and image software produce. Roughly
+    /// 1.5× smaller than 4:4:4 at the same quality knob, with no
+    /// visible loss on natural-scene photographs.
     Yuv420,
 }
 
-/// Drop-in JPEG encoder. Mirrors the `image::codecs::jpeg::JpegEncoder`
-/// shape so call sites can be ported with a `use` swap. Default
-/// subsampling is 4:2:0 to match what we ship today.
+/// JPEG encoder over an arbitrary [`Write`] sink.
+///
+/// Public API mirrors [`image::codecs::jpeg::JpegEncoder`] so call
+/// sites can be ported by changing the `use` line.
+///
+/// [`image::codecs::jpeg::JpegEncoder`]: https://docs.rs/image/latest/image/codecs/jpeg/struct.JpegEncoder.html
+///
+/// # Examples
+///
+/// ```
+/// use jpeg_rusturbo::JpegEncoder;
+///
+/// let mut out: Vec<u8> = Vec::new();
+/// let mut enc = JpegEncoder::new_with_quality(&mut out, 75);
+/// # let pixels = vec![0u8; 8 * 8 * 3];
+/// enc.encode_rgb(&pixels, 8, 8)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// Each `encode_*` call produces a complete, self-contained JPEG
+/// stream (SOI … EOI). Calling `encode_*` more than once on the same
+/// encoder will produce concatenated streams in the sink, which is
+/// almost certainly not what you want — construct a fresh
+/// `JpegEncoder` per image.
 pub struct JpegEncoder<W: Write> {
     out: W,
     quality: u8,
@@ -68,9 +157,16 @@ pub struct JpegEncoder<W: Write> {
 }
 
 impl<W: Write> JpegEncoder<W> {
-    /// Create an encoder at the given quality (1..=100, clamped). The
-    /// inner writer receives the full JPEG byte stream when `encode_*`
-    /// is called.
+    /// Create an encoder at the given quality, writing to `out`.
+    ///
+    /// `quality` is the conventional JPEG quality knob: 1..=100,
+    /// clamped to that range. 1 is the smallest / lowest fidelity, 100
+    /// is the largest / highest. Most workflows use 70-90; defaults to
+    /// 80 are common.
+    ///
+    /// Subsampling defaults to [`ChromaSubsampling::Yuv420`]; override
+    /// with [`set_subsampling`](Self::set_subsampling) before calling
+    /// any `encode_*` method.
     pub fn new_with_quality(out: W, quality: u8) -> Self {
         Self {
             out,
@@ -79,21 +175,42 @@ impl<W: Write> JpegEncoder<W> {
         }
     }
 
-    /// Override subsampling. Call before `encode_*`.
+    /// Override the chroma subsampling mode for this encoder. Must be
+    /// called before any `encode_*`; the value is read once at the
+    /// start of encoding.
     pub fn set_subsampling(&mut self, s: ChromaSubsampling) {
         self.subsampling = s;
     }
 
-    /// Encode an RGB pixel buffer. `pixels.len()` must be at least
-    /// `width * height * 3`; trailing bytes are ignored.
+    /// Encode an RGB pixel buffer (3 bytes/pixel) as a complete JPEG
+    /// stream into the sink.
+    ///
+    /// `pixels` is treated as `width * height` packed RGB triples in
+    /// row-major order. Trailing bytes past `width * height * 3` are
+    /// ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `width` or `height`
+    /// is zero, if `width * height * 3` overflows `usize`, or if the
+    /// pixel buffer is shorter than `width * height * 3`. Any I/O
+    /// error from the sink is propagated as-is.
     pub fn encode_rgb(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
         self.encode_inner(pixels, width, height, RGB)
     }
 
-    /// Encode an RGBA pixel buffer. The alpha channel is dropped (JPEG
-    /// has no alpha). Saves one full-frame copy compared to the
-    /// `image` crate's encoder, which only accepts RGB and forces the
-    /// caller to repack.
+    /// Encode an RGBA pixel buffer (4 bytes/pixel) as a complete JPEG
+    /// stream into the sink. The alpha channel is dropped (JPEG has
+    /// no alpha).
+    ///
+    /// Compared to `encode_rgb`, this avoids the caller having to
+    /// repack RGBA → RGB before calling, saving one full-frame copy
+    /// on the common case where image data arrives as RGBA.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`encode_rgb`](Self::encode_rgb) but with the size
+    /// requirement `width * height * 4`.
     pub fn encode_rgba(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
         self.encode_inner(pixels, width, height, RGBA)
     }
