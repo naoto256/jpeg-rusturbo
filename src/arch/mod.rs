@@ -9,8 +9,8 @@
 //! Selection rules:
 //!
 //! - `aarch64` + `not(force-scalar)`  → `neon`
-//! - `x86_64`  + `not(force-scalar)`  → `x86_64` (AVX2 with scalar fallback
-//!                                                at runtime when AVX2 absent)
+//! - `x86_64`  + `not(force-scalar)`  → `x86_64` (AVX2; runtime
+//!   `is_x86_feature_detected!` falls back to scalar on non-AVX2 CPUs)
 //! - everything else                  → `scalar`
 //!
 //! `arch::x86_64::huffman` intentionally stays scalar — its AC zero-scan

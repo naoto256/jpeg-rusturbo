@@ -109,7 +109,12 @@ pub fn extract_block_ycbcr(
             &pixels[row_off + x0 as usize * bpp..row_off + (x0 as usize + 8) * bpp]
         };
         arch::backend::color::rgb_row_to_ycc(
-            src_slice, layout, 8, &mut y_row, &mut cb_row, &mut cr_row,
+            src_slice,
+            layout,
+            8,
+            &mut y_row,
+            &mut cb_row,
+            &mut cr_row,
         );
         for i in 0..8 {
             let idx = j * 8 + i;
@@ -174,8 +179,7 @@ pub fn extract_mcu_420(
             let dst = &mut y_blocks[jq * 2 + iq];
             for j in 0..8 {
                 for i in 0..8 {
-                    dst[j * 8 + i] =
-                        (y_full[(jq * 8 + j) * 16 + (iq * 8 + i)] as i16) - 128;
+                    dst[j * 8 + i] = (y_full[(jq * 8 + j) * 16 + (iq * 8 + i)] as i16) - 128;
                 }
             }
         }

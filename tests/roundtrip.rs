@@ -138,7 +138,10 @@ fn rgba_input_matches_rgb_input() {
 
     // Streams are byte-equal: alpha is dropped before any arithmetic,
     // so the YCbCr planes match.
-    assert_eq!(jpeg_a, jpeg_b, "RGB and RGBA at the same quality should match");
+    assert_eq!(
+        jpeg_a, jpeg_b,
+        "RGB and RGBA at the same quality should match"
+    );
 }
 
 // Constant-color image: every pixel of every block decodes to (very
