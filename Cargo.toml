@@ -1,0 +1,19 @@
+[package]
+name = "jpeg-rusturbo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Baseline JPEG encoder with integer LL&M DCT and AArch64 NEON kernels."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Force the scalar fallback even on aarch64. Used by the bench harness
+# to measure NEON speedup vs scalar without leaving the same binary.
+force-scalar = []
+
+[dependencies]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
