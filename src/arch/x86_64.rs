@@ -2,13 +2,14 @@
 //! `simd/x86_64/*-avx2.asm`. See `NOTICE.md`.
 //!
 //! Backend status:
-//!   - `quant`           — AVX2
-//!   - `dct`             — AVX2
-//!   - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
-//!                              scalar fallback for n=8 / RGB / non-AVX2
-//!   - `color::h2v2_downsample` — AVX2
-//!   - `huffman`         — delegate to scalar (the AC zero-scan helper
-//!                         autovectorizes well in scalar form)
+//!
+//! - `quant` — AVX2
+//! - `dct` — AVX2
+//! - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
+//!   scalar fallback for n=8 / RGB / non-AVX2
+//! - `color::h2v2_downsample` — AVX2
+//! - `huffman` — delegate to scalar (the AC zero-scan helper
+//!   autovectorizes well in scalar form)
 //!
 //! Runtime feature detection: AVX2 is the only target we ever dispatch
 //! to from x86_64. Non-AVX2 CPUs hit the scalar fallback at runtime via
@@ -173,46 +174,48 @@ pub mod color {
     /// by-value vector lanes; no memory access.
     #[inline(always)]
     unsafe fn deinterleave_rgba16(p0: __m256i, p1: __m256i) -> (__m256i, __m256i, __m256i) {
-        // mask: per 128-bit lane, place RRRRGGGGBBBBAAAA at byte 0..15.
-        let shuf = _mm256_setr_epi8(
-            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6,
-            10, 14, 3, 7, 11, 15,
-        );
-        // After vpshufb (per-lane):
-        //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
-        //   s0 hi lane = [R4..7 G4..7 B4..7 A4..7]
-        //   s1 lo lane = [R8..11 G8..11 B8..11 A8..11]
-        //   s1 hi lane = [R12..15 G12..15 B12..15 A12..15]
-        let s0 = _mm256_shuffle_epi8(p0, shuf);
-        let s1 = _mm256_shuffle_epi8(p1, shuf);
+        unsafe {
+            // mask: per 128-bit lane, place RRRRGGGGBBBBAAAA at byte 0..15.
+            let shuf = _mm256_setr_epi8(
+                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2,
+                6, 10, 14, 3, 7, 11, 15,
+            );
+            // After vpshufb (per-lane):
+            //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
+            //   s0 hi lane = [R4..7 G4..7 B4..7 A4..7]
+            //   s1 lo lane = [R8..11 G8..11 B8..11 A8..11]
+            //   s1 hi lane = [R12..15 G12..15 B12..15 A12..15]
+            let s0 = _mm256_shuffle_epi8(p0, shuf);
+            let s1 = _mm256_shuffle_epi8(p1, shuf);
 
-        // unpacklo/hi 32-bit chunks: align R/G chunks (resp. B/A) across
-        // both inputs.
-        //   lo32 lane content (per 32-bit lane): [R0..3, R8..11, G0..3, G8..11,
-        //                                          R4..7, R12..15, G4..7, G12..15]
-        //   hi32 lane content: same shape but with B/A.
-        let lo32 = _mm256_unpacklo_epi32(s0, s1);
-        let hi32 = _mm256_unpackhi_epi32(s0, s1);
+            // unpacklo/hi 32-bit chunks: align R/G chunks (resp. B/A) across
+            // both inputs.
+            //   lo32 lane content (per 32-bit lane): [R0..3, R8..11, G0..3, G8..11,
+            //                                          R4..7, R12..15, G4..7, G12..15]
+            //   hi32 lane content: same shape but with B/A.
+            let lo32 = _mm256_unpacklo_epi32(s0, s1);
+            let hi32 = _mm256_unpackhi_epi32(s0, s1);
 
-        // vpermd indices to gather 16 contiguous channel bytes into lo
-        // 128 of result (i.e. into 4 32-bit lanes).
-        //   R: 32-bit lanes 0, 4, 1, 5 of lo32 → R0..3, R4..7, R8..11, R12..15
-        //   G: lanes 2, 6, 3, 7 of lo32
-        //   B: lanes 0, 4, 1, 5 of hi32
-        let idx_r = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
-        let idx_g = _mm256_setr_epi32(2, 6, 3, 7, 0, 0, 0, 0);
-        let idx_b = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
+            // vpermd indices to gather 16 contiguous channel bytes into lo
+            // 128 of result (i.e. into 4 32-bit lanes).
+            //   R: 32-bit lanes 0, 4, 1, 5 of lo32 → R0..3, R4..7, R8..11, R12..15
+            //   G: lanes 2, 6, 3, 7 of lo32
+            //   B: lanes 0, 4, 1, 5 of hi32
+            let idx_r = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
+            let idx_g = _mm256_setr_epi32(2, 6, 3, 7, 0, 0, 0, 0);
+            let idx_b = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
 
-        let r_packed = _mm256_permutevar8x32_epi32(lo32, idx_r);
-        let g_packed = _mm256_permutevar8x32_epi32(lo32, idx_g);
-        let b_packed = _mm256_permutevar8x32_epi32(hi32, idx_b);
+            let r_packed = _mm256_permutevar8x32_epi32(lo32, idx_r);
+            let g_packed = _mm256_permutevar8x32_epi32(lo32, idx_g);
+            let b_packed = _mm256_permutevar8x32_epi32(hi32, idx_b);
 
-        // Widen 16 u8 (in lo 128) → 16 u16 (full ymm).
-        let r_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(r_packed));
-        let g_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(g_packed));
-        let b_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(b_packed));
+            // Widen 16 u8 (in lo 128) → 16 u16 (full ymm).
+            let r_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(r_packed));
+            let g_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(g_packed));
+            let b_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(b_packed));
 
-        (r_u16, g_u16, b_u16)
+            (r_u16, g_u16, b_u16)
+        }
     }
 
     /// Compute one of Y/Cb/Cr from the deinterleaved channels. Returns a
@@ -236,19 +239,21 @@ pub mod color {
         extra_hi: __m256i,
         bias: __m256i,
     ) -> __m256i {
-        let p_lo = _mm256_madd_epi16(rg_or_bg_lo, c_xy);
-        let p_hi = _mm256_madd_epi16(rg_or_bg_hi, c_xy);
-        let s_lo = _mm256_add_epi32(_mm256_add_epi32(p_lo, extra_lo), bias);
-        let s_hi = _mm256_add_epi32(_mm256_add_epi32(p_hi, extra_hi), bias);
-        // Logical >> 16: the sum is always non-negative for the chosen
-        // biases (Y's bias is +0.5, Cb/Cr add the +128 center plus the
-        // round bias), so srli gives the same result as srai.
-        let q_lo = _mm256_srli_epi32::<16>(s_lo);
-        let q_hi = _mm256_srli_epi32::<16>(s_hi);
-        // Pack i32 → u16 (saturating). The result interleaves lanes
-        // per 128-bit lane of pack: lo 128 = [q_lo[0..3], q_hi[0..3]] =
-        // pixels 0..7; hi 128 = [q_lo[4..7], q_hi[4..7]] = pixels 8..15.
-        _mm256_packus_epi32(q_lo, q_hi)
+        unsafe {
+            let p_lo = _mm256_madd_epi16(rg_or_bg_lo, c_xy);
+            let p_hi = _mm256_madd_epi16(rg_or_bg_hi, c_xy);
+            let s_lo = _mm256_add_epi32(_mm256_add_epi32(p_lo, extra_lo), bias);
+            let s_hi = _mm256_add_epi32(_mm256_add_epi32(p_hi, extra_hi), bias);
+            // Logical >> 16: the sum is always non-negative for the chosen
+            // biases (Y's bias is +0.5, Cb/Cr add the +128 center plus the
+            // round bias), so srli gives the same result as srai.
+            let q_lo = _mm256_srli_epi32::<16>(s_lo);
+            let q_hi = _mm256_srli_epi32::<16>(s_hi);
+            // Pack i32 → u16 (saturating). The result interleaves lanes
+            // per 128-bit lane of pack: lo 128 = [q_lo[0..3], q_hi[0..3]] =
+            // pixels 0..7; hi 128 = [q_lo[4..7], q_hi[4..7]] = pixels 8..15.
+            _mm256_packus_epi32(q_lo, q_hi)
+        }
     }
 
     /// Pack 16 u16 (in one ymm) → 16 u8 in low 128 bits, then store.
@@ -258,10 +263,12 @@ pub mod color {
     /// - `out` must be writable for at least 16 bytes.
     #[inline(always)]
     unsafe fn pack_and_store_u16x16(v: __m256i, out: *mut u8) {
-        let lo = _mm256_castsi256_si128(v);
-        let hi = _mm256_extracti128_si256::<1>(v);
-        let packed = _mm_packus_epi16(lo, hi);
-        _mm_storeu_si128(out as *mut __m128i, packed);
+        unsafe {
+            let lo = _mm256_castsi256_si128(v);
+            let hi = _mm256_extracti128_si256::<1>(v);
+            let packed = _mm_packus_epi16(lo, hi);
+            _mm_storeu_si128(out as *mut __m128i, packed);
+        }
     }
 
     /// # Safety
@@ -455,7 +462,7 @@ pub mod dct {
     /// - `p` must point to at least 32 readable bytes.
     #[inline(always)]
     unsafe fn load(p: *const i16) -> __m256i {
-        _mm256_loadu_si256(p as *const __m256i)
+        unsafe { _mm256_loadu_si256(p as *const __m256i) }
     }
 
     /// In-place 8x8x16-bit transpose. Mirrors the DOTRANSPOSE asm macro:
