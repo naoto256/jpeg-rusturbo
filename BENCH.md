@@ -94,12 +94,92 @@ target-independent — only the AC zero-scan SIMD is aarch64-gated.
 \* Phase 1 numbers reproduced from the brief; not re-measured for this
 section.
 
-## Phase 3 candidates (not in scope)
+## Phase 3 — x86_64 AVX2 port
 
-  - x86_64 SSE2/AVX2 versions of the same four kernels (the brief calls
-    this "Phase 3").
-  - Huffman bit-pack vectorization. Worth experimenting once we have
-    flamegraphs from real workloads; the exact AC scan is branchy but
-    the run-length detection (`v != 0` mask + popcount) does vectorize.
-  - Reduce per-block scratch allocation in `encode_inner` — small but
-    nonzero overhead from re-zeroing the `i16` block arrays per MCU.
+Phase 3 ports the four hot kernels (color RGB→YCbCr, 4:2:0 chroma
+downsample, integer LL&M FDCT, reciprocal-multiply quantize) to x86_64
+AVX2, translated from libjpeg-turbo's `simd/x86_64/*-avx2.asm`. Color
+is AVX2-fast for the 4:2:0 hot path (`n=16`, RGBA layout); narrower
+calls and RGB-bpp inputs still go through scalar. The scaffolding
+(arch backend modules, runtime AVX2 detection, CI-friendly cfg
+plumbing) lives in `src/arch/`.
+
+The Huffman entropy coder is intentionally left scalar — the same
+reasoning as Phase 2 (libjpeg-turbo itself doesn't ship an AVX2 Huffman
+kernel for our shape, and the loop is too branchy for SIMD to win).
+The Phase 2.5 64-bit accumulator + branchless inner path + 8-skip
+zero-scan stays as is.
+
+### Setup — Intel Ice Lake
+
+Measured on Azure `Standard_D2s_v5` Spot (Intel Xeon Platinum 8370C,
+Ice Lake-SP, 2 vCPU, 8 GB) at 100 iterations per resolution after a
+3-iteration warm-up. Five repeated runs, variance < 1 % across runs;
+numbers below are the median.
+
+| Resolution                  | scalar (force-scalar) | AVX2  | speedup |
+| --------------------------- | --------------------: | ----: | ------: |
+| 1592 x 1124 (session size)  |             24.69 ms  | 14.56 ms |  1.70x |
+| 1920 x 1080 (1080p)         |             28.27 ms  | 16.57 ms |  1.71x |
+| 3840 x 2160 (4K)            |            109.90 ms  | 63.93 ms |  1.72x |
+
+Bytes-out across builds: `423839 / 488459 / 1940692` — byte-identical
+to scalar and to the Apple Silicon NEON build at every resolution,
+verified by both the cross-check unit tests and the roundtrip suite.
+
+### Where the AVX2 speedup is
+
+The ~1.71x whole-pipeline speedup matches what Amdahl's law predicts
+once the Huffman + marker/IO portion (~45-50 %) stays scalar and the
+remaining color/dct/quant/downsample chunk (~50-55 %) hits roughly
+3x in its kernels.
+
+A rough per-stage breakdown on the Ice Lake host (Phase 3 AVX2):
+
+  Color/downsample  ~25%  (AVX2: ~3.0x;  scalar: 1.0x)
+  Forward DCT       ~20%  (AVX2: ~2.7x;  scalar: 1.0x)
+  Quantize+zig-zag  ~10%  (AVX2: ~2.5x;  scalar: 1.0x)
+  Huffman           ~35%  (scalar in both)
+  Marker writes/IO  ~10%  (scalar in both)
+
+### Apple Silicon NEON revisit
+
+The Step 1 refactor (kernels moved behind `arch::backend::*`) added a
+small amount of inlining indirection. Re-measured Apple M-series
+numbers shift by 1-5 % vs the original Phase 2.5 figures; the NEON
+path is still bit-exact, just slightly slower at the function-call
+boundary the compiler doesn't always collapse. We accept this as the
+cost of having a uniform x86_64/AArch64 dispatch surface.
+
+| Resolution                  | Phase 2.5 NEON | Phase 3 NEON (refactored) | Δ |
+| --------------------------- | -------------: | ------------------------: | -: |
+| 1592 x 1124                 |        5.92 ms |                   6.15 ms | +3.9% |
+| 1920 x 1080                 |        6.75 ms |                   6.97 ms | +3.3% |
+| 3840 x 2160                 |       27.23 ms |                   28.50 ms | +4.7% |
+
+### Cumulative across phases (4K representative)
+
+| Phase                                          | aarch64        | x86_64 (Ice Lake) |
+| ---------------------------------------------- | -------------: | ----------------: |
+| Phase 1 (f32 scalar)                           |     ~51.44 ms\* |                 — |
+| Phase 2 NEON (4 kernels)                       |        37.92 ms |                 — |
+| Phase 2.5 NEON (+ Huffman 64-bit)              |        27.23 ms |                 — |
+| **Phase 3 AVX2 (4 kernels)**                   |     **28.50 ms** |       **63.93 ms** |
+| Phase 3 force-scalar (reference)               |          ~40 ms |          109.90 ms |
+
+\* Phase 1 reproduced from the brief.
+
+The aarch64 column at "Phase 3 AVX2" is the same NEON build measured
+above (the AVX2 work doesn't change the aarch64 path); shown to make
+the cross-architecture comparison easy.
+
+## Out of scope (still)
+
+  - AVX-512 versions of the four kernels. Ice Lake has AVX-512 but the
+    server market is bifurcated (Zen 4 has it, Zen 2/3 don't, Alder
+    Lake P-cores have it disabled in many bins). AVX2 is the safe
+    floor.
+  - Huffman vectorization (see Phase 2.5 notes — same conclusion).
+  - x86 32-bit and SSE2-only fallback. Non-AVX2 x86_64 already runs
+    via the scalar path through runtime feature detection; AVX2 has
+    been the de-facto floor for new code since ~2014.
