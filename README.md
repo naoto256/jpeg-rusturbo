@@ -1,5 +1,7 @@
 # jpeg-rusturbo
 
+[![CI](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/ci.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/ci.yml)
+[![Release](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Baseline JPEG encoder with libjpeg-turbo-derived SIMD kernels —
@@ -116,10 +118,9 @@ JPEG that decodes round-trip-equivalent through any conforming decoder
 (verified via `image`'s decoder in the test suite). The public API has
 settled but `0.1` reserves the right to evolve before `1.0`.
 
-This crate's reason for existing is performance under the same public
-contract `image` offers, so **upstreaming into the `image` crate
-itself is on the table** — if the maintainers want it, this code is
-designed to fit. Until then it ships as a standalone drop-in.
+The public API is intentionally identical to `image`'s
+`JpegEncoder`, so call sites can swap implementations with a `use`
+change.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
