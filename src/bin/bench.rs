@@ -22,7 +22,7 @@ fn main() {
         } else if cfg!(target_arch = "aarch64") {
             "aarch64 (force-scalar — NEON kernels disabled)"
         } else if cfg!(all(target_arch = "x86_64", not(feature = "force-scalar"))) {
-            "x86_64 (AVX2: quant+dct; scalar: color/huffman)"
+            "x86_64 (AVX2: quant+dct+color; scalar: downsample/huffman)"
         } else if cfg!(target_arch = "x86_64") {
             "x86_64 (force-scalar — AVX2 kernels disabled)"
         } else {

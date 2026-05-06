@@ -4,7 +4,8 @@
 //! Backend status (incremental port):
 //!   - `quant`    — AVX2
 //!   - `dct`      — AVX2
-//!   - `color`    — delegate to scalar (TODO)
+//!   - `color`    — AVX2 for n=16 RGBA (the 4:2:0 hot path); scalar fallback
+//!                  for n=8 / RGB / non-AVX2 CPU
 //!   - `huffman`  — delegate to scalar (TODO)
 //!
 //! Runtime feature detection: AVX2 is the only target we ever dispatch
@@ -14,11 +15,242 @@
 #![allow(dead_code)]
 
 // Kernels not yet ported: forward to the scalar reference.
-pub mod color {
-    pub use crate::arch::scalar::color::*;
-}
 pub mod huffman {
     pub use crate::arch::scalar::huffman::*;
+}
+
+// ===========================================================================
+// color: AVX2 RGBA→YCbCr per-row converter (n=16 only).
+// Translated from `simd/x86_64/jccolext-avx2.asm` math, reshaped for our
+// "one row at a time, 16 pixels wide" API. Other widths / RGB-bpp paths
+// delegate to scalar.
+// ===========================================================================
+pub mod color {
+    use core::arch::x86_64::*;
+
+    use crate::color::PixelLayout;
+
+    #[repr(C, align(32))]
+    struct Aligned<T>(T);
+
+    // F_0_337 = F_0_587 - F_0_250 = 38470 - 16384 = 22086.
+    // PW_F0299_F0337 — Y: pair (R, G) with [F_0_299, F_0_337].
+    static PW_F0299_F0337: Aligned<[i16; 16]> = Aligned([
+        19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086,
+        19595, 22086, 19595, 22086, 19595, 22086, 19595, 22086,
+    ]);
+
+    // PW_F0114_F0250 — Y: pair (B, G) with [F_0_114, F_0_250].
+    static PW_F0114_F0250: Aligned<[i16; 16]> = Aligned([
+        7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384,
+        7471, 16384, 7471, 16384, 7471, 16384, 7471, 16384,
+    ]);
+
+    // PW_MF016_MF033 — Cb: pair (R, G) with [-F_0_168, -F_0_331].
+    static PW_MF016_MF033: Aligned<[i16; 16]> = Aligned([
+        -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709,
+        -11059, -21709, -11059, -21709, -11059, -21709, -11059, -21709,
+    ]);
+
+    // PW_MF008_MF041 — Cr: pair (B, G) with [-F_0_081, -F_0_418].
+    static PW_MF008_MF041: Aligned<[i16; 16]> = Aligned([
+        -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439,
+        -5329, -27439, -5329, -27439, -5329, -27439, -5329, -27439,
+    ]);
+
+    // PD_ONEHALF — Y rounding bias = 1 << 15.
+    static PD_ONEHALF: Aligned<[i32; 8]> = Aligned([32768; 8]);
+
+    // PD_ONEHALFM1_CJ — Cb/Cr rounding + center-128 bias.
+    //   = (1 << 15) - 1 + (128 << 16) = 32767 + 8388608 = 8421375
+    static PD_ONEHALFM1_CJ: Aligned<[i32; 8]> = Aligned([8421375; 8]);
+
+    /// Per-row RGB(A) → YCbCr converter.
+    ///
+    /// AVX2 fast path: `n == 16 && layout.bpp == 4` (the typical 4:2:0
+    /// hot path). All other widths and RGB-bpp inputs fall through to
+    /// the scalar reference.
+    pub fn rgb_row_to_ycc(
+        pixels: &[u8],
+        layout: PixelLayout,
+        n: usize,
+        y: &mut [u8],
+        cb: &mut [u8],
+        cr: &mut [u8],
+    ) {
+        debug_assert!(n == 8 || n == 16);
+        debug_assert!(y.len() >= n && cb.len() >= n && cr.len() >= n);
+        debug_assert!(pixels.len() >= n * layout.bpp);
+        if n == 16 && layout.bpp == 4 && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                rgba16_avx2(
+                    pixels.as_ptr(),
+                    y.as_mut_ptr(),
+                    cb.as_mut_ptr(),
+                    cr.as_mut_ptr(),
+                )
+            }
+        } else {
+            crate::arch::scalar::color::rgb_row_to_ycc(pixels, layout, n, y, cb, cr)
+        }
+    }
+
+    /// 16x16 → 8x8 chroma 4:2:0 box-average. AVX2 not yet ported for
+    /// downsample (step 3d); fall through to scalar.
+    pub use crate::arch::scalar::color::h2v2_downsample;
+
+    /// Deinterleave 16 RGBA pixels (= 64 bytes from `pixels`) into three
+    /// `__m256i` registers carrying 16 u16 lanes of R, G, B respectively.
+    ///
+    /// Approach: vpshufb each input ymm to gather R/G/B/A bytes into
+    /// 4-byte groups within each 128-bit lane, then vpermd across both
+    /// ymm to produce 16 contiguous bytes per channel in lo 128, then
+    /// vpmovzxbw to widen to 16 u16 lanes.
+    #[inline(always)]
+    unsafe fn deinterleave_rgba16(
+        p0: __m256i,
+        p1: __m256i,
+    ) -> (__m256i, __m256i, __m256i) {
+        // mask: per 128-bit lane, place RRRRGGGGBBBBAAAA at byte 0..15.
+        let shuf = _mm256_setr_epi8(
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+        );
+        // After vpshufb (per-lane):
+        //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
+        //   s0 hi lane = [R4..7 G4..7 B4..7 A4..7]
+        //   s1 lo lane = [R8..11 G8..11 B8..11 A8..11]
+        //   s1 hi lane = [R12..15 G12..15 B12..15 A12..15]
+        let s0 = _mm256_shuffle_epi8(p0, shuf);
+        let s1 = _mm256_shuffle_epi8(p1, shuf);
+
+        // unpacklo/hi 32-bit chunks: align R/G chunks (resp. B/A) across
+        // both inputs.
+        //   lo32 lane content (per 32-bit lane): [R0..3, R8..11, G0..3, G8..11,
+        //                                          R4..7, R12..15, G4..7, G12..15]
+        //   hi32 lane content: same shape but with B/A.
+        let lo32 = _mm256_unpacklo_epi32(s0, s1);
+        let hi32 = _mm256_unpackhi_epi32(s0, s1);
+
+        // vpermd indices to gather 16 contiguous channel bytes into lo
+        // 128 of result (i.e. into 4 32-bit lanes).
+        //   R: 32-bit lanes 0, 4, 1, 5 of lo32 → R0..3, R4..7, R8..11, R12..15
+        //   G: lanes 2, 6, 3, 7 of lo32
+        //   B: lanes 0, 4, 1, 5 of hi32
+        let idx_r = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
+        let idx_g = _mm256_setr_epi32(2, 6, 3, 7, 0, 0, 0, 0);
+        let idx_b = _mm256_setr_epi32(0, 4, 1, 5, 0, 0, 0, 0);
+
+        let r_packed = _mm256_permutevar8x32_epi32(lo32, idx_r);
+        let g_packed = _mm256_permutevar8x32_epi32(lo32, idx_g);
+        let b_packed = _mm256_permutevar8x32_epi32(hi32, idx_b);
+
+        // Widen 16 u8 (in lo 128) → 16 u16 (full ymm).
+        let r_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(r_packed));
+        let g_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(g_packed));
+        let b_u16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(b_packed));
+
+        (r_u16, g_u16, b_u16)
+    }
+
+    /// Compute one of Y/Cb/Cr from the deinterleaved channels. Returns a
+    /// `__m256i` whose 16 u16 lanes are the output samples in order.
+    ///
+    /// `c_xy` is the constant ymm to pair the *primary* two channels
+    /// `(x, y)` against (e.g. `[F_0_299, F_0_337]` interleaved for Y's
+    /// `(R, G)` term). `extra_lo` and `extra_hi` are i32 add-ins for
+    /// the residual term — for Y this is the `(B, G) madd` partial; for
+    /// Cb/Cr it's `0.5 * B` (resp. `0.5 * R`) computed via the
+    /// `vpunpcklwd(0, X) >> 1` trick.
+    #[inline(always)]
+    unsafe fn finalize_component(
+        rg_or_bg_lo: __m256i,
+        rg_or_bg_hi: __m256i,
+        c_xy: __m256i,
+        extra_lo: __m256i,
+        extra_hi: __m256i,
+        bias: __m256i,
+    ) -> __m256i {
+        let p_lo = _mm256_madd_epi16(rg_or_bg_lo, c_xy);
+        let p_hi = _mm256_madd_epi16(rg_or_bg_hi, c_xy);
+        let s_lo = _mm256_add_epi32(_mm256_add_epi32(p_lo, extra_lo), bias);
+        let s_hi = _mm256_add_epi32(_mm256_add_epi32(p_hi, extra_hi), bias);
+        // Logical >> 16: the sum is always non-negative for the chosen
+        // biases (Y's bias is +0.5, Cb/Cr add the +128 center plus the
+        // round bias), so srli gives the same result as srai.
+        let q_lo = _mm256_srli_epi32::<16>(s_lo);
+        let q_hi = _mm256_srli_epi32::<16>(s_hi);
+        // Pack i32 → u16 (saturating). The result interleaves lanes
+        // per 128-bit lane of pack: lo 128 = [q_lo[0..3], q_hi[0..3]] =
+        // pixels 0..7; hi 128 = [q_lo[4..7], q_hi[4..7]] = pixels 8..15.
+        _mm256_packus_epi32(q_lo, q_hi)
+    }
+
+    /// Pack 16 u16 (in one ymm) → 16 u8 in low 128 bits, then store.
+    #[inline(always)]
+    unsafe fn pack_and_store_u16x16(v: __m256i, out: *mut u8) {
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256::<1>(v);
+        let packed = _mm_packus_epi16(lo, hi);
+        _mm_storeu_si128(out as *mut __m128i, packed);
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn rgba16_avx2(pixels: *const u8, y: *mut u8, cb: *mut u8, cr: *mut u8) {
+        unsafe {
+            // Load 64 bytes = 16 RGBA pixels into 2 ymm.
+            let p_in = pixels as *const __m256i;
+            let p0 = _mm256_loadu_si256(p_in);
+            let p1 = _mm256_loadu_si256(p_in.add(1));
+
+            let (r_u16, g_u16, b_u16) = deinterleave_rgba16(p0, p1);
+
+            // Build interleaved-pair ymm registers used by every component.
+            let rg_lo = _mm256_unpacklo_epi16(r_u16, g_u16);
+            let rg_hi = _mm256_unpackhi_epi16(r_u16, g_u16);
+            let bg_lo = _mm256_unpacklo_epi16(b_u16, g_u16);
+            let bg_hi = _mm256_unpackhi_epi16(b_u16, g_u16);
+
+            // 0.5 * B and 0.5 * R via the (zero,X) interleave + >>1
+            // trick: unpacklo_wd(0, B) places each B[i] in the high 16
+            // bits of a u32 lane (= B[i] << 16); then srli 1 gives
+            // B[i] << 15 = B[i] * 32768, which is what F_0_500 would do
+            // if it fit in i16.
+            let zero = _mm256_setzero_si256();
+            let half_b_lo = _mm256_srli_epi32::<1>(_mm256_unpacklo_epi16(zero, b_u16));
+            let half_b_hi = _mm256_srli_epi32::<1>(_mm256_unpackhi_epi16(zero, b_u16));
+            let half_r_lo = _mm256_srli_epi32::<1>(_mm256_unpacklo_epi16(zero, r_u16));
+            let half_r_hi = _mm256_srli_epi32::<1>(_mm256_unpackhi_epi16(zero, r_u16));
+
+            // Constants
+            let c_y_rg = _mm256_loadu_si256(PW_F0299_F0337.0.as_ptr() as *const __m256i);
+            let c_y_bg = _mm256_loadu_si256(PW_F0114_F0250.0.as_ptr() as *const __m256i);
+            let c_cb_rg = _mm256_loadu_si256(PW_MF016_MF033.0.as_ptr() as *const __m256i);
+            let c_cr_bg = _mm256_loadu_si256(PW_MF008_MF041.0.as_ptr() as *const __m256i);
+            let bias_y = _mm256_loadu_si256(PD_ONEHALF.0.as_ptr() as *const __m256i);
+            let bias_cbcr = _mm256_loadu_si256(PD_ONEHALFM1_CJ.0.as_ptr() as *const __m256i);
+
+            // Y: madd(R,G; F_0_299, F_0_337) + madd(B,G; F_0_114, F_0_250) + 0.5
+            //    The (B, G) madd is the "extra" term.
+            let y_extra_lo = _mm256_madd_epi16(bg_lo, c_y_bg);
+            let y_extra_hi = _mm256_madd_epi16(bg_hi, c_y_bg);
+            let y_u16 = finalize_component(rg_lo, rg_hi, c_y_rg, y_extra_lo, y_extra_hi, bias_y);
+
+            // Cb: madd(R,G; -F_0_168, -F_0_331) + 0.5*B + bias
+            let cb_u16 =
+                finalize_component(rg_lo, rg_hi, c_cb_rg, half_b_lo, half_b_hi, bias_cbcr);
+
+            // Cr: madd(B,G; -F_0_081, -F_0_418) + 0.5*R + bias
+            let cr_u16 =
+                finalize_component(bg_lo, bg_hi, c_cr_bg, half_r_lo, half_r_hi, bias_cbcr);
+
+            pack_and_store_u16x16(y_u16, y);
+            pack_and_store_u16x16(cb_u16, cb);
+            pack_and_store_u16x16(cr_u16, cr);
+
+            _mm256_zeroupper();
+        }
+    }
 }
 
 // ===========================================================================
@@ -484,6 +716,102 @@ mod tests {
         scalar::dct::fdct_islow(&mut a);
         dct::fdct_islow(&mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgba16_random() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::RGBA;
+        // Deterministic-ish pixel data covering full u8 range.
+        let mut pixels = [0u8; 16 * 4];
+        for i in 0..16 {
+            pixels[i * 4] = ((i * 17) % 256) as u8;
+            pixels[i * 4 + 1] = ((i * 23 + 7) % 256) as u8;
+            pixels[i * 4 + 2] = ((i * 31 + 13) % 256) as u8;
+            pixels[i * 4 + 3] = 255;
+        }
+        let mut y_s = [0u8; 16];
+        let mut cb_s = [0u8; 16];
+        let mut cr_s = [0u8; 16];
+        scalar::color::rgb_row_to_ycc(
+            &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
+        );
+
+        let mut y_a = [0u8; 16];
+        let mut cb_a = [0u8; 16];
+        let mut cr_a = [0u8; 16];
+        color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_a, &mut cb_a, &mut cr_a);
+
+        assert_eq!(y_s, y_a);
+        assert_eq!(cb_s, cb_a);
+        assert_eq!(cr_s, cr_a);
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgba16_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::RGBA;
+        let panels: [[u8; 4]; 5] = [
+            [0, 0, 0, 255],     // black
+            [255, 255, 255, 255], // white
+            [255, 0, 0, 255],   // red
+            [0, 255, 0, 255],   // green
+            [0, 0, 255, 255],   // blue
+        ];
+        for color in &panels {
+            let mut pixels = [0u8; 16 * 4];
+            for i in 0..16 {
+                pixels[i * 4..i * 4 + 4].copy_from_slice(color);
+            }
+            let mut y_s = [0u8; 16];
+            let mut cb_s = [0u8; 16];
+            let mut cr_s = [0u8; 16];
+            scalar::color::rgb_row_to_ycc(
+                &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
+            );
+            let mut y_a = [0u8; 16];
+            let mut cb_a = [0u8; 16];
+            let mut cr_a = [0u8; 16];
+            color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_a, &mut cb_a, &mut cr_a);
+            assert_eq!(y_s, y_a, "y mismatch for color {color:?}");
+            assert_eq!(cb_s, cb_a, "cb mismatch for color {color:?}");
+            assert_eq!(cr_s, cr_a, "cr mismatch for color {color:?}");
+        }
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgba16_full_range() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::RGBA;
+        // Sweep R while keeping G, B varied.
+        let mut state: u64 = 0xC0DE;
+        for _ in 0..30 {
+            let mut pixels = [0u8; 16 * 4];
+            for i in 0..16 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                pixels[i * 4] = (state >> 24) as u8;
+                pixels[i * 4 + 1] = (state >> 32) as u8;
+                pixels[i * 4 + 2] = (state >> 40) as u8;
+                pixels[i * 4 + 3] = 255;
+            }
+            let mut y_s = [0u8; 16];
+            let mut cb_s = [0u8; 16];
+            let mut cr_s = [0u8; 16];
+            scalar::color::rgb_row_to_ycc(
+                &pixels, RGBA, 16, &mut y_s, &mut cb_s, &mut cr_s,
+            );
+            let mut y_a = [0u8; 16];
+            let mut cb_a = [0u8; 16];
+            let mut cr_a = [0u8; 16];
+            color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_a, &mut cb_a, &mut cr_a);
+            assert_eq!((y_s, cb_s, cr_s), (y_a, cb_a, cr_a));
+        }
     }
 
     #[test]
