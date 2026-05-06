@@ -1,35 +1,37 @@
-//! Baseline JPEG encoder — Phase 2 (integer LL&M DCT + AArch64 NEON).
+//! Baseline JPEG encoder — integer LL&M DCT + per-arch SIMD kernels.
 //!
-//! Phase 1 was a pure-Rust f32 AAN scaffold. Phase 2 swaps the hot
-//! kernels to libjpeg-turbo's integer LL&M ("islow") DCT and adds
-//! AArch64 NEON kernels for color conversion, 4:2:0 chroma downsample,
-//! the forward DCT, and quantization. Scalar paths remain as the
-//! reference implementation and the fallback for non-aarch64 builds.
+//! Hot kernels live behind a single `arch::backend` dispatch chosen at
+//! compile time (`aarch64 + !force-scalar` → NEON; everything else →
+//! scalar reference). All SIMD backends produce bit-exact-equivalent
+//! output to the scalar reference; cross-check tests assert this in
+//! `arch::neon`'s test module.
 //!
 //! Pipeline:
 //!
 //! ```text
 //!   RGB(A) bytes
-//!       │ color::extract_*           (NEON: 16-pixel-wide RGB → YCbCr)
+//!       │ color::extract_*                    (orchestration)
+//!       │   └─ arch::backend::color::rgb_row_to_ycc
 //!       ▼
 //!   8x8 i16 blocks (level-shifted)
-//!       │ dct::fdct_islow            (NEON: 12-mul integer LL&M DCT)
+//!       │ arch::backend::dct::fdct_islow      (12-mul integer LL&M DCT)
 //!       ▼
 //!   8x8 i16 DCT coefficients (scaled by 8)
-//!       │ quant::quantize_and_zigzag (NEON: reciprocal-multiply + zig-zag)
+//!       │ quant::quantize_and_zigzag
+//!       │   └─ arch::backend::quant::quantize_natural + scalar zig-zag
 //!       ▼
 //!   8x8 i16 zig-zag coefficients
-//!       │ huffman::encode_block      (Phase 2.5: u64 accumulator,
-//!       │                              packed LUT, NEON AC zero-scan)
+//!       │ huffman::encode_block               (Phase 2.5: u64 accumulator,
+//!       │   └─ arch::backend::huffman::group_of_8_is_zero (8-skip)
 //!       ▼
 //!   entropy-coded bytes (with 0xFF → 0xFF 0x00 stuffing)
 //! ```
 //!
-//! See `LICENSES/` for attribution; the NEON kernels are translations
+//! See `LICENSES/` for attribution; the SIMD kernels are translations
 //! of libjpeg-turbo (BSD-3-Clause + IJG).
 
+mod arch;
 pub mod color;
-mod dct;
 mod huffman;
 mod markers;
 mod quant;
@@ -288,18 +290,9 @@ fn encode_one_block<W: Write>(
     dc_tab: &HuffmanTable,
     ac_tab: &HuffmanTable,
 ) -> io::Result<i16> {
-    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
-    {
-        dct::fdct_islow_neon(block);
-        let zz = quant::quantize_and_zigzag_neon(block, div);
-        encode_block(bw, &zz, prev_dc, dc_tab, ac_tab)
-    }
-    #[cfg(not(all(target_arch = "aarch64", not(feature = "force-scalar"))))]
-    {
-        dct::fdct_islow(block);
-        let zz = quant::quantize_and_zigzag(block, div);
-        encode_block(bw, &zz, prev_dc, dc_tab, ac_tab)
-    }
+    arch::backend::dct::fdct_islow(block);
+    let zz = quant::quantize_and_zigzag(block, div);
+    encode_block(bw, &zz, prev_dc, dc_tab, ac_tab)
 }
 
 #[cfg(test)]
