@@ -3,7 +3,7 @@ name = "jpeg-rusturbo"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Baseline JPEG encoder with integer LL&M DCT and AArch64 NEON kernels."
+description = "Baseline JPEG encoder with integer LL&M DCT and per-arch SIMD kernels (AArch64 NEON, x86_64 AVX2)."
 
 [lib]
 path = "src/lib.rs"

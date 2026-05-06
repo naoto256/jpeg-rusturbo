@@ -31,7 +31,7 @@
 //! of libjpeg-turbo (BSD-3-Clause + IJG).
 
 mod arch;
-pub mod color;
+mod color;
 mod huffman;
 mod markers;
 mod quant;
