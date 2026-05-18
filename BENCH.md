@@ -113,24 +113,38 @@ zero-scan from the Huffman pass stays as is.
 
 ### Setup — Intel Ice Lake
 
-Measured on Azure `Standard_D2s_v5` Spot (Intel Xeon Platinum 8370C,
-Ice Lake-SP, 2 vCPU, 8 GB) at 100 iterations per resolution after a
-3-iteration warm-up. Five repeated runs, variance < 1 % across runs;
-numbers below are the median.
+Measured on Intel Xeon Platinum 8370C (Ice Lake-SP, 2 vCPU,
+Ubuntu 24.04) at 100 iterations per resolution after a 3-iteration
+warm-up. Five repeated runs, variance < 1 % across runs; numbers
+below are the median.
+
+#### 4:2:0
 
 | Resolution                  | scalar (force-scalar) | AVX2  | speedup |
 | --------------------------- | --------------------: | ----: | ------: |
-| 1592 x 1124 (session size)  |             24.69 ms  | 14.56 ms |  1.70x |
-| 1920 x 1080 (1080p)         |             28.27 ms  | 16.57 ms |  1.71x |
-| 3840 x 2160 (4K)            |            109.90 ms  | 63.93 ms |  1.72x |
+| 1592 x 1124 (session size)  |             24.99 ms  | 14.02 ms |  1.78x |
+| 1920 x 1080 (1080p)         |             28.59 ms  | 15.85 ms |  1.80x |
+| 3840 x 2160 (4K)            |            111.51 ms  | 61.93 ms |  1.80x |
 
-Bytes-out across builds: `423839 / 488459 / 1940692` — byte-identical
-to scalar and to the Apple Silicon NEON build at every resolution,
-verified by both the cross-check unit tests and the roundtrip suite.
+Output bytes: `423839 / 488459 / 1940692` — byte-identical to scalar
+and to the Apple Silicon NEON build, verified by the cross-check unit
+tests and the roundtrip suite.
+
+#### 4:2:2
+
+| Resolution                  | scalar (force-scalar) | AVX2   | speedup |
+| --------------------------- | --------------------: | -----: | ------: |
+| 1592 x 1124 (session size)  |             31.94 ms  | 17.99 ms |  1.78x |
+| 1920 x 1080 (1080p)         |             36.45 ms  | 20.43 ms |  1.78x |
+| 3840 x 2160 (4K)            |            141.71 ms  | 78.23 ms |  1.81x |
+
+Output bytes: `568676 / 654460 / 2618066`. The 4:2:2 path runs 4 DCT
+blocks per 16×8 MCU (vs 6 per 16×16 4:2:0 MCU), so per-pixel work
+grows by ~1.33×; the AVX2 path tracks that growth closely.
 
 ### Where the AVX2 speedup is
 
-The ~1.71x whole-pipeline speedup matches what Amdahl's law predicts
+The ~1.80x whole-pipeline speedup matches what Amdahl's law predicts
 once the Huffman + marker/IO portion (~45-50 %) stays scalar and the
 remaining color/dct/quant/downsample chunk (~50-55 %) hits roughly
 3x in its kernels.
@@ -143,20 +157,33 @@ A rough per-stage breakdown on the Ice Lake host (AVX2):
   Huffman           ~35%  (scalar in both)
   Marker writes/IO  ~10%  (scalar in both)
 
-### Apple Silicon NEON revisit
+### Apple Silicon (NEON)
 
-The backend-dispatch refactor (kernels moved behind `arch::backend::*`)
-added a small amount of inlining indirection. Re-measured Apple M-series
-numbers shift by 1-5 % vs the pre-AVX2 figures; the NEON path is still
-bit-exact, just slightly slower at the function-call boundary the
-compiler doesn't always collapse. We accept this as the cost of having
-a uniform x86_64/AArch64 dispatch surface.
+Measured on Apple M-series at 100 iterations after a 3-iteration
+warm-up. Five repeated runs, variance < 1 %; numbers below are the
+median.
 
-| Resolution                  | NEON (pre-refactor) | NEON (post-refactor) | Δ |
-| --------------------------- | -------------: | ------------------------: | -: |
-| 1592 x 1124                 |        5.92 ms |                   6.15 ms | +3.9% |
-| 1920 x 1080                 |        6.75 ms |                   6.97 ms | +3.3% |
-| 3840 x 2160                 |       27.23 ms |                   28.50 ms | +4.7% |
+#### 4:2:0
+
+| Resolution                  | scalar (force-scalar) | NEON   | speedup |
+| --------------------------- | --------------------: | -----: | ------: |
+| 1592 x 1124 (session size)  |              9.01 ms  |  6.47 ms |  1.39x |
+| 1920 x 1080 (1080p)         |             10.34 ms  |  7.41 ms |  1.40x |
+| 3840 x 2160 (4K)            |             43.79 ms  | 29.41 ms |  1.49x |
+
+#### 4:2:2
+
+| Resolution                  | scalar (force-scalar) | NEON   | speedup |
+| --------------------------- | --------------------: | -----: | ------: |
+| 1592 x 1124 (session size)  |             11.17 ms  |  8.58 ms |  1.30x |
+| 1920 x 1080 (1080p)         |             12.83 ms  |  9.82 ms |  1.31x |
+| 3840 x 2160 (4K)            |             50.01 ms  | 38.71 ms |  1.29x |
+
+NEON whole-pipeline speedup is more modest than AVX2 here because the
+Apple M-series scalar path already runs the autovectorized Huffman /
+quantize / DCT inner loops well; the explicit NEON kernels for color
+convert, FDCT, quantize and chroma downsample claw back the remaining
+fixed-point arithmetic that LLVM doesn't fully cover.
 
 ### Cumulative timeline (4K representative)
 
