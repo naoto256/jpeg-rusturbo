@@ -91,8 +91,8 @@ defaults to 4:2:0 with 4:4:4 available via `set_subsampling`.
 The Huffman entropy coder stays scalar by design: it autovectorizes
 well in trivial form, the AC scan is too branchy for SIMD to win, and
 libjpeg-turbo upstream itself doesn't ship an AArch64-NEON / AVX2
-Huffman kernel. See [BENCH.md](BENCH.md)'s Phase 2.5 + 3 sections for
-the reasoning trail.
+Huffman kernel. See [BENCH.md](BENCH.md)'s Huffman and AVX2 sections
+for the reasoning trail.
 
 ## Architecture (brief)
 
