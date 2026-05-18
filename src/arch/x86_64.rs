@@ -8,7 +8,7 @@
 //! - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
 //!   scalar fallback for n=8 / RGB / non-AVX2
 //! - `color::h2v2_downsample` — AVX2
-//! - `color::h2v1_downsample` — delegate to scalar (4:2:2 AVX2 port pending)
+//! - `color::h2v1_downsample` — AVX2
 //! - `huffman` — delegate to scalar (the AC zero-scan helper
 //!   autovectorizes well in scalar form)
 //!
@@ -110,10 +110,49 @@ pub mod color {
         }
     }
 
-    /// 16x8 → 8x8 horizontal 2:1 chroma downsample. Delegates to the
-    /// scalar reference pending an AVX2 port.
+    /// 16x8 → 8x8 horizontal 2:1 chroma downsample with libjpeg's
+    /// `{0, 1, 0, 1, ...}` bias. Bit-exact equivalent to
+    /// `arch::scalar::color::h2v1_downsample`.
     pub fn h2v1_downsample(src: &[u8; 128], dst: &mut [i16; 64]) {
-        crate::arch::scalar::color::h2v1_downsample(src, dst)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { h2v1_avx2(src, dst) }
+        } else {
+            crate::arch::scalar::color::h2v1_downsample(src, dst)
+        }
+    }
+
+    /// # Safety
+    /// AVX2 must be available (the runtime gate in
+    /// `h2v1_downsample` checks). `src` / `dst` are fixed-size refs.
+    #[target_feature(enable = "avx2")]
+    unsafe fn h2v1_avx2(src: &[u8; 128], dst: &mut [i16; 64]) {
+        unsafe {
+            // Bias `{0, 1, 0, 1, ...}` over 8 u16 lanes per 128-bit
+            // half, = u32 lanes of 0x0001_0000 broadcast.
+            let bias = _mm256_set1_epi32(0x0001_0000u32 as i32);
+            let level_shift = _mm256_set1_epi16(128);
+            // `_mm256_maddubs_epi16(a, ones)` sums adjacent byte pairs
+            // within each 128-bit lane: `out[i] = a[2i] + a[2i+1]`
+            // (saturating to i16, but the u8+u8 sum fits comfortably).
+            let ones = _mm256_set1_epi8(1);
+
+            // Each iteration consumes 2 input rows = 32 bytes, emits
+            // 2 output rows = 32 bytes (16 i16).
+            for j in 0..4 {
+                let row_off = j * 2 * 16;
+                let r = _mm256_loadu_si256(src.as_ptr().add(row_off) as *const __m256i);
+                // Pair-add within each 128-bit lane:
+                //   lo 128 = pair sums for row 2j   (8 i16)
+                //   hi 128 = pair sums for row 2j+1 (8 i16)
+                let s = _mm256_maddubs_epi16(r, ones);
+                // + bias, then /2.
+                let avg = _mm256_srli_epi16::<1>(_mm256_add_epi16(s, bias));
+                // Level-shift to centered i16 range.
+                let signed = _mm256_sub_epi16(avg, level_shift);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(j * 16) as *mut __m256i, signed);
+            }
+            _mm256_zeroupper();
+        }
     }
 
     /// # Safety
