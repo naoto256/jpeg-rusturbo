@@ -2,7 +2,7 @@
 //!
 //! All markers are byte-exact per ITU-T T.81 (the same a libjpeg
 //! decoder produces). This module is pure I/O — no arithmetic, no
-//! algorithm choices — so Phase 2's NEON work doesn't touch it.
+//! algorithm choices — so the SIMD kernels don't touch it.
 
 use std::io::{self, Write};
 

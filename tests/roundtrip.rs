@@ -3,8 +3,8 @@
 //! Encode a known RGB pattern, decode it back with the `image` crate,
 //! and check that the decoded pixels are reasonably close to the
 //! input (PSNR floor — JPEG is lossy, so bit-exact comparison would
-//! be wrong here; that becomes a Phase 2+ goal once we match
-//! libjpeg-turbo's coefficient precision).
+//! be wrong here; byte-identical output against libjpeg-turbo would
+//! become a separate goal once we match its coefficient precision).
 
 use image::{ImageFormat, ImageReader};
 use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};

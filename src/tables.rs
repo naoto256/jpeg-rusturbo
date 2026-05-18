@@ -5,9 +5,9 @@
 //! these verbatim; a decoder that reads our DQT/DHT segments will
 //! find the same numeric values it would in libjpeg's output.
 //!
-//! Phase 2 will not touch this file. The tables are pure data; the
-//! NEON kernels operate on the *application* of these tables (DCT,
-//! quantize, Huffman bit-pack), not on the table contents.
+//! The tables are pure data; the SIMD kernels operate on the
+//! *application* of these tables (DCT, quantize, Huffman bit-pack),
+//! not on the table contents.
 
 // ---------------------------------------------------------------
 // Zig-zag scan order (Annex F.1.1.5).

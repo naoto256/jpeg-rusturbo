@@ -1,6 +1,6 @@
 //! Baseline Huffman entropy coding (DC + AC).
 //!
-//! Phase 2.5 optimizations:
+//! Optimizations applied:
 //!
 //!   1. **64-bit bit accumulator** — `BitWriter` keeps a `u64` of pending
 //!      bits left-aligned at the MSB. Each `write_bits` call appends with
