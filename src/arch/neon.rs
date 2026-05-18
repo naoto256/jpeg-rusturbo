@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 // ===========================================================================
-// color: 16-pixel-wide RGB(A) → YCbCr, 16x16 → 8x8 chroma 4:2:0 downsample
+// color: 16-pixel-wide RGB(A) → YCbCr, chroma downsample (4:2:0 NEON; 4:2:2 scalar fallback)
 // ===========================================================================
 pub mod color {
     use core::arch::aarch64::*;
@@ -183,6 +183,12 @@ pub mod color {
     /// rounding (alternating +1 / +2 across output columns).
     pub fn h2v2_downsample(src: &[u8; 256], dst: &mut [i16; 64]) {
         unsafe { h2v2_inner(src, dst) }
+    }
+
+    /// 16x8 → 8x8 horizontal 2:1 chroma downsample. Delegates to the
+    /// scalar reference pending a NEON port.
+    pub fn h2v1_downsample(src: &[u8; 128], dst: &mut [i16; 64]) {
+        crate::arch::scalar::color::h2v1_downsample(src, dst)
     }
 
     /// # Safety
@@ -680,6 +686,19 @@ mod tests {
         let mut b = [0i16; 64];
         scalar::color::h2v2_downsample(&src, &mut a);
         color::h2v2_downsample(&src, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn color_neon_matches_scalar_h2v1_downsample() {
+        let mut src = [0u8; 128];
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = ((i * 71 + 23) % 256) as u8;
+        }
+        let mut a = [0i16; 64];
+        let mut b = [0i16; 64];
+        scalar::color::h2v1_downsample(&src, &mut a);
+        color::h2v1_downsample(&src, &mut b);
         assert_eq!(a, b);
     }
 

@@ -1,9 +1,9 @@
 //! YCbCr block extraction with edge replication.
 //!
-//! The per-row RGB→YCbCr and 16x16→8x8 chroma downsample kernels live
-//! in `crate::arch::backend::color`. This file orchestrates them at the
-//! 8x8 block / 4:2:0 MCU level — padding, level shift, layout
-//! distribution.
+//! The per-row RGB→YCbCr and chroma downsample kernels live in
+//! `crate::arch::backend::color`. This file orchestrates them at the
+//! 8x8 block / MCU level (4:4:4, 4:2:2, 4:2:0) — padding, level
+//! shift, layout distribution.
 //!
 //! Algorithmic constants for the libjpeg-turbo color transform:
 //!   Y  =  0.29900 R + 0.58700 G + 0.11400 B
@@ -187,4 +187,67 @@ pub fn extract_mcu_420(
 
     arch::backend::color::h2v2_downsample(&cb_full, cb_block);
     arch::backend::color::h2v2_downsample(&cr_full, cr_block);
+}
+
+/// Extract a 16x8 luma window with 2 luma blocks plus 4:2:2 chroma.
+///
+/// MCU layout: two horizontally-adjacent 8x8 luma blocks (left, right)
+/// and one 8x8 chroma block per Cb/Cr produced by 2:1 horizontal
+/// downsample of the 16-wide chroma row pair.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_mcu_422(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    x0: u32,
+    y0: u32,
+    y_blocks: &mut [[i16; 64]; 2],
+    cb_block: &mut [i16; 64],
+    cr_block: &mut [i16; 64],
+) {
+    let max_y = (height - 1) as usize;
+    let pixels_per_row_full = width as usize;
+    let bpp = layout.bpp;
+    let stride = pixels_per_row_full * bpp;
+
+    let mut y_full = [0u8; 16 * 8];
+    let mut cb_full = [0u8; 16 * 8];
+    let mut cr_full = [0u8; 16 * 8];
+
+    let needs_h_pad = (x0 as usize + 16) > pixels_per_row_full;
+    let mut padded = [0u8; 16 * 4];
+
+    for j in 0..8 {
+        let sy = (y0 as usize + j).min(max_y);
+        let row_off = sy * stride;
+        let src_slice = if needs_h_pad {
+            build_padded_row::<{ 16 * 4 }>(pixels, width, layout, x0, sy, &mut padded);
+            &padded[..16 * bpp]
+        } else {
+            &pixels[row_off + x0 as usize * bpp..row_off + (x0 as usize + 16) * bpp]
+        };
+        let off = j * 16;
+        arch::backend::color::rgb_row_to_ycc(
+            src_slice,
+            layout,
+            16,
+            &mut y_full[off..off + 16],
+            &mut cb_full[off..off + 16],
+            &mut cr_full[off..off + 16],
+        );
+    }
+
+    // Distribute luma into the two 8x8 halves with level shift.
+    for iq in 0..2 {
+        let dst = &mut y_blocks[iq];
+        for j in 0..8 {
+            for i in 0..8 {
+                dst[j * 8 + i] = (y_full[j * 16 + (iq * 8 + i)] as i16) - 128;
+            }
+        }
+    }
+
+    arch::backend::color::h2v1_downsample(&cb_full, cb_block);
+    arch::backend::color::h2v1_downsample(&cr_full, cr_block);
 }
