@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 // ===========================================================================
-// color: 16-pixel-wide RGB(A) → YCbCr, chroma downsample (4:2:0 NEON; 4:2:2 scalar fallback)
+// color: 16-pixel-wide RGB(A) → YCbCr, chroma downsample (4:2:0 and 4:2:2 NEON)
 // ===========================================================================
 pub mod color {
     use core::arch::aarch64::*;
@@ -185,10 +185,32 @@ pub mod color {
         unsafe { h2v2_inner(src, dst) }
     }
 
-    /// 16x8 → 8x8 horizontal 2:1 chroma downsample. Delegates to the
-    /// scalar reference pending a NEON port.
+    /// 16x8 → 8x8 horizontal 2:1 chroma downsample with libjpeg's
+    /// `{0, 1, 0, 1, ...}` bias. Bit-exact equivalent to
+    /// `arch::scalar::color::h2v1_downsample`.
     pub fn h2v1_downsample(src: &[u8; 128], dst: &mut [i16; 64]) {
-        crate::arch::scalar::color::h2v1_downsample(src, dst)
+        unsafe { h2v1_inner(src, dst) }
+    }
+
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON is available. `src` /
+    /// `dst` are fixed-size references.
+    #[target_feature(enable = "neon")]
+    unsafe fn h2v1_inner(src: &[u8; 128], dst: &mut [i16; 64]) {
+        unsafe {
+            // Bias `{0, 1, 0, 1, ...}` over the 8 u16 output lanes per
+            // row, packed as u32 lanes (low half 0, high half 1).
+            let bias = vreinterpretq_u16_u32(vdupq_n_u32(0x0001_0000));
+            let level_shift = vdupq_n_s16(128);
+            for j in 0..8 {
+                let row = vld1q_u8(src.as_ptr().add(j * 16));
+                let sums = vpadalq_u8(bias, row);
+                let avg_u8 = vshrn_n_u16::<1>(sums);
+                let avg_u16 = vmovl_u8(avg_u8);
+                let signed = vsubq_s16(vreinterpretq_s16_u16(avg_u16), level_shift);
+                vst1q_s16(dst.as_mut_ptr().add(j * 8), signed);
+            }
+        }
     }
 
     /// # Safety
