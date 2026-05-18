@@ -117,6 +117,11 @@ pub enum ChromaSubsampling {
     /// content (text, line art, screenshots) where chroma edges
     /// matter.
     Yuv444,
+    /// 4:2:2 — Y at full resolution, Cb / Cr at half horizontal
+    /// resolution (one chroma sample per 2×1 luma pair). Preserves
+    /// vertical chroma fidelity; common in video and broadcast
+    /// pipelines.
+    Yuv422,
     /// 4:2:0 — Y at full resolution, Cb / Cr at half resolution in
     /// both axes (one chroma sample per 2×2 luma quad).
     ///
@@ -277,6 +282,7 @@ impl<W: Write> JpegEncoder<W> {
 
         let (h_y, v_y) = match self.subsampling {
             ChromaSubsampling::Yuv444 => Yuv444Scheme::H_V,
+            ChromaSubsampling::Yuv422 => Yuv422Scheme::H_V,
             ChromaSubsampling::Yuv420 => Yuv420Scheme::H_V,
         };
         markers::write_sof0(
@@ -314,6 +320,19 @@ impl<W: Write> JpegEncoder<W> {
         bw.reserve(needed);
         match self.subsampling {
             ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
+                pixels,
+                width,
+                height,
+                layout,
+                &mut bw,
+                &div_luma,
+                &div_chroma,
+                &dc_luma,
+                &ac_luma,
+                &dc_chroma,
+                &ac_chroma,
+            )?,
+            ChromaSubsampling::Yuv422 => encode_scan::<Yuv422Scheme, _>(
                 pixels,
                 width,
                 height,
@@ -473,6 +492,65 @@ impl SamplingScheme for Yuv420Scheme {
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
         color::extract_mcu_420(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        for blk in y_blocks.iter_mut() {
+            prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+        }
+        prev_dc.cb = encode_one_block(
+            bw,
+            &mut cb_blk,
+            div_chroma,
+            prev_dc.cb,
+            dc_chroma,
+            ac_chroma,
+        )?;
+        prev_dc.cr = encode_one_block(
+            bw,
+            &mut cr_blk,
+            div_chroma,
+            prev_dc.cr,
+            dc_chroma,
+            ac_chroma,
+        )?;
+        Ok(())
+    }
+}
+
+struct Yuv422Scheme;
+impl SamplingScheme for Yuv422Scheme {
+    const H_V: (u8, u8) = (2, 1);
+    const MCU_W: u32 = 16;
+    const MCU_H: u32 = 8;
+
+    fn encode_one_mcu<W: Write>(
+        bw: &mut BitWriter<W>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        prev_dc: &mut DcPredictors,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        dc_luma: &HuffmanTable,
+        ac_luma: &HuffmanTable,
+        dc_chroma: &HuffmanTable,
+        ac_chroma: &HuffmanTable,
+    ) -> io::Result<()> {
+        let mut y_blocks = [[0i16; 64]; 2];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_mcu_422(
             pixels,
             width,
             height,

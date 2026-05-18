@@ -107,6 +107,24 @@ fn roundtrip_17x17_q80_444() {
 }
 
 #[test]
+fn roundtrip_16x8_q80_422() {
+    // Smallest MCU-exact 4:2:2 case.
+    run_case(16, 8, 80, ChromaSubsampling::Yuv422, 30.0);
+}
+
+// 17x9 forces both 8x8 luma padding and 4:2:2 16x8 MCU edge stepping
+// (right edge and bottom edge both partial).
+#[test]
+fn roundtrip_17x9_q80_422() {
+    run_case(17, 9, 80, ChromaSubsampling::Yuv422, 28.0);
+}
+
+#[test]
+fn roundtrip_1080p_q80_422() {
+    run_case(1920, 1080, 80, ChromaSubsampling::Yuv422, 32.0);
+}
+
+#[test]
 fn roundtrip_session_size_q70_420() {
     // The actual 1592x1124 size we see in deployed sessions.
     run_case(1592, 1124, 70, ChromaSubsampling::Yuv420, 30.0);

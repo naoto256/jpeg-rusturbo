@@ -1,7 +1,7 @@
-//! Architecture-independent reference implementations of the four hot
-//! kernels: per-row RGB→YCbCr, 4:2:0 chroma downsample, integer LL&M
-//! FDCT, and reciprocal-multiply quantization (with the small Huffman
-//! AC-zero-scan helper rounding things out).
+//! Architecture-independent reference implementations of the hot
+//! kernels: per-row RGB→YCbCr, 4:2:0 / 4:2:2 chroma downsample,
+//! integer LL&M FDCT, and reciprocal-multiply quantization (with the
+//! small Huffman AC-zero-scan helper rounding things out).
 //!
 //! Every NEON / x86_64 backend produces bit-exact output against this
 //! file. When the `force-scalar` feature is on (or the target arch has
@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 // ===========================================================================
-// color: RGB(A) → YCbCr (per-row), 16x16 → 8x8 chroma 4:2:0 downsample
+// color: RGB(A) → YCbCr (per-row), chroma downsample (4:2:0 and 4:2:2)
 // ===========================================================================
 pub mod color {
     use crate::color::{
@@ -64,6 +64,27 @@ pub mod color {
                     + src[r1 * 16 + c0] as u32
                     + src[r1 * 16 + c1] as u32;
                 let avg = (sum + bias) >> 2;
+                dst[j * 8 + i] = (avg as i16) - 128;
+            }
+        }
+    }
+
+    /// Downsample a 16x8 plane to 8x8 by 2:1 horizontal averaging, with
+    /// libjpeg-turbo's biased rounding. Output is level-shifted to i16
+    /// centered on 0.
+    ///
+    /// Bias alternates `{0, 1, 0, 1, ...}` across output columns, added
+    /// once and shifted right by 1. See libjpeg-turbo `jcsample.c`,
+    /// `h2v1_downsample`. The SIMD ports must reproduce this for
+    /// bit-exact equivalence with this reference.
+    pub fn h2v1_downsample(src: &[u8; 128], dst: &mut [i16; 64]) {
+        for j in 0..8 {
+            for i in 0..8 {
+                let c0 = i * 2;
+                let c1 = c0 + 1;
+                let bias = if i % 2 == 0 { 0u32 } else { 1 };
+                let sum = src[j * 16 + c0] as u32 + src[j * 16 + c1] as u32;
+                let avg = (sum + bias) >> 1;
                 dst[j * 8 + i] = (avg as i16) - 128;
             }
         }

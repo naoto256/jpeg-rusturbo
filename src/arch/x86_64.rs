@@ -8,6 +8,7 @@
 //! - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
 //!   scalar fallback for n=8 / RGB / non-AVX2
 //! - `color::h2v2_downsample` — AVX2
+//! - `color::h2v1_downsample` — delegate to scalar (4:2:2 AVX2 port pending)
 //! - `huffman` — delegate to scalar (the AC zero-scan helper
 //!   autovectorizes well in scalar form)
 //!
@@ -107,6 +108,12 @@ pub mod color {
         } else {
             crate::arch::scalar::color::h2v2_downsample(src, dst)
         }
+    }
+
+    /// 16x8 → 8x8 horizontal 2:1 chroma downsample. Delegates to the
+    /// scalar reference pending an AVX2 port.
+    pub fn h2v1_downsample(src: &[u8; 128], dst: &mut [i16; 64]) {
+        crate::arch::scalar::color::h2v1_downsample(src, dst)
     }
 
     /// # Safety
@@ -826,6 +833,19 @@ mod tests {
         let mut b = [0i16; 64];
         scalar::color::h2v2_downsample(&src, &mut a);
         color::h2v2_downsample(&src, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn h2v1_downsample_matches_scalar_random() {
+        let mut src = [0u8; 128];
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = ((i * 71 + 23) % 256) as u8;
+        }
+        let mut a = [0i16; 64];
+        let mut b = [0i16; 64];
+        scalar::color::h2v1_downsample(&src, &mut a);
+        color::h2v1_downsample(&src, &mut b);
         assert_eq!(a, b);
     }
 
