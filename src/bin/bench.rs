@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use jpeg_rusturbo::JpegEncoder;
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};
 
 const ITERATIONS: usize = 100;
 
@@ -33,16 +33,22 @@ fn main() {
         },
     );
 
-    for &(label, w, h) in &[
-        ("1592x1124 (session-size)", 1592u32, 1124u32),
-        ("1920x1080 (1080p)", 1920, 1080),
-        ("3840x2160 (4K)", 3840, 2160),
+    for &(mode_label, mode) in &[
+        ("4:2:0", ChromaSubsampling::Yuv420),
+        ("4:2:2", ChromaSubsampling::Yuv422),
     ] {
-        bench_one(label, w, h);
+        println!("\nsubsampling: {mode_label}");
+        for &(label, w, h) in &[
+            ("1592x1124 (session-size)", 1592u32, 1124u32),
+            ("1920x1080 (1080p)", 1920, 1080),
+            ("3840x2160 (4K)", 3840, 2160),
+        ] {
+            bench_one(label, w, h, mode);
+        }
     }
 }
 
-fn bench_one(label: &str, w: u32, h: u32) {
+fn bench_one(label: &str, w: u32, h: u32, subsampling: ChromaSubsampling) {
     let pixels = make_image(w, h);
     let mut buf = Vec::with_capacity((w as usize * h as usize * 3) / 2);
 
@@ -50,6 +56,7 @@ fn bench_one(label: &str, w: u32, h: u32) {
     for _ in 0..3 {
         buf.clear();
         let mut enc = JpegEncoder::new_with_quality(&mut buf, 80);
+        enc.set_subsampling(subsampling);
         enc.encode_rgba(&pixels, w, h).unwrap();
     }
 
@@ -57,6 +64,7 @@ fn bench_one(label: &str, w: u32, h: u32) {
     for _ in 0..ITERATIONS {
         buf.clear();
         let mut enc = JpegEncoder::new_with_quality(&mut buf, 80);
+        enc.set_subsampling(subsampling);
         enc.encode_rgba(&pixels, w, h).unwrap();
     }
     let elapsed = start.elapsed();
@@ -64,7 +72,7 @@ fn bench_one(label: &str, w: u32, h: u32) {
     let mp = (w as f64) * (h as f64) / 1_000_000.0;
     let ms_per_mp = per_iter.as_secs_f64() * 1000.0 / mp;
     println!(
-        "{label:<28}  {ms:>7.2} ms/iter   {ms_per_mp:>5.2} ms/MPx   ({size} bytes)",
+        "  {label:<28}  {ms:>7.2} ms/iter   {ms_per_mp:>5.2} ms/MPx   ({size} bytes)",
         ms = per_iter.as_secs_f64() * 1000.0,
         size = buf.len(),
     );

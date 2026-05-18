@@ -18,10 +18,10 @@ enc.encode_rgba(&pixels, width, height)?;
 
 The public encoder API mirrors `image::codecs::jpeg::JpegEncoder` so
 call sites swap with a `use` change. Internally, hot paths (color
-conversion, FDCT, quantize, 4:2:0 downsample) dispatch to NEON on
-AArch64 and AVX2 on x86_64 via translations of libjpeg-turbo's SIMD
-sources; non-SIMD targets fall through to a bit-exact scalar
-reference.
+conversion, FDCT, quantize, 4:2:0 and 4:2:2 chroma downsample)
+dispatch to NEON on AArch64 and AVX2 on x86_64 via translations of
+libjpeg-turbo's SIMD sources; non-SIMD targets fall through to a
+bit-exact scalar reference.
 
 ## Why
 
@@ -34,13 +34,23 @@ without changing the bytes that come out.
 
 ## Performance
 
-100-iteration medians, q=80, 4:2:0:
+100-iteration medians of 5 repeated runs, q=80.
+
+### 4:2:0
 
 | Resolution                  | Apple M-series (NEON) | Intel Xeon Platinum 8370C (AVX2) |
 | --------------------------- | --------------------: | -------------------------------: |
-| 1592 × 1124 (session size)  |              6.15 ms  |                          14.56 ms |
-| 1920 × 1080 (1080p)         |              6.97 ms  |                          16.57 ms |
-| 3840 × 2160 (4K)            |             28.50 ms  |                          63.93 ms |
+| 1592 × 1124 (session size)  |              6.47 ms  |                          14.02 ms |
+| 1920 × 1080 (1080p)         |              7.41 ms  |                          15.85 ms |
+| 3840 × 2160 (4K)            |             29.41 ms  |                          61.93 ms |
+
+### 4:2:2
+
+| Resolution                  | Apple M-series (NEON) | Intel Xeon Platinum 8370C (AVX2) |
+| --------------------------- | --------------------: | -------------------------------: |
+| 1592 × 1124 (session size)  |              8.58 ms  |                          17.99 ms |
+| 1920 × 1080 (1080p)         |              9.82 ms  |                          20.43 ms |
+| 3840 × 2160 (4K)            |             38.71 ms  |                          78.23 ms |
 
 Scalar-fallback ratios on the same hosts are 1.4-1.7x slower than the
 SIMD numbers above. Output bytes are byte-identical across all three
@@ -72,7 +82,8 @@ fn save(path: &str, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
 The encoder accepts `&[u8]` in either RGB (3 bytes/pixel) or RGBA
 (4 bytes/pixel, alpha dropped — JPEG has no alpha channel) and writes
 to any `std::io::Write`. Quality is clamped to 1..=100; subsampling
-defaults to 4:2:0 with 4:4:4 available via `set_subsampling`.
+defaults to 4:2:0, with 4:2:2 and 4:4:4 available via
+`set_subsampling`.
 
 ## Features
 
