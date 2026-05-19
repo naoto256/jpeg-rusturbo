@@ -442,6 +442,30 @@ pub mod color {
             _mm256_zeroupper();
         }
     }
+
+    // ---- Decoder-side kernels (currently scalar; AVX2 ports pending) ----
+
+    /// 8x8 → 16x16 box-upsample (decoder-side counterpart of `h2v2_downsample`).
+    pub fn h2v2_upsample(src: &[u8; 64], dst: &mut [u8; 256]) {
+        crate::arch::scalar::color::h2v2_upsample(src, dst)
+    }
+
+    /// 8x8 → 16x8 box-upsample (decoder-side counterpart of `h2v1_downsample`).
+    pub fn h2v1_upsample(src: &[u8; 64], dst: &mut [u8; 128]) {
+        crate::arch::scalar::color::h2v1_upsample(src, dst)
+    }
+
+    /// Per-row YCbCr → RGB(A) converter.
+    pub fn ycc_row_to_rgb(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        out: &mut [u8],
+        n: usize,
+        layout: PixelLayout,
+    ) {
+        crate::arch::scalar::color::ycc_row_to_rgb(y, cb, cr, out, n, layout)
+    }
 }
 
 // ===========================================================================
@@ -561,6 +585,12 @@ pub mod dct {
 
     /// 8x8 forward integer DCT (LL&M "islow"), in-place. Bit-exact
     /// equivalent to `arch::scalar::dct::fdct_islow`.
+    /// Inverse 8x8 DCT — currently the scalar reference; an AVX2 port
+    /// is on the decoder roadmap.
+    pub fn idct_islow(coef: &[i16; 64], output: &mut [u8; 64]) {
+        crate::arch::scalar::dct::idct_islow(coef, output)
+    }
+
     pub fn fdct_islow(data: &mut [i16; 64]) {
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe { fdct_avx2(data) }
