@@ -69,7 +69,7 @@ jpeg-rusturbo = { git = "..." }   # crates.io publication TBD
 ```
 
 ```rust
-use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat};
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -79,40 +79,60 @@ fn save(path: &str, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
     enc.set_subsampling(ChromaSubsampling::Yuv420); // default; explicit for clarity
     enc.encode_rgba(rgba, w, h)
 }
+
+// Other byte layouts go through the generic `encode` entry point:
+fn save_bgra(path: &str, bgra: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode(bgra, w, h, PixelFormat::Bgra)
+}
 ```
 
-The encoder accepts `&[u8]` in either RGB (3 bytes/pixel) or RGBA
-(4 bytes/pixel, alpha dropped — JPEG has no alpha channel) and writes
-to any `std::io::Write`. Quality is clamped to 1..=100; subsampling
-defaults to 4:2:0, with 4:2:2 and 4:4:4 available via
-`set_subsampling`.
+The encoder accepts `&[u8]` in any of eight pixel layouts — `Rgb`,
+`Bgr`, `Rgba`, `Bgra`, `Argb`, `Abgr`, `Rgbx`, `Bgrx` (alpha or pad
+byte dropped) — and writes to any `std::io::Write`. `encode_rgb` and
+`encode_rgba` remain as convenience shortcuts; everything else goes
+through `JpegEncoder::encode(buf, w, h, PixelFormat::…)`. Quality is
+clamped to `1..=100`; subsampling defaults to 4:2:0, with 4:2:2 and
+4:4:4 available via `set_subsampling`.
 
 ## Features
 
-- **NEON on AArch64** — full set of four hot kernels.
-- **AVX2 on x86_64** — same four kernels. Runtime
-  `is_x86_feature_detected!` falls back to scalar on non-AVX2 CPUs;
-  the result is cached, so only the first call pays the check.
+- **NEON on AArch64** — color convert, FDCT, quantize + zig-zag,
+  4:2:0 / 4:2:2 chroma downsample, and the Huffman nonzero bitmap.
+- **AVX2 on x86_64** — color convert, FDCT, quantize + zig-zag, 4:2:0
+  / 4:2:2 chroma downsample. Runtime `is_x86_feature_detected!` falls
+  back to scalar on non-AVX2 CPUs; the result is cached, so only the
+  first call pays the check.
+- **SSE2 on x86_64** — Huffman nonzero bitmap
+  (`pcmpeqw + packsswb + pmovmskb`, translated from
+  `jchuff-sse2.asm`). SSE2 is the x86_64 baseline, no runtime gate.
+- **Eight input pixel layouts** — `Rgb`, `Bgr`, `Rgba`, `Bgra`,
+  `Argb`, `Abgr`, `Rgbx`, `Bgrx` via the generic
+  [`PixelFormat`] dispatch on `JpegEncoder::encode`.
+- **Three chroma modes** — 4:4:4, 4:2:2, 4:2:0.
 - **Scalar fallback** — on every target, opt-in via the `force-scalar`
   Cargo feature, or used automatically on architectures without a
   SIMD backend.
 - **Bit-exact across backends** — cross-check tests assert that NEON,
-  scalar, and AVX2 produce byte-identical JPEG output.
+  scalar, and AVX2 / SSE2 produce byte-identical JPEG output.
 - **`image::codecs::jpeg::JpegEncoder`-shaped public API** — port a
   call site by swapping the `use` line.
 
-The Huffman entropy coder stays scalar by design: it autovectorizes
-well in trivial form, the AC scan is too branchy for SIMD to win, and
-libjpeg-turbo upstream itself doesn't ship an AArch64-NEON / AVX2
-Huffman kernel. See [BENCH.md](BENCH.md)'s Huffman and AVX2 sections
-for the reasoning trail.
+The Huffman AC scan is bitmap-driven: a `u64` nonzero bitmap collapses
+zero runs into a single `trailing_zeros` jump per nonzero. The bitmap
+itself is SIMD on both architectures (NEON / SSE2); the per-nonzero
+symbol emission (run-length + magnitude + table lookup + bit-writer
+drain) stays scalar — it autovectorizes well and doesn't reshape
+cleanly into a wider SIMD body. See [BENCH.md](BENCH.md) for the
+per-stage breakdown.
 
 ## Architecture (brief)
 
 The crate is a single library with a small public surface
-(`JpegEncoder`, `ChromaSubsampling`, `encode_rgb`, `encode_rgba`).
-Per-architecture kernels live behind `arch::backend::*`, selected at
-compile time:
+(`JpegEncoder`, `ChromaSubsampling`, `PixelFormat`, `encode`,
+`encode_rgb`, `encode_rgba`). Per-architecture kernels live behind
+`arch::backend::*`, selected at compile time:
 
 ```
 aarch64 + !force-scalar  →  arch::neon
@@ -129,7 +149,7 @@ four kernel modules + add a `cfg` arm in `arch/mod.rs`"; see
 Pre-1.0, single-author project. The encoder produces standard baseline
 JPEG that decodes round-trip-equivalent through any conforming decoder
 (verified via `image`'s decoder in the test suite). The public API has
-settled but `0.1` reserves the right to evolve before `1.0`.
+settled but `0.x` reserves the right to evolve before `1.0`.
 
 The public API is intentionally identical to `image`'s
 `JpegEncoder`, so call sites can swap implementations with a `use`
