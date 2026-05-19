@@ -16,13 +16,13 @@
 //!      single `u32` per symbol. One load per symbol, no struct field
 //!      offsetting.
 //!
-//!   4. **AC zero scan, 8 at a time** — the AC RLE loop walks 63
-//!      coefficients counting zero runs. We delegate the per-group
-//!      zero check to `crate::arch::backend::huffman::group_of_8_is_zero`,
-//!      which on aarch64 is a 1-load, 1-compare NEON op and on the
-//!      scalar backend is a tight loop that LLVM autovectorizes.
-//!      Either way we skip 8 coefficients at once whenever the group
-//!      is fully zero.
+//!   4. **Bitmap-driven AC scan** — `arch::backend::huffman::nonzero_bitmap`
+//!      packs the per-coefficient zero/non-zero predicate into a single
+//!      `u64`. The AC walk then uses `trailing_zeros` to jump directly
+//!      to each next nonzero, replacing the previous group-of-8 skip +
+//!      per-coefficient branch. On aarch64 the bitmap is built with
+//!      `vceqz + vmovn + vaddv`; on x86_64 / scalar the obvious loop
+//!      autovectorizes.
 //!
 //!   5. **Internal byte buffer** — the bit accumulator drains into a
 //!      `Vec<u8>` we own, and we only call the user's `Write` when
@@ -244,41 +244,30 @@ pub fn encode_block<W: io::Write>(
     }
 
     // ----- AC terms: run-length of zeros + magnitude (F.1.2.2) -----
-    // Find last non-zero AC index so the trailing run becomes EOB.
-    let last_nonzero = find_last_nonzero(block);
-    if last_nonzero == 0 {
+    // Build a 64-bit bitmap of nonzero positions, then drive the scan
+    // via trailing/leading-zeros so every walked position is a hit.
+    let ac_bitmap = crate::arch::backend::huffman::nonzero_bitmap(block) & !1u64;
+
+    if ac_bitmap == 0 {
         // All AC coefficients zero → emit EOB and we're done.
         let eob = ac_tab.packed[0x00];
         bw.write_bits(eob & 0xFFFF, eob >> 16)?;
         return Ok(dc);
     }
 
-    let mut zero_run: u32 = 0;
+    let last_nonzero = 63 - ac_bitmap.leading_zeros() as usize;
+    let mut remaining = ac_bitmap;
     let mut k: usize = 1;
-    while k <= last_nonzero {
-        // ---- Skip a zero group of 8 when possible. ----
-        // Useful when we're aligned at the start of a zig-zag group of
-        // 8 AND there's at least 8 elements left in the AC scan.
-        while k + 8 <= last_nonzero + 1
-            && crate::arch::backend::huffman::group_of_8_is_zero(block, k)
-        {
-            zero_run += 8;
-            k += 8;
-        }
-
-        let coef = block[k];
-        if coef == 0 {
-            zero_run += 1;
-            k += 1;
-            continue;
-        }
-
+    while remaining != 0 {
+        let next_k = remaining.trailing_zeros() as usize;
+        let mut zero_run = (next_k - k) as u32;
         // ZRL (F0): emit 16-zero placeholder until run < 16.
         while zero_run >= 16 {
             let zrl = ac_tab.packed[0xF0];
             bw.write_bits(zrl & 0xFFFF, zrl >> 16)?;
             zero_run -= 16;
         }
+        let coef = block[next_k];
         let (size, bits) = magnitude_category(coef as i32);
         // Baseline 8-bit JPEG bounds AC magnitude category at 10 (DC at
         // 11). With our fixed-point scale + clamped quant tables, post-
@@ -293,8 +282,8 @@ pub fn encode_block<W: io::Write>(
         let entry = ac_tab.packed[symbol];
         bw.write_bits(entry & 0xFFFF, entry >> 16)?;
         bw.write_bits(bits, size as u32)?;
-        zero_run = 0;
-        k += 1;
+        remaining &= !(1u64 << next_k);
+        k = next_k + 1;
     }
 
     // Trailing zeros → EOB (symbol 0x00).
@@ -304,24 +293,6 @@ pub fn encode_block<W: io::Write>(
     }
 
     Ok(dc)
-}
-
-/// Index of the last non-zero AC coefficient (1..=63), or 0 if every AC
-/// coefficient is zero. Hot path: a typical compressed-image block at
-/// q=70-80 has its last nonzero somewhere in the first 1/3 of the AC
-/// scan, so walking from the end backwards finishes very fast.
-#[inline]
-fn find_last_nonzero(block: &[i16; 64]) -> usize {
-    // Walk from the tail. The scalar form here is what LLVM autovectorizes
-    // into a NEON-friendly loop on aarch64, and on x86_64 / scalar builds
-    // it's still cheap because the typical block has a short tail of
-    // zeros.
-    for k in (1..64).rev() {
-        if block[k] != 0 {
-            return k;
-        }
-    }
-    0
 }
 
 /// JPEG "magnitude category" (Annex F.1.2):
