@@ -281,17 +281,25 @@ pub mod quant {
 }
 
 // ===========================================================================
-// huffman: AC zero-scan helper (the only compiled SIMD-y part of huffman)
+// huffman: 64-bit nonzero bitmap for AC scan
 // ===========================================================================
 pub mod huffman {
-    /// Returns true if `block[k..k+8]` is all zero. The scalar form
-    /// LLVM autovectorizes well on every backend; SIMD backends provide
-    /// a directly-implemented version when the bookkeeping for a
-    /// vectorized check is cheaper than autovec output.
-    #[inline(always)]
-    pub fn group_of_8_is_zero(block: &[i16; 64], k: usize) -> bool {
-        debug_assert!(k + 8 <= 64);
-        block[k..k + 8].iter().all(|&v| v == 0)
+    /// Bit `k` is set iff `block[k] != 0`. Drives the AC run-length scan
+    /// via trailing/leading-zeros bit twiddling, so that the inner walk
+    /// is `ctz`-driven rather than per-coefficient branchy.
+    ///
+    /// The scalar form here is a straightforward loop; SIMD backends
+    /// build the same bitmap with `vceqz + vshrn + vaddv`-style packed
+    /// comparison.
+    #[inline]
+    pub fn nonzero_bitmap(block: &[i16; 64]) -> u64 {
+        let mut bm: u64 = 0;
+        for (k, &v) in block.iter().enumerate() {
+            if v != 0 {
+                bm |= 1u64 << k;
+            }
+        }
+        bm
     }
 }
 
