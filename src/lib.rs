@@ -35,14 +35,14 @@
 //!
 //! # Performance
 //!
-//! Per-architecture SIMD kernels (NEON on aarch64, AVX2 on x86_64)
-//! are translated from libjpeg-turbo with bit-exact output guarantees
-//! against the scalar reference. Whole-pipeline speedup vs scalar is
-//! around 1.7-1.9x at 1080p / 4K on Apple Silicon and recent Intel /
-//! AMD x86_64. See [`BENCH.md`] in the repository for detailed
+//! Per-architecture SIMD kernels (NEON on aarch64, AVX2 + SSE2 on
+//! x86_64) are translated from libjpeg-turbo with bit-exact output
+//! guarantees against the scalar reference. Whole-pipeline speedup vs
+//! scalar is ~1.5× on Apple Silicon and ~2.0× on Intel Ice Lake at
+//! 1080p / 4K, q=80. See [`BENCH.md`] in the repository for detailed
 //! numbers.
 //!
-//! [`BENCH.md`]: https://github.com/example/jpeg-rusturbo/blob/main/BENCH.md
+//! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
 //! On x86_64, AVX2 dispatch is gated by a runtime
 //! `is_x86_feature_detected!("avx2")` check; CPUs without AVX2 fall
@@ -79,7 +79,7 @@
 //! See [`docs/ARCHITECTURE.md`] for the full internal design and the
 //! "adding a new arch backend" recipe.
 //!
-//! [`docs/ARCHITECTURE.md`]: https://github.com/example/jpeg-rusturbo/blob/main/docs/ARCHITECTURE.md
+//! [`docs/ARCHITECTURE.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/docs/ARCHITECTURE.md
 //!
 //! # Attribution
 //!
