@@ -32,9 +32,9 @@ pub mod color {
         debug_assert!(pixels.len() >= n * layout.bpp);
         for i in 0..n {
             let p = i * layout.bpp;
-            let r = pixels[p] as u32;
-            let g = pixels[p + 1] as u32;
-            let b = pixels[p + 2] as u32;
+            let r = pixels[p + layout.r_off] as u32;
+            let g = pixels[p + layout.g_off] as u32;
+            let b = pixels[p + layout.b_off] as u32;
             let y_i = (Y_R * r + Y_G * g + Y_B * b + FIX_HALF as u32) >> FIX;
             let cb_i = (CHROMA_BIAS - CB_R * r - CB_G * g + CB_B * b) >> FIX;
             let cr_i = (CHROMA_BIAS + CR_R * r - CR_G * g - CR_B * b) >> FIX;

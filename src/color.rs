@@ -34,14 +34,65 @@ pub(crate) const CR_B: u32 = 5329;
 // so we pre-bias once.
 pub(crate) const CHROMA_BIAS: u32 = (128 << 16) + 32767;
 
-/// Pixel-stride descriptor: bytes per pixel.
+/// Per-pixel layout descriptor: bytes per pixel plus the R/G/B byte
+/// offsets within a pixel. The alpha / pad byte (when present) lives
+/// at the leftover offset and is ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelLayout {
     pub bpp: usize,
+    pub r_off: usize,
+    pub g_off: usize,
+    pub b_off: usize,
 }
 
-pub const RGB: PixelLayout = PixelLayout { bpp: 3 };
-pub const RGBA: PixelLayout = PixelLayout { bpp: 4 };
+pub const RGB: PixelLayout = PixelLayout {
+    bpp: 3,
+    r_off: 0,
+    g_off: 1,
+    b_off: 2,
+};
+pub const BGR: PixelLayout = PixelLayout {
+    bpp: 3,
+    r_off: 2,
+    g_off: 1,
+    b_off: 0,
+};
+pub const RGBA: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 0,
+    g_off: 1,
+    b_off: 2,
+};
+pub const BGRA: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 2,
+    g_off: 1,
+    b_off: 0,
+};
+pub const ARGB: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 1,
+    g_off: 2,
+    b_off: 3,
+};
+pub const ABGR: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 3,
+    g_off: 2,
+    b_off: 1,
+};
+pub const RGBX: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 0,
+    g_off: 1,
+    b_off: 2,
+};
+pub const BGRX: PixelLayout = PixelLayout {
+    bpp: 4,
+    r_off: 2,
+    g_off: 1,
+    b_off: 0,
+};
 
 /// Build an 8- or 16-wide RGB scratch row with edge replication, starting
 /// at pixel column `x0` and source row `sy`. Source row is clamped to
