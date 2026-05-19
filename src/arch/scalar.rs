@@ -89,6 +89,87 @@ pub mod color {
             }
         }
     }
+
+    // ---- Decoder-side upsample (box / nearest-neighbor) ----
+
+    /// Box-upsample 8x8 chroma into 16x16 by 2x replication in both
+    /// axes. Pairs with [`h2v2_downsample`] on the encoder side but
+    /// is intentionally a simple nearest-neighbor expansion — fancy
+    /// (interpolating) upsample is on the roadmap.
+    pub fn h2v2_upsample(src: &[u8; 64], dst: &mut [u8; 256]) {
+        for j in 0..8 {
+            for i in 0..8 {
+                let s = src[j * 8 + i];
+                let row0 = (j * 2) * 16;
+                let row1 = row0 + 16;
+                let col = i * 2;
+                dst[row0 + col] = s;
+                dst[row0 + col + 1] = s;
+                dst[row1 + col] = s;
+                dst[row1 + col + 1] = s;
+            }
+        }
+    }
+
+    /// Box-upsample 8x8 chroma into 16x8 by 2x replication in the
+    /// horizontal axis only. Counterpart of [`h2v1_downsample`].
+    pub fn h2v1_upsample(src: &[u8; 64], dst: &mut [u8; 128]) {
+        for j in 0..8 {
+            for i in 0..8 {
+                let s = src[j * 8 + i];
+                let col = i * 2;
+                dst[j * 16 + col] = s;
+                dst[j * 16 + col + 1] = s;
+            }
+        }
+    }
+
+    // ---- Decoder-side per-row YCbCr → RGB(A) ----
+
+    /// Convert one row of `n` YCbCr samples to RGB(A) at `layout`. The
+    /// alpha / pad byte (when `bpp == 4`) is filled with `0xFF`.
+    ///
+    /// Inverse color matrix (SCALEBITS = 16):
+    ///   R = Y                              + 1.40200 * (Cr - 128)
+    ///   G = Y - 0.34414 * (Cb - 128) - 0.71414 * (Cr - 128)
+    ///   B = Y + 1.77200 * (Cb - 128)
+    pub fn ycc_row_to_rgb(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        out: &mut [u8],
+        n: usize,
+        layout: PixelLayout,
+    ) {
+        debug_assert!(y.len() >= n && cb.len() >= n && cr.len() >= n);
+        debug_assert!(out.len() >= n * layout.bpp);
+        const HALF: i32 = 1 << 15;
+        // Inverse color-conversion fixed-point constants (round(x * 65536)).
+        const I_CR_R: i32 = 91881; // 1.40200
+        const I_CB_G: i32 = 22554; // 0.34414
+        const I_CR_G: i32 = 46802; // 0.71414
+        const I_CB_B: i32 = 116130; // 1.77200
+
+        for i in 0..n {
+            let yi = y[i] as i32;
+            let cbi = cb[i] as i32 - 128;
+            let cri = cr[i] as i32 - 128;
+            let r = yi + ((I_CR_R * cri + HALF) >> 16);
+            let g = yi - ((I_CB_G * cbi + I_CR_G * cri + HALF) >> 16);
+            let b = yi + ((I_CB_B * cbi + HALF) >> 16);
+            let r = r.clamp(0, 255) as u8;
+            let g = g.clamp(0, 255) as u8;
+            let b = b.clamp(0, 255) as u8;
+            let p = i * layout.bpp;
+            out[p + layout.r_off] = r;
+            out[p + layout.g_off] = g;
+            out[p + layout.b_off] = b;
+            if layout.bpp == 4 {
+                let a_off = 6 - layout.r_off - layout.g_off - layout.b_off;
+                out[p + a_off] = 0xFF;
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -236,6 +317,158 @@ pub mod dct {
             data[40 + col] = descale(t5 + z2 + z4, CONST_BITS + PASS1_BITS) as i16;
             data[24 + col] = descale(t6 + z2 + z3, CONST_BITS + PASS1_BITS) as i16;
             data[8 + col] = descale(t7 + z1 + z4, CONST_BITS + PASS1_BITS) as i16;
+        }
+    }
+
+    /// Round-and-shift used by the inverse pass; pass 2 also folds in
+    /// the level shift (`+128`) so the output range matches u8.
+    #[inline(always)]
+    fn descale_pos(x: i32, n: i32) -> i32 {
+        (x + (1 << (n - 1))) >> n
+    }
+
+    /// Inverse 8x8 DCT, libjpeg-turbo `jidctint` style. Input
+    /// `coef_block` is in natural order, already dequantized (i.e.
+    /// `Q[i] * coef[i]`). Output is 8x8 u8 samples in natural order.
+    ///
+    /// Pass 1 processes columns into a scaled i32 workspace; pass 2
+    /// processes rows from the workspace, descales, level-shifts by
+    /// +128, and clamps to `[0, 255]`.
+    pub fn idct_islow(coef: &[i16; 64], output: &mut [u8; 64]) {
+        let mut ws = [0i32; 64];
+
+        // ---- Pass 1: columns from coef → ws (i32) ----
+        for col in 0..8 {
+            // Even part
+            let z2 = coef[16 + col] as i32;
+            let z3 = coef[48 + col] as i32;
+            let z1 = (z2 + z3) * FIX_0_541_196_100;
+            let tmp2 = z1 + z3 * (-FIX_1_847_759_065);
+            let tmp3 = z1 + z2 * FIX_0_765_366_865;
+
+            let z2 = coef[col] as i32;
+            let z3 = coef[32 + col] as i32;
+            let tmp0 = (z2 + z3) << CONST_BITS;
+            let tmp1 = (z2 - z3) << CONST_BITS;
+
+            let tmp10 = tmp0 + tmp3;
+            let tmp13 = tmp0 - tmp3;
+            let tmp11 = tmp1 + tmp2;
+            let tmp12 = tmp1 - tmp2;
+
+            // Odd part
+            let t0 = coef[56 + col] as i32;
+            let t1 = coef[40 + col] as i32;
+            let t2 = coef[24 + col] as i32;
+            let t3 = coef[8 + col] as i32;
+
+            let z1 = t0 + t3;
+            let z2 = t1 + t2;
+            let z3 = t0 + t2;
+            let z4 = t1 + t3;
+            let z5 = (z3 + z4) * FIX_1_175_875_602;
+
+            let t0m = t0 * FIX_0_298_631_336;
+            let t1m = t1 * FIX_2_053_119_869;
+            let t2m = t2 * FIX_3_072_711_026;
+            let t3m = t3 * FIX_1_501_321_110;
+            let z1 = z1 * (-FIX_0_899_976_223);
+            let z2 = z2 * (-FIX_2_562_915_447);
+            let z3 = z3 * (-FIX_1_961_570_560);
+            let z4 = z4 * (-FIX_0_390_180_644);
+
+            let z3 = z3 + z5;
+            let z4 = z4 + z5;
+
+            let to0 = t0m + z1 + z3;
+            let to1 = t1m + z2 + z4;
+            let to2 = t2m + z2 + z3;
+            let to3 = t3m + z1 + z4;
+
+            ws[col] = descale_pos(tmp10 + to3, CONST_BITS - PASS1_BITS);
+            ws[56 + col] = descale_pos(tmp10 - to3, CONST_BITS - PASS1_BITS);
+            ws[8 + col] = descale_pos(tmp11 + to2, CONST_BITS - PASS1_BITS);
+            ws[48 + col] = descale_pos(tmp11 - to2, CONST_BITS - PASS1_BITS);
+            ws[16 + col] = descale_pos(tmp12 + to1, CONST_BITS - PASS1_BITS);
+            ws[40 + col] = descale_pos(tmp12 - to1, CONST_BITS - PASS1_BITS);
+            ws[24 + col] = descale_pos(tmp13 + to0, CONST_BITS - PASS1_BITS);
+            ws[32 + col] = descale_pos(tmp13 - to0, CONST_BITS - PASS1_BITS);
+        }
+
+        // ---- Pass 2: rows from ws → output (u8, range-limited) ----
+        const SHIFT2: i32 = CONST_BITS + PASS1_BITS + 3;
+        // +3 bits absorb the `*8` scaling residual built into the
+        // forward DCT, so the round-bias becomes `1 << (SHIFT2 - 1)`.
+        // The +128 level shift is folded in by adding `128 << SHIFT2`
+        // to the round-bias before descaling.
+        let round_bias: i32 = (1 << (SHIFT2 - 1)) + (128 << SHIFT2);
+
+        for row in 0..8 {
+            let off = row * 8;
+            // Even part
+            let z2 = ws[off + 2];
+            let z3 = ws[off + 6];
+            let z1 = (z2 + z3) * FIX_0_541_196_100;
+            let tmp2 = z1 + z3 * (-FIX_1_847_759_065);
+            let tmp3 = z1 + z2 * FIX_0_765_366_865;
+
+            let z2 = ws[off];
+            let z3 = ws[off + 4];
+            let tmp0 = (z2 + z3) << CONST_BITS;
+            let tmp1 = (z2 - z3) << CONST_BITS;
+
+            let tmp10 = tmp0 + tmp3;
+            let tmp13 = tmp0 - tmp3;
+            let tmp11 = tmp1 + tmp2;
+            let tmp12 = tmp1 - tmp2;
+
+            // Odd part
+            let t0 = ws[off + 7];
+            let t1 = ws[off + 5];
+            let t2 = ws[off + 3];
+            let t3 = ws[off + 1];
+
+            let z1 = t0 + t3;
+            let z2 = t1 + t2;
+            let z3 = t0 + t2;
+            let z4 = t1 + t3;
+            let z5 = (z3 + z4) * FIX_1_175_875_602;
+
+            let t0m = t0 * FIX_0_298_631_336;
+            let t1m = t1 * FIX_2_053_119_869;
+            let t2m = t2 * FIX_3_072_711_026;
+            let t3m = t3 * FIX_1_501_321_110;
+            let z1 = z1 * (-FIX_0_899_976_223);
+            let z2 = z2 * (-FIX_2_562_915_447);
+            let z3 = z3 * (-FIX_1_961_570_560);
+            let z4 = z4 * (-FIX_0_390_180_644);
+
+            let z3 = z3 + z5;
+            let z4 = z4 + z5;
+
+            let to0 = t0m + z1 + z3;
+            let to1 = t1m + z2 + z4;
+            let to2 = t2m + z2 + z3;
+            let to3 = t3m + z1 + z4;
+
+            // Apply DESCALE with combined round + level-shift bias.
+            let p0 = ((tmp10 + to3) + round_bias) >> SHIFT2;
+            let p1 = ((tmp11 + to2) + round_bias) >> SHIFT2;
+            let p2 = ((tmp12 + to1) + round_bias) >> SHIFT2;
+            let p3 = ((tmp13 + to0) + round_bias) >> SHIFT2;
+            let p4 = ((tmp13 - to0) + round_bias) >> SHIFT2;
+            let p5 = ((tmp12 - to1) + round_bias) >> SHIFT2;
+            let p6 = ((tmp11 - to2) + round_bias) >> SHIFT2;
+            let p7 = ((tmp10 - to3) + round_bias) >> SHIFT2;
+
+            output[off] = p0.clamp(0, 255) as u8;
+            output[off + 1] = p1.clamp(0, 255) as u8;
+            output[off + 2] = p2.clamp(0, 255) as u8;
+            output[off + 3] = p3.clamp(0, 255) as u8;
+            output[off + 4] = p4.clamp(0, 255) as u8;
+            output[off + 5] = p5.clamp(0, 255) as u8;
+            output[off + 6] = p6.clamp(0, 255) as u8;
+            output[off + 7] = p7.clamp(0, 255) as u8;
         }
     }
 }

@@ -88,6 +88,7 @@
 
 mod arch;
 mod color;
+pub mod decode;
 mod huffman;
 mod markers;
 mod quant;
