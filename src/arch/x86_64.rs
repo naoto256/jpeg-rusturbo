@@ -278,10 +278,12 @@ pub mod color {
             // Per 128-bit lane, place RRRRGGGGBBBBAAAA at bytes 0..15 by
             // gathering source bytes at offsets {r, g, b, a} stepped by 4
             // (one per pixel within the 4-pixel-per-half-lane chunk).
+            #[rustfmt::skip]
             let shuf = _mm256_setr_epi8(
-                r, r + 4, r + 8, r + 12, g, g + 4, g + 8, g + 12, b, b + 4, b + 8, b + 12, a,
-                a + 4, a + 8, a + 12, r, r + 4, r + 8, r + 12, g, g + 4, g + 8, g + 12, b, b + 4,
-                b + 8, b + 12, a, a + 4, a + 8, a + 12,
+                r, r + 4, r + 8, r + 12,  g, g + 4, g + 8, g + 12,
+                b, b + 4, b + 8, b + 12,  a, a + 4, a + 8, a + 12,
+                r, r + 4, r + 8, r + 12,  g, g + 4, g + 8, g + 12,
+                b, b + 4, b + 8, b + 12,  a, a + 4, a + 8, a + 12,
             );
             // After vpshufb (per-lane):
             //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
