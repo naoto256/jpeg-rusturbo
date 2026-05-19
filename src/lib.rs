@@ -1,9 +1,11 @@
-//! Baseline JPEG encoder — drop-in for [`image::codecs::jpeg::JpegEncoder`]
-//! with NEON / AVX2 / scalar SIMD backends.
+//! Baseline JPEG encoder + decoder with NEON / AVX2 / SSE2 / scalar
+//! SIMD backends. The encoder is a drop-in for
+//! [`image::codecs::jpeg::JpegEncoder`]; the decoder is a standalone
+//! [`decode::Decoder`] under the `decode` module.
 //!
 //! [`image::codecs::jpeg::JpegEncoder`]: https://docs.rs/image/latest/image/codecs/jpeg/struct.JpegEncoder.html
 //!
-//! # Quick start
+//! # Quick start — encode
 //!
 //! ```
 //! use jpeg_rusturbo::JpegEncoder;
@@ -14,6 +16,19 @@
 //! enc.encode_rgba(&pixels, 16, 16)?;
 //! assert_eq!(&out[..2], &[0xFF, 0xD8]); // SOI marker
 //! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Quick start — decode
+//!
+//! ```
+//! use jpeg_rusturbo::{JpegEncoder, PixelFormat, decode};
+//!
+//! # let pixels = vec![128u8; 16 * 16 * 4];
+//! # let mut jpeg = Vec::new();
+//! # JpegEncoder::new_with_quality(&mut jpeg, 80).encode_rgba(&pixels, 16, 16)?;
+//! let rgb = decode::decode(&jpeg, PixelFormat::Rgb)?;
+//! assert_eq!(rgb.len(), 16 * 16 * 3);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # Choosing chroma subsampling
@@ -37,10 +52,14 @@
 //!
 //! Per-architecture SIMD kernels (NEON on aarch64, AVX2 + SSE2 on
 //! x86_64) are translated from libjpeg-turbo with bit-exact output
-//! guarantees against the scalar reference. Whole-pipeline speedup vs
-//! scalar is ~1.5× on Apple Silicon and ~2.0× on Intel Ice Lake at
-//! 1080p / 4K, q=80. See [`BENCH.md`] in the repository for detailed
-//! numbers.
+//! guarantees against the scalar reference. Encoder whole-pipeline
+//! speedup vs scalar is ~1.5× on Apple Silicon and ~2.0× on Intel
+//! Ice Lake at 1080p / 4K, q=80. Versus the `image` crate's
+//! scalar encoder, jpeg-rusturbo's encoder is ~2.5× / ~3.9× faster
+//! (Apple M / Ice Lake). The decoder added in 0.3.0 is currently
+//! scalar — it lags `image`'s SIMD decoder by ~2.5× until decoder
+//! SIMD lands in 0.4.0. See [`BENCH.md`] in the repository for
+//! detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
@@ -55,7 +74,7 @@
 //! # Implementation notes
 //!
 //! Hot kernels live behind `arch::backend::*` selected at compile
-//! time. The pipeline:
+//! time. The encode pipeline:
 //!
 //! ```text
 //!   RGB(A) bytes
@@ -70,11 +89,16 @@
 //!       │   └─ arch::backend::quant::quantize_natural
 //!       ▼
 //!   8x8 i16 zig-zag coefficients
-//!       │ Huffman entropy code
-//!       │   └─ arch::backend::huffman::group_of_8_is_zero (8-skip)
+//!       │ Huffman entropy code (bitmap-driven AC scan)
+//!       │   └─ arch::backend::huffman::nonzero_bitmap
 //!       ▼
 //!   entropy-coded bytes (with 0xFF → 0xFF 0x00 stuffing)
 //! ```
+//!
+//! The decode pipeline mirrors this in reverse: marker parser →
+//! Huffman decode (bit reader plus canonical-Huffman LUT) →
+//! de-zig-zag and dequantize → `arch::backend::dct::idct_islow` →
+//! chroma upsample → YCbCr→RGB.
 //!
 //! See [`docs/ARCHITECTURE.md`] for the full internal design and the
 //! "adding a new arch backend" recipe.

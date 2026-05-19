@@ -221,3 +221,53 @@ together with the SSE2 counterpart on x86_64.
     been the de-facto floor for new code since ~2014. (SSE2 is the
     x86_64-v1 baseline and is always available for the Huffman
     nonzero-bitmap kernel.)
+
+## vs `image` crate (added in 0.3.0)
+
+`image` is the de-facto Rust image library. It bundles a scalar JPEG
+encoder and routes JPEG decode through `zune-jpeg` (SIMD-accelerated).
+The numbers below are from `tests/comparison_bench.rs` (50 warmed
+iterations, single timed batch) on the same hosts as the
+self-comparison tables above.
+
+### Encode (RGB → JPEG, q=80, 4:2:0)
+
+| Host                                | Resolution | ours        | image       | ratio (img/ours) |
+| ----------------------------------- | ---------- | ----------: | ----------: | ---------------: |
+| Apple M-series (NEON)               | 1592×1124  |     5.66 ms |    14.49 ms |            2.56× |
+|                                     | 1920×1080  |     6.20 ms |    15.99 ms |            2.58× |
+|                                     | 3840×2160  |    24.33 ms |    61.75 ms |            2.54× |
+| Intel Xeon Platinum 8370C (AVX2)    | 1592×1124  |    16.03 ms |    62.01 ms |            3.87× |
+|                                     | 1920×1080  |    18.34 ms |    71.32 ms |            3.89× |
+|                                     | 3840×2160  |    72.09 ms |   276.49 ms |            3.84× |
+
+### Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
+
+| Host                                | Resolution | ours        | image       | ratio (img/ours) |
+| ----------------------------------- | ---------- | ----------: | ----------: | ---------------: |
+| Apple M-series (NEON)               | 1592×1124  |    11.11 ms |     4.22 ms |            0.38× |
+|                                     | 1920×1080  |    12.68 ms |     4.88 ms |            0.38× |
+|                                     | 3840×2160  |    50.17 ms |    19.04 ms |            0.38× |
+| Intel Xeon Platinum 8370C (AVX2)    | 1592×1124  |    23.66 ms |     9.30 ms |            0.39× |
+|                                     | 1920×1080  |    27.01 ms |    10.70 ms |            0.40× |
+|                                     | 3840×2160  |   107.64 ms |    46.47 ms |            0.43× |
+
+Decode is currently scalar (libjpeg-turbo's `jidctint` IDCT, integer
+YCbCr→RGB, box upsample). `image`'s decode goes through `zune-jpeg`
+with NEON / AVX2 IDCT and color paths, which is why it leads on
+decode by roughly the same factor our encoder leads on encode.
+Decoder SIMD is the headline 0.4.0 work item; until then, roundtrip
+throughput (encode + decode) is roughly even between the two crates
+on these resolutions.
+
+### Reproducibility
+
+```sh
+cargo test --release --test comparison_bench -- --nocapture comparison_print
+```
+
+Run on both an Apple M-series and a Linux x86_64 host with AVX2 to
+reproduce the per-host columns above. The harness uses
+deterministically generated pixel content (`make_image` in
+`tests/comparison_bench.rs`) so runs on different hosts compare
+apples-to-apples.

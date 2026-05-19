@@ -82,7 +82,7 @@ pub struct ScanComponent {
 
 /// Scan header parsed from SOS.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // ss/se/ah/al used by progressive (0.3.0 roadmap)
+#[allow(dead_code)] // ss/se/ah/al used by progressive (0.4.0 roadmap)
 pub struct ScanHeader {
     pub components: Vec<ScanComponent>,
     /// Start of spectral selection (Ss). 0 for DC, 1..=63 for AC.
