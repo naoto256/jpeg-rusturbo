@@ -27,10 +27,11 @@ bit-exact scalar reference.
 
 The `image` crate's bundled JPEG encoder is solid but scalar. On a 4K
 RGBA frame at q=80 it spends nearly all of its time on color
-conversion, DCT, and quantize — work that vectorizes well. Pulling
-those kernels off the scalar path lifts whole-pipeline throughput by
-roughly 1.7-1.9x on both Apple Silicon and recent Intel/AMD x86_64
-without changing the bytes that come out.
+conversion, DCT, quantize, and Huffman — work that vectorizes well.
+Pulling those kernels off the scalar path lifts whole-pipeline
+throughput by **~1.5× on Apple Silicon** and **~2.0× on Intel
+Ice Lake** versus scalar code on the same hardware, without changing
+the bytes that come out.
 
 ## Performance
 
@@ -40,23 +41,24 @@ without changing the bytes that come out.
 
 | Resolution                  | Apple M-series (NEON) | Intel Xeon Platinum 8370C (AVX2) |
 | --------------------------- | --------------------: | -------------------------------: |
-| 1592 × 1124 (session size)  |              6.47 ms  |                          14.02 ms |
-| 1920 × 1080 (1080p)         |              7.41 ms  |                          15.85 ms |
-| 3840 × 2160 (4K)            |             29.41 ms  |                          61.93 ms |
+| 1592 × 1124 (session size)  |              5.49 ms  |                          11.82 ms |
+| 1920 × 1080 (1080p)         |              6.23 ms  |                          13.65 ms |
+| 3840 × 2160 (4K)            |             25.04 ms  |                          53.50 ms |
 
 ### 4:2:2
 
 | Resolution                  | Apple M-series (NEON) | Intel Xeon Platinum 8370C (AVX2) |
 | --------------------------- | --------------------: | -------------------------------: |
-| 1592 × 1124 (session size)  |              8.58 ms  |                          17.99 ms |
-| 1920 × 1080 (1080p)         |              9.82 ms  |                          20.43 ms |
-| 3840 × 2160 (4K)            |             38.71 ms  |                          78.23 ms |
+| 1592 × 1124 (session size)  |              7.43 ms  |                          15.29 ms |
+| 1920 × 1080 (1080p)         |              8.45 ms  |                          17.45 ms |
+| 3840 × 2160 (4K)            |             33.00 ms  |                          68.18 ms |
 
-Scalar-fallback ratios on the same hosts are 1.4-1.7x slower than the
-SIMD numbers above. Output bytes are byte-identical across all three
-paths at every resolution; the cross-check unit tests + a roundtrip
-suite assert this. Full breakdown including per-stage profiling and
-phase-by-phase progression is in [BENCH.md](BENCH.md).
+Scalar-fallback ratios on the same hosts are 1.44–1.68× slower than
+NEON (Apple M-series) and 2.04–2.07× slower than AVX2 (Intel
+Ice Lake). Output bytes are byte-identical across SIMD and scalar
+paths at every resolution; cross-check unit tests + the roundtrip
+suite assert this. Full breakdown including per-stage profiling is
+in [BENCH.md](BENCH.md).
 
 ## Quick start
 

@@ -97,19 +97,20 @@ re-measured for this section.
 
 ## x86_64 AVX2 port
 
-This pass ports the four hot kernels (color RGB→YCbCr, 4:2:0 chroma
+This pass ports the four hot kernels (color RGB→YCbCr, chroma
 downsample, integer LL&M FDCT, reciprocal-multiply quantize) to x86_64
 AVX2, translated from libjpeg-turbo's `simd/x86_64/*-avx2.asm`. Color
-is AVX2-fast for the 4:2:0 hot path (`n=16`, RGBA layout); narrower
-calls and RGB-bpp inputs still go through scalar. The scaffolding
-(arch backend modules, runtime AVX2 detection, CI-friendly cfg
-plumbing) lives in `src/arch/`.
+is AVX2-fast for the bpp=4 hot path (`n=16`, any of RGBA / BGRA /
+ARGB / ABGR / RGBX / BGRX); narrower calls and 3-byte inputs still go
+through scalar. The scaffolding (arch backend modules, runtime AVX2
+detection, CI-friendly cfg plumbing) lives in `src/arch/`.
 
-The Huffman entropy coder is intentionally left scalar — the same
-reasoning as for the NEON port (libjpeg-turbo itself doesn't ship an
-AVX2 Huffman kernel for our shape, and the loop is too branchy for
-SIMD to win). The 64-bit accumulator + branchless inner path + 8-skip
-zero-scan from the Huffman pass stays as is.
+The Huffman AC scan is bitmap-driven: a nonzero bitmap (`u64`)
+collapses zero runs into a single `trailing_zeros` jump per nonzero.
+On x86_64 the bitmap is built with SSE2 (`pcmpeqw + packsswb +
+pmovmskb`, translated from `jchuff-sse2.asm`); the rest of the
+entropy emitter stays scalar (AC-symbol-emission and the 64-bit bit
+accumulator both autovectorize well in scalar form).
 
 ### Setup — Intel Ice Lake
 
@@ -120,11 +121,11 @@ below are the median.
 
 #### 4:2:0
 
-| Resolution                  | scalar (force-scalar) | AVX2  | speedup |
-| --------------------------- | --------------------: | ----: | ------: |
-| 1592 x 1124 (session size)  |             24.99 ms  | 14.02 ms |  1.78x |
-| 1920 x 1080 (1080p)         |             28.59 ms  | 15.85 ms |  1.80x |
-| 3840 x 2160 (4K)            |            111.51 ms  | 61.93 ms |  1.80x |
+| Resolution                  | scalar (force-scalar) | AVX2     | speedup |
+| --------------------------- | --------------------: | -------: | ------: |
+| 1592 x 1124 (session size)  |             24.31 ms  | 11.82 ms |  2.06x  |
+| 1920 x 1080 (1080p)         |             27.93 ms  | 13.65 ms |  2.05x  |
+| 3840 x 2160 (4K)            |            109.98 ms  | 53.50 ms |  2.06x  |
 
 Output bytes: `423839 / 488459 / 1940692` — byte-identical to scalar
 and to the Apple Silicon NEON build, verified by the cross-check unit
@@ -132,11 +133,11 @@ tests and the roundtrip suite.
 
 #### 4:2:2
 
-| Resolution                  | scalar (force-scalar) | AVX2   | speedup |
-| --------------------------- | --------------------: | -----: | ------: |
-| 1592 x 1124 (session size)  |             31.94 ms  | 17.99 ms |  1.78x |
-| 1920 x 1080 (1080p)         |             36.45 ms  | 20.43 ms |  1.78x |
-| 3840 x 2160 (4K)            |            141.71 ms  | 78.23 ms |  1.81x |
+| Resolution                  | scalar (force-scalar) | AVX2     | speedup |
+| --------------------------- | --------------------: | -------: | ------: |
+| 1592 x 1124 (session size)  |             31.15 ms  | 15.29 ms |  2.04x  |
+| 1920 x 1080 (1080p)         |             35.73 ms  | 17.45 ms |  2.05x  |
+| 3840 x 2160 (4K)            |            140.87 ms  | 68.18 ms |  2.07x  |
 
 Output bytes: `568676 / 654460 / 2618066`. The 4:2:2 path runs 4 DCT
 blocks per 16×8 MCU (vs 6 per 16×16 4:2:0 MCU), so per-pixel work
@@ -144,18 +145,18 @@ grows by ~1.33×; the AVX2 path tracks that growth closely.
 
 ### Where the AVX2 speedup is
 
-The ~1.80x whole-pipeline speedup matches what Amdahl's law predicts
-once the Huffman + marker/IO portion (~45-50 %) stays scalar and the
-remaining color/dct/quant/downsample chunk (~50-55 %) hits roughly
-3x in its kernels.
+The ~2.05× whole-pipeline speedup is what Amdahl's law predicts once
+the bitmap-driven Huffman scan trims the previously scalar-dominated
+AC walk and the remaining color / DCT / quant / chroma downsample
+kernels keep hitting ~3× in their SIMD bodies.
 
 A rough per-stage breakdown on the Ice Lake host (AVX2):
 
-  Color/downsample  ~25%  (AVX2: ~3.0x;  scalar: 1.0x)
-  Forward DCT       ~20%  (AVX2: ~2.7x;  scalar: 1.0x)
-  Quantize+zig-zag  ~10%  (AVX2: ~2.5x;  scalar: 1.0x)
-  Huffman           ~35%  (scalar in both)
-  Marker writes/IO  ~10%  (scalar in both)
+  Color/downsample      ~25%  (AVX2: ~3.0x;  scalar: 1.0x)
+  Forward DCT           ~20%  (AVX2: ~2.7x;  scalar: 1.0x)
+  Quantize+zig-zag      ~10%  (AVX2: ~2.5x;  scalar: 1.0x)
+  Huffman bitmap + walk ~30%  (SSE2 bitmap + scalar emitter; ~1.4x)
+  Marker writes/IO      ~15%  (scalar in both)
 
 ### Apple Silicon (NEON)
 
@@ -165,41 +166,44 @@ median.
 
 #### 4:2:0
 
-| Resolution                  | scalar (force-scalar) | NEON   | speedup |
-| --------------------------- | --------------------: | -----: | ------: |
-| 1592 x 1124 (session size)  |              9.01 ms  |  6.47 ms |  1.39x |
-| 1920 x 1080 (1080p)         |             10.34 ms  |  7.41 ms |  1.40x |
-| 3840 x 2160 (4K)            |             43.79 ms  | 29.41 ms |  1.49x |
+| Resolution                  | scalar (force-scalar) | NEON     | speedup |
+| --------------------------- | --------------------: | -------: | ------: |
+| 1592 x 1124 (session size)  |              8.54 ms  |  5.49 ms |  1.56x  |
+| 1920 x 1080 (1080p)         |              9.94 ms  |  6.23 ms |  1.60x  |
+| 3840 x 2160 (4K)            |             41.96 ms  | 25.04 ms |  1.68x  |
 
 #### 4:2:2
 
-| Resolution                  | scalar (force-scalar) | NEON   | speedup |
-| --------------------------- | --------------------: | -----: | ------: |
-| 1592 x 1124 (session size)  |             11.17 ms  |  8.58 ms |  1.30x |
-| 1920 x 1080 (1080p)         |             12.83 ms  |  9.82 ms |  1.31x |
-| 3840 x 2160 (4K)            |             50.01 ms  | 38.71 ms |  1.29x |
+| Resolution                  | scalar (force-scalar) | NEON     | speedup |
+| --------------------------- | --------------------: | -------: | ------: |
+| 1592 x 1124 (session size)  |             10.68 ms  |  7.43 ms |  1.44x  |
+| 1920 x 1080 (1080p)         |             12.32 ms  |  8.45 ms |  1.46x  |
+| 3840 x 2160 (4K)            |             47.94 ms  | 33.00 ms |  1.45x  |
 
 NEON whole-pipeline speedup is more modest than AVX2 here because the
 Apple M-series scalar path already runs the autovectorized Huffman /
 quantize / DCT inner loops well; the explicit NEON kernels for color
-convert, FDCT, quantize and chroma downsample claw back the remaining
-fixed-point arithmetic that LLVM doesn't fully cover.
+convert, FDCT, quantize, chroma downsample, and the Huffman nonzero
+bitmap claw back the remaining fixed-point arithmetic that LLVM
+doesn't fully cover.
 
-### Cumulative timeline (4K representative)
+### Cumulative timeline (4K, 4:2:0, q=80)
 
 | Configuration                                  | aarch64        | x86_64 (Ice Lake) |
 | ---------------------------------------------- | -------------: | ----------------: |
 | f32 AAN baseline (scalar)                      |     ~51.44 ms\* |                 — |
-| NEON SIMD kernels                              |        37.92 ms |                 — |
-| NEON + Huffman 64-bit                          |        27.23 ms |                 — |
-| **AVX2 + backend-dispatch refactor**           |     **28.50 ms** |       **63.93 ms** |
-| force-scalar (reference, post-refactor)        |          ~40 ms |          109.90 ms |
+| NEON SIMD kernels (color/FDCT/quant/downsample)|        37.92 ms |                 — |
+| NEON + Huffman 64-bit accumulator              |        27.23 ms |                 — |
+| AVX2 + backend-dispatch refactor               |        28.50 ms |          63.93 ms |
+| **Bitmap-driven Huffman (NEON + SSE2)**        |     **25.04 ms** |       **53.50 ms** |
+| force-scalar (reference, current)              |        41.96 ms |         109.98 ms |
 
 \* f32 baseline reproduced from earlier measurements.
 
-The aarch64 column at the AVX2 row is the same NEON build measured
-above (the AVX2 work doesn't change the aarch64 path); shown to make
-the cross-architecture comparison easy.
+The aarch64 column at the "AVX2 + backend-dispatch refactor" row is
+the NEON build measured pre-bitmap; the next row reflects the
+bitmap-driven AC scan plus NEON nonzero-bitmap kernel landed
+together with the SSE2 counterpart on x86_64.
 
 ## Out of scope (still)
 
@@ -207,7 +211,13 @@ the cross-architecture comparison easy.
     server market is bifurcated (Zen 4 has it, Zen 2/3 don't, Alder
     Lake P-cores have it disabled in many bins). AVX2 is the safe
     floor.
-  - Huffman vectorization (see Huffman pass notes — same conclusion).
+  - Full SIMD AC-symbol-emission (run-length + magnitude + Huffman
+    table lookup + bit-writer drain). The bitmap is now SIMD'd, but
+    the per-nonzero emission stays scalar — it's tight enough that
+    LLVM autovectorizes the bit-writer drain and the table lookups
+    don't reshape cleanly into SIMD.
   - x86 32-bit and SSE2-only fallback. Non-AVX2 x86_64 already runs
     via the scalar path through runtime feature detection; AVX2 has
-    been the de-facto floor for new code since ~2014.
+    been the de-facto floor for new code since ~2014. (SSE2 is the
+    x86_64-v1 baseline and is always available for the Huffman
+    nonzero-bitmap kernel.)
