@@ -662,8 +662,7 @@ pub mod huffman {
     #[target_feature(enable = "neon")]
     unsafe fn nonzero_bitmap_inner(block: &[i16; 64]) -> u64 {
         unsafe {
-            const BIT_SELECT: [u8; 16] =
-                [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            const BIT_SELECT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
             let bit_select = vld1q_u8(BIT_SELECT.as_ptr());
             let mut bm: u64 = 0;
             for chunk in 0..4 {
