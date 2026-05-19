@@ -9,8 +9,8 @@
 //!   scalar fallback for n=8 / RGB / non-AVX2
 //! - `color::h2v2_downsample` — AVX2
 //! - `color::h2v1_downsample` — AVX2
-//! - `huffman` — delegate to scalar (the AC zero-scan helper
-//!   autovectorizes well in scalar form)
+//! - `huffman::nonzero_bitmap` — SSE2 (`pcmpeqw + packsswb + pmovmskb`,
+//!   translated from `jchuff-sse2.asm`)
 //!
 //! Runtime feature detection: AVX2 is the only target we ever dispatch
 //! to from x86_64. Non-AVX2 CPUs hit the scalar fallback at runtime via
@@ -18,9 +18,49 @@
 
 #![allow(dead_code)]
 
-// Kernels not yet ported: forward to the scalar reference.
+// ===========================================================================
+// huffman: SSE2 nonzero bitmap for AC scan
+// ===========================================================================
 pub mod huffman {
-    pub use crate::arch::scalar::huffman::*;
+    use core::arch::x86_64::*;
+
+    /// Bit `k` is set iff `block[k] != 0`. Translated from
+    /// libjpeg-turbo's `simd/x86_64/jchuff-sse2.asm` bitmap step:
+    /// `pcmpeqw + packsswb + pmovmskb` over four 16-coefficient
+    /// chunks, NOT the result for "nonzero" semantics, OR into a u64.
+    ///
+    /// SSE2 is part of the x86_64 baseline so no runtime feature gate
+    /// is required.
+    pub fn nonzero_bitmap(block: &[i16; 64]) -> u64 {
+        unsafe { nonzero_bitmap_sse2(block) }
+    }
+
+    /// # Safety
+    /// SSE2 is unconditionally available on `target_arch = "x86_64"`.
+    /// `block` is a fixed-size reference; no caller-side invariants.
+    #[target_feature(enable = "sse2")]
+    unsafe fn nonzero_bitmap_sse2(block: &[i16; 64]) -> u64 {
+        unsafe {
+            let zero = _mm_setzero_si128();
+            let mut bm: u64 = 0;
+            for chunk in 0..4 {
+                let p = block.as_ptr().add(chunk * 16) as *const __m128i;
+                let v0 = _mm_loadu_si128(p);
+                let v1 = _mm_loadu_si128(p.add(1));
+                // 0xFFFF per i16 lane if zero, else 0x0000.
+                let eq0 = _mm_cmpeq_epi16(v0, zero);
+                let eq1 = _mm_cmpeq_epi16(v1, zero);
+                // Signed-saturate pack i16→i8: 0xFFFF (-1) → 0xFF, 0 → 0.
+                let packed = _mm_packs_epi16(eq0, eq1);
+                // Extract MSB of each byte ⇒ "is zero" mask.
+                let zero_mask = _mm_movemask_epi8(packed) as u32 & 0xFFFF;
+                // Invert for "nonzero" semantics.
+                let nz_mask = !zero_mask & 0xFFFF;
+                bm |= (nz_mask as u64) << (chunk * 16);
+            }
+            bm
+        }
+    }
 }
 
 // ===========================================================================
@@ -1045,5 +1085,63 @@ mod tests {
                 assert_eq!(s, a, "q={q}");
             }
         }
+    }
+
+    #[test]
+    fn huffman_nonzero_bitmap_sse2_matches_scalar() {
+        // SSE2 is x86_64 baseline; no runtime gate needed.
+
+        // All-zero.
+        let block = [0i16; 64];
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // All-nonzero.
+        let mut block = [0i16; 64];
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = (i as i16) - 32;
+            if *v == 0 {
+                *v = 1;
+            }
+        }
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // Sparse including 16-lane chunk boundaries.
+        let mut block = [0i16; 64];
+        for k in [0, 1, 7, 8, 15, 16, 31, 32, 47, 48, 62, 63] {
+            block[k] = (k as i16) + 1;
+        }
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // i16 extremes.
+        let mut block = [0i16; 64];
+        block[0] = i16::MIN;
+        block[63] = i16::MAX;
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // LCG panel.
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut block = [0i16; 64];
+        for v in block.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((state >> 55) as i16).wrapping_sub(128);
+        }
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
     }
 }
