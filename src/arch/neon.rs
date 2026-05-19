@@ -628,23 +628,58 @@ pub mod quant {
 }
 
 // ===========================================================================
-// huffman: AC zero-scan over 8 contiguous coefficients
+// huffman: 64-bit nonzero bitmap for AC scan
 // ===========================================================================
 pub mod huffman {
-    use core::arch::aarch64::{vabsq_s16, vld1q_s16, vmaxvq_u16, vreinterpretq_u16_s16};
+    use core::arch::aarch64::*;
 
-    /// True iff `block[k..k+8]` is all zero. Loads 8 i16 lanes, takes
-    /// `vmaxvq_u16(abs)`, returns `max == 0`.
-    #[inline(always)]
-    pub fn group_of_8_is_zero(block: &[i16; 64], k: usize) -> bool {
-        debug_assert!(k + 8 <= 64);
-        // SAFETY: k + 8 <= 64; NEON intrinsics are unconditionally
-        // available on aarch64.
+    /// Bit `k` is set iff `block[k] != 0`. Builds the bitmap 16 lanes
+    /// per iteration: `vceqzq_s16` produces 16-bit all-ones / all-zeros
+    /// masks per lane, `vmovn_u16` truncates to 8-bit lanes, AND with a
+    /// per-lane bit selector packs each lane into a distinct bit, and a
+    /// pair of `vaddv_u8` sum-reductions extracts the 16-bit bitmap byte
+    /// pair for that chunk.
+    ///
+    /// AArch64 has no direct `PMOVMSKB` equivalent; the `vaddv` reduction
+    /// is the standard substitute. Four iterations cover the full 64
+    /// coefficients.
+    pub fn nonzero_bitmap(block: &[i16; 64]) -> u64 {
+        unsafe { nonzero_bitmap_inner(block) }
+    }
+
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. `block` is a fixed-size
+    /// reference; no caller-side invariants beyond the standard
+    /// reference rules.
+    #[target_feature(enable = "neon")]
+    unsafe fn nonzero_bitmap_inner(block: &[i16; 64]) -> u64 {
         unsafe {
-            let v = vld1q_s16(block.as_ptr().add(k));
-            let abs = vabsq_s16(v);
-            let max = vmaxvq_u16(vreinterpretq_u16_s16(abs));
-            max == 0
+            const BIT_SELECT: [u8; 16] =
+                [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let bit_select = vld1q_u8(BIT_SELECT.as_ptr());
+            let mut bm: u64 = 0;
+            for chunk in 0..4 {
+                let p = block.as_ptr().add(chunk * 16);
+                let v0 = vld1q_s16(p);
+                let v1 = vld1q_s16(p.add(8));
+                // 0xFFFF if zero, 0x0000 if nonzero — invert for "nonzero".
+                let nz0 = vmvnq_u16(vceqzq_s16(v0));
+                let nz1 = vmvnq_u16(vceqzq_s16(v1));
+                // Narrow each 16-bit lane to 8-bit (low byte). For
+                // all-ones / all-zeros input this preserves the mask.
+                let nz = vcombine_u8(vmovn_u16(nz0), vmovn_u16(nz1));
+                // AND with `{1, 2, 4, ..., 128}` per 8-lane half ⇒ each
+                // surviving byte holds a single distinct bit.
+                let masked = vandq_u8(nz, bit_select);
+                // Sum-reduce per half: yields the 8-bit bitmap byte for
+                // that half (since all bits are at distinct positions
+                // within a u8, sum == bitwise-OR).
+                let lo = vaddv_u8(vget_low_u8(masked));
+                let hi = vaddv_u8(vget_high_u8(masked));
+                let chunk_bits = (lo as u16) | ((hi as u16) << 8);
+                bm |= (chunk_bits as u64) << (chunk * 16);
+            }
+            bm
         }
     }
 }
@@ -799,26 +834,60 @@ mod tests {
     }
 
     #[test]
-    fn huffman_zero_scan_matches_scalar() {
+    fn huffman_nonzero_bitmap_matches_scalar() {
+        // All-zero.
+        let block = [0i16; 64];
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // All-nonzero.
         let mut block = [0i16; 64];
-        // All-zero panel.
-        for k in (0..64).step_by(8) {
-            assert_eq!(
-                scalar::huffman::group_of_8_is_zero(&block, k),
-                huffman::group_of_8_is_zero(&block, k),
-                "all-zero k={k}"
-            );
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = (i as i16) - 32;
+            if *v == 0 {
+                *v = 1;
+            }
         }
-        // Sparse non-zeros at various positions.
-        block[1] = 7;
-        block[15] = -3;
-        block[33] = 1;
-        for k in (0..=56).step_by(1) {
-            assert_eq!(
-                scalar::huffman::group_of_8_is_zero(&block, k),
-                huffman::group_of_8_is_zero(&block, k),
-                "sparse k={k}"
-            );
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // Sparse, including boundaries (k=0 DC, k=63 last AC, k=15/16
+        // straddling the 16-lane chunk boundary).
+        let mut block = [0i16; 64];
+        for k in [0, 1, 7, 8, 15, 16, 31, 32, 47, 48, 62, 63] {
+            block[k] = (k as i16) + 1;
         }
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // Extreme magnitudes (i16::MIN must register as nonzero too).
+        let mut block = [0i16; 64];
+        block[0] = i16::MIN;
+        block[63] = i16::MAX;
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
+
+        // Deterministic LCG panel.
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut block = [0i16; 64];
+        for v in block.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Allow zeros so the bitmap has varied bits.
+            *v = ((state >> 55) as i16).wrapping_sub(128);
+        }
+        assert_eq!(
+            scalar::huffman::nonzero_bitmap(&block),
+            huffman::nonzero_bitmap(&block),
+        );
     }
 }
