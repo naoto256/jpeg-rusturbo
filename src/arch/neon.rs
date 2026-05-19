@@ -44,7 +44,7 @@ pub mod color {
             if n == 16 {
                 rgb_row_16_inner(
                     pixels.as_ptr(),
-                    layout.bpp,
+                    layout,
                     y.as_mut_ptr(),
                     cb.as_mut_ptr(),
                     cr.as_mut_ptr(),
@@ -52,7 +52,7 @@ pub mod color {
             } else {
                 rgb_row_8_inner(
                     pixels.as_ptr(),
-                    layout.bpp,
+                    layout,
                     y.as_mut_ptr(),
                     cb.as_mut_ptr(),
                     cr.as_mut_ptr(),
@@ -110,14 +110,14 @@ pub mod color {
     }
 
     /// # Safety
-    /// - `inptr` must be readable for at least `16 * bpp` bytes.
+    /// - `inptr` must be readable for at least `16 * layout.bpp` bytes.
     /// - `outy`, `outcb`, `outcr` must each be writable for at least 16 bytes.
-    /// - `bpp` must be 3 or 4.
+    /// - `layout.bpp` must be 3 or 4.
     /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
     unsafe fn rgb_row_16_inner(
         inptr: *const u8,
-        bpp: usize,
+        layout: PixelLayout,
         outy: *mut u8,
         outcb: *mut u8,
         outcr: *mut u8,
@@ -125,12 +125,18 @@ pub mod color {
         unsafe {
             let consts = vld1q_u16(CONSTS.as_ptr());
             let bias = vdupq_n_u32(CHROMA_BIAS);
-            let (r, g, b) = if bpp == 4 {
+            // Deinterleave by channel and pick R/G/B by layout offset.
+            // `vld3q_u8` / `vld4q_u8` already produce channel-planar
+            // vectors; the offset within a pixel byte tuple equals the
+            // channel index in the deinterleaved result.
+            let (r, g, b) = if layout.bpp == 4 {
                 let p = vld4q_u8(inptr);
-                (p.0, p.1, p.2)
+                let ch = [p.0, p.1, p.2, p.3];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
             } else {
                 let p = vld3q_u8(inptr);
-                (p.0, p.1, p.2)
+                let ch = [p.0, p.1, p.2];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
             };
             let r_l = vmovl_u8(vget_low_u8(r));
             let g_l = vmovl_u8(vget_low_u8(g));
@@ -147,14 +153,14 @@ pub mod color {
     }
 
     /// # Safety
-    /// - `inptr` must be readable for at least `8 * bpp` bytes.
+    /// - `inptr` must be readable for at least `8 * layout.bpp` bytes.
     /// - `outy`, `outcb`, `outcr` must each be writable for at least 8 bytes.
-    /// - `bpp` must be 3 or 4.
+    /// - `layout.bpp` must be 3 or 4.
     /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
     unsafe fn rgb_row_8_inner(
         inptr: *const u8,
-        bpp: usize,
+        layout: PixelLayout,
         outy: *mut u8,
         outcb: *mut u8,
         outcr: *mut u8,
@@ -162,12 +168,14 @@ pub mod color {
         unsafe {
             let consts = vld1q_u16(CONSTS.as_ptr());
             let bias = vdupq_n_u32(CHROMA_BIAS);
-            let (r, g, b) = if bpp == 4 {
+            let (r, g, b) = if layout.bpp == 4 {
                 let p = vld4_u8(inptr);
-                (p.0, p.1, p.2)
+                let ch = [p.0, p.1, p.2, p.3];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
             } else {
                 let p = vld3_u8(inptr);
-                (p.0, p.1, p.2)
+                let ch = [p.0, p.1, p.2];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
             };
             let r = vmovl_u8(r);
             let g = vmovl_u8(g);

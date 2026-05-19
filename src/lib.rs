@@ -95,7 +95,7 @@ mod tables;
 
 use std::io::{self, Write};
 
-use crate::color::{PixelLayout, RGB, RGBA};
+use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, PixelLayout, RGB, RGBA, RGBX};
 use crate::huffman::{BitWriter, HuffmanTable, encode_block};
 use crate::quant::Divisors;
 use crate::tables::{
@@ -129,6 +129,46 @@ pub enum ChromaSubsampling {
     /// 1.5× smaller than 4:4:4 at the same quality knob, with no
     /// visible loss on natural-scene photographs.
     Yuv420,
+}
+
+/// Source pixel format for the generic [`JpegEncoder::encode`] entry
+/// point.
+///
+/// JPEG stores Y/Cb/Cr internally, so the alpha or pad byte in 4-byte
+/// formats is read and then discarded by the encoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 3 bytes per pixel, in order (R, G, B).
+    Rgb,
+    /// 3 bytes per pixel, in order (B, G, R).
+    Bgr,
+    /// 4 bytes per pixel, in order (R, G, B, A). Alpha dropped.
+    Rgba,
+    /// 4 bytes per pixel, in order (B, G, R, A). Alpha dropped.
+    Bgra,
+    /// 4 bytes per pixel, in order (A, R, G, B). Alpha dropped.
+    Argb,
+    /// 4 bytes per pixel, in order (A, B, G, R). Alpha dropped.
+    Abgr,
+    /// 4 bytes per pixel, in order (R, G, B, X). Pad byte ignored.
+    Rgbx,
+    /// 4 bytes per pixel, in order (B, G, R, X). Pad byte ignored.
+    Bgrx,
+}
+
+impl From<PixelFormat> for PixelLayout {
+    fn from(f: PixelFormat) -> Self {
+        match f {
+            PixelFormat::Rgb => RGB,
+            PixelFormat::Bgr => BGR,
+            PixelFormat::Rgba => RGBA,
+            PixelFormat::Bgra => BGRA,
+            PixelFormat::Argb => ARGB,
+            PixelFormat::Abgr => ABGR,
+            PixelFormat::Rgbx => RGBX,
+            PixelFormat::Bgrx => BGRX,
+        }
+    }
 }
 
 /// JPEG encoder over an arbitrary [`Write`] sink.
@@ -218,6 +258,23 @@ impl<W: Write> JpegEncoder<W> {
     /// requirement `width * height * 4`.
     pub fn encode_rgba(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
         self.encode_inner(pixels, width, height, RGBA)
+    }
+
+    /// Encode an arbitrary [`PixelFormat`] pixel buffer. Generic entry
+    /// point covering all eight supported byte layouts (RGB / BGR /
+    /// RGBA / BGRA / ARGB / ABGR / RGBX / BGRX).
+    ///
+    /// # Errors
+    /// Same shape as [`encode_rgb`](Self::encode_rgb) / [`encode_rgba`](Self::encode_rgba),
+    /// scaled by `format`'s bytes-per-pixel.
+    pub fn encode(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> io::Result<()> {
+        self.encode_inner(pixels, width, height, format.into())
     }
 
     fn encode_inner(
