@@ -1,4 +1,4 @@
-//! JPEG decoder — baseline (and, on the 0.3.0 roadmap, progressive)
+//! JPEG decoder — baseline (and, on the 0.4.0 roadmap, progressive)
 //! Huffman scans translated from libjpeg-turbo, sharing the
 //! `arch::backend` SIMD kernels with the encoder where they overlap.
 //!
@@ -48,7 +48,7 @@ impl<'a> Decoder<'a> {
         let (headers, first_scan) = reader.read_to_scan()?;
         let entropy_start = reader.pos();
         if headers.frame.progressive {
-            return Err(DecodeError::Unsupported("progressive JPEG (0.3.0 roadmap)"));
+            return Err(DecodeError::Unsupported("progressive JPEG (0.4.0 roadmap)"));
         }
         Ok(Self {
             src,

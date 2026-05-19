@@ -37,7 +37,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    #[allow(dead_code)] // used by progressive scan path (on the 0.3.0 roadmap)
+    #[allow(dead_code)] // used by progressive scan path (on the 0.4.0 roadmap)
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -122,7 +122,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read 1 bit. Used by progressive AC refine and 1-bit refinement.
-    #[allow(dead_code)] // used by progressive scan path (on the 0.3.0 roadmap)
+    #[allow(dead_code)] // used by progressive scan path (on the 0.4.0 roadmap)
     pub fn get_bit(&mut self) -> Result<u32> {
         self.get_bits(1)
     }
