@@ -7,7 +7,7 @@
 //! become a separate goal once we match its coefficient precision).
 
 use image::{ImageFormat, ImageReader};
-use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat};
 use std::io::Cursor;
 
 /// Build a smoothly-varying RGB image. Smooth content compresses well
@@ -160,6 +160,141 @@ fn rgba_input_matches_rgb_input() {
         jpeg_a, jpeg_b,
         "RGB and RGBA at the same quality should match"
     );
+}
+
+/// Rearrange RGB bytes into the requested `PixelFormat`. For 4-byte
+/// formats, the alpha/pad byte is filled with 0xAA so it's clearly
+/// non-zero (a buggy encoder that read it as a color channel would
+/// produce visibly wrong colors).
+fn rgb_to_format(rgb: &[u8], format: PixelFormat) -> Vec<u8> {
+    let pixels = rgb.len() / 3;
+    let bpp = match format {
+        PixelFormat::Rgb | PixelFormat::Bgr => 3,
+        _ => 4,
+    };
+    let mut out = vec![0u8; pixels * bpp];
+    for i in 0..pixels {
+        let r = rgb[i * 3];
+        let g = rgb[i * 3 + 1];
+        let b = rgb[i * 3 + 2];
+        let p = i * bpp;
+        match format {
+            PixelFormat::Rgb => {
+                out[p] = r;
+                out[p + 1] = g;
+                out[p + 2] = b;
+            }
+            PixelFormat::Bgr => {
+                out[p] = b;
+                out[p + 1] = g;
+                out[p + 2] = r;
+            }
+            PixelFormat::Rgba => {
+                out[p] = r;
+                out[p + 1] = g;
+                out[p + 2] = b;
+                out[p + 3] = 0xAA;
+            }
+            PixelFormat::Bgra => {
+                out[p] = b;
+                out[p + 1] = g;
+                out[p + 2] = r;
+                out[p + 3] = 0xAA;
+            }
+            PixelFormat::Argb => {
+                out[p] = 0xAA;
+                out[p + 1] = r;
+                out[p + 2] = g;
+                out[p + 3] = b;
+            }
+            PixelFormat::Abgr => {
+                out[p] = 0xAA;
+                out[p + 1] = b;
+                out[p + 2] = g;
+                out[p + 3] = r;
+            }
+            PixelFormat::Rgbx => {
+                out[p] = r;
+                out[p + 1] = g;
+                out[p + 2] = b;
+                out[p + 3] = 0xAA;
+            }
+            PixelFormat::Bgrx => {
+                out[p] = b;
+                out[p + 1] = g;
+                out[p + 2] = r;
+                out[p + 3] = 0xAA;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn all_pixel_formats_match_rgb_bytes() {
+    // Same content rendered through each PixelFormat must produce a
+    // byte-identical JPEG stream (the encoder converts to YCbCr from
+    // the same R/G/B values regardless of byte ordering).
+    let w = 64u32;
+    let h = 32u32;
+    let rgb = gradient_rgb(w, h);
+
+    let mut baseline = Vec::new();
+    JpegEncoder::new_with_quality(&mut baseline, 80)
+        .encode(&rgb, w, h, PixelFormat::Rgb)
+        .unwrap();
+
+    for fmt in [
+        PixelFormat::Rgb,
+        PixelFormat::Bgr,
+        PixelFormat::Rgba,
+        PixelFormat::Bgra,
+        PixelFormat::Argb,
+        PixelFormat::Abgr,
+        PixelFormat::Rgbx,
+        PixelFormat::Bgrx,
+    ] {
+        let buf = rgb_to_format(&rgb, fmt);
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut out, 80)
+            .encode(&buf, w, h, fmt)
+            .unwrap();
+        assert_eq!(
+            out, baseline,
+            "{fmt:?} produced different bytes than RGB baseline",
+        );
+    }
+}
+
+#[test]
+fn all_pixel_formats_roundtrip_1080p() {
+    let w = 1920u32;
+    let h = 1080u32;
+    let rgb = gradient_rgb(w, h);
+
+    for fmt in [
+        PixelFormat::Bgr,
+        PixelFormat::Bgra,
+        PixelFormat::Argb,
+        PixelFormat::Abgr,
+        PixelFormat::Rgbx,
+        PixelFormat::Bgrx,
+    ] {
+        let buf = rgb_to_format(&rgb, fmt);
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 80)
+            .encode(&buf, w, h, fmt)
+            .unwrap();
+        let img = ImageReader::with_format(Cursor::new(&jpeg), ImageFormat::Jpeg)
+            .decode()
+            .unwrap()
+            .to_rgb8();
+        let psnr = psnr_rgb(&rgb, img.as_raw());
+        assert!(
+            psnr >= 32.0,
+            "{fmt:?} PSNR {psnr:.2} dB below floor (1080p q=80)",
+        );
+    }
 }
 
 // Constant-color image: every pixel of every block decodes to (very

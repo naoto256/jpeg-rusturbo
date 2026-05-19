@@ -111,9 +111,9 @@ pub mod color {
 
     /// Per-row RGB(A) → YCbCr converter.
     ///
-    /// AVX2 fast path: `n == 16 && layout.bpp == 4` (the typical 4:2:0
-    /// hot path). All other widths and RGB-bpp inputs fall through to
-    /// the scalar reference.
+    /// AVX2 fast path: `n == 16 && layout.bpp == 4` (any of RGBA / BGRA
+    /// / ARGB / ABGR / RGBX / BGRX). All other widths and 3-byte input
+    /// layouts fall through to the scalar reference.
     pub fn rgb_row_to_ycc(
         pixels: &[u8],
         layout: PixelLayout,
@@ -129,6 +129,7 @@ pub mod color {
             unsafe {
                 rgba16_avx2(
                     pixels.as_ptr(),
+                    layout,
                     y.as_mut_ptr(),
                     cb.as_mut_ptr(),
                     cr.as_mut_ptr(),
@@ -246,8 +247,11 @@ pub mod color {
         }
     }
 
-    /// Deinterleave 16 RGBA pixels (= 64 bytes from `pixels`) into three
-    /// `__m256i` registers carrying 16 u16 lanes of R, G, B respectively.
+    /// Deinterleave 16 4-byte pixels into three `__m256i` registers
+    /// carrying 16 u16 lanes of R, G, B respectively. The R/G/B byte
+    /// positions within each pixel come from `layout`, so the same
+    /// kernel covers every bpp=4 ordering (RGBA / BGRA / ARGB / ABGR /
+    /// RGBX / BGRX).
     ///
     /// Approach: vpshufb each input ymm to gather R/G/B/A bytes into
     /// 4-byte groups within each 128-bit lane, then vpermd across both
@@ -259,12 +263,25 @@ pub mod color {
     /// `#[target_feature(enable = "avx2")]` function. Inputs are
     /// by-value vector lanes; no memory access.
     #[inline(always)]
-    unsafe fn deinterleave_rgba16(p0: __m256i, p1: __m256i) -> (__m256i, __m256i, __m256i) {
+    unsafe fn deinterleave_pixels16(
+        p0: __m256i,
+        p1: __m256i,
+        layout: PixelLayout,
+    ) -> (__m256i, __m256i, __m256i) {
         unsafe {
-            // mask: per 128-bit lane, place RRRRGGGGBBBBAAAA at byte 0..15.
+            // R/G/B/A offsets sum to 0+1+2+3 = 6 for any bpp=4 layout;
+            // the leftover slot is the alpha/pad byte we want to drop.
+            let r = layout.r_off as i8;
+            let g = layout.g_off as i8;
+            let b = layout.b_off as i8;
+            let a = 6 - r - g - b; // 0..=3, the alpha/pad slot.
+            // Per 128-bit lane, place RRRRGGGGBBBBAAAA at bytes 0..15 by
+            // gathering source bytes at offsets {r, g, b, a} stepped by 4
+            // (one per pixel within the 4-pixel-per-half-lane chunk).
             let shuf = _mm256_setr_epi8(
-                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2,
-                6, 10, 14, 3, 7, 11, 15,
+                r, r + 4, r + 8, r + 12, g, g + 4, g + 8, g + 12, b, b + 4, b + 8, b + 12, a,
+                a + 4, a + 8, a + 12, r, r + 4, r + 8, r + 12, g, g + 4, g + 8, g + 12, b, b + 4,
+                b + 8, b + 12, a, a + 4, a + 8, a + 12,
             );
             // After vpshufb (per-lane):
             //   s0 lo lane = [R0..3 G0..3 B0..3 A0..3]
@@ -360,17 +377,24 @@ pub mod color {
     /// # Safety
     /// - AVX2 must be available (the runtime gate in `rgb_row_to_ycc`
     ///   checks; `target_feature` enforces the compile-time half).
-    /// - `pixels` must be readable for at least 64 bytes (16 RGBA pixels).
+    /// - `pixels` must be readable for at least 64 bytes (16 4-byte pixels).
     /// - `y`, `cb`, `cr` must each be writable for at least 16 bytes.
+    /// - `layout.bpp` must be 4.
     #[target_feature(enable = "avx2")]
-    unsafe fn rgba16_avx2(pixels: *const u8, y: *mut u8, cb: *mut u8, cr: *mut u8) {
+    unsafe fn rgba16_avx2(
+        pixels: *const u8,
+        layout: PixelLayout,
+        y: *mut u8,
+        cb: *mut u8,
+        cr: *mut u8,
+    ) {
         unsafe {
-            // Load 64 bytes = 16 RGBA pixels into 2 ymm.
+            // Load 64 bytes = 16 4-byte pixels into 2 ymm.
             let p_in = pixels as *const __m256i;
             let p0 = _mm256_loadu_si256(p_in);
             let p1 = _mm256_loadu_si256(p_in.add(1));
 
-            let (r_u16, g_u16, b_u16) = deinterleave_rgba16(p0, p1);
+            let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
 
             // Build interleaved-pair ymm registers used by every component.
             let rg_lo = _mm256_unpacklo_epi16(r_u16, g_u16);
