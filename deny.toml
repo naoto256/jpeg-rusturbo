@@ -1,0 +1,34 @@
+# Supply-chain policy for `cargo deny check`.
+# License inventory of the current dependency graph (verified via
+# `cargo metadata` 2026-05-20): every crate publishes an `OR`
+# expression that contains at least one of `Apache-2.0` or `MIT`, so
+# this two-entry allowlist covers the whole tree. Crates that also
+# allow BSD-3-Clause / Unlicense / Zlib in their `OR` clauses
+# resolve to one of the allowed picks; we keep the allowlist minimal
+# so a future dependency change introducing a genuinely new license
+# fails loudly and gets a deliberate review.
+
+[graph]
+all-features = true
+
+[advisories]
+# Advisories are surfaced separately by cargo-audit; we let cargo-deny
+# evaluate them too so any rule mismatch shows up in both reports.
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+]
+
+[bans]
+# Duplicate-version detection — warn rather than deny so transitive
+# version drift doesn't gate releases, but we still get visibility.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
