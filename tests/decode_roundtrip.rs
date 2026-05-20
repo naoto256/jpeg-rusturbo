@@ -5,7 +5,7 @@
 //! encode→ours-decode → input direction so both halves of the
 //! pipeline are independently anchored.
 
-use jpeg_rusturbo::decode::Decoder;
+use jpeg_rusturbo::decode::{DecodeError, Decoder};
 use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat};
 
 fn gradient_rgb(w: u32, h: u32) -> Vec<u8> {
@@ -147,6 +147,112 @@ fn self_roundtrip_matches_image_crate_pixels() {
         psnr >= 40.0,
         "PSNR vs image's decoder too low: {psnr:.2} dB"
     );
+}
+
+/// Locate `0xFF 0xC0` (SOF0) by walking length-prefixed segments
+/// starting after SOI. Returns the byte offset of `0xFF`.
+fn find_sof0_offset(jpeg: &[u8]) -> Option<usize> {
+    let mut i = 2usize; // skip SOI (0xFF D8)
+    while i + 1 < jpeg.len() {
+        if jpeg[i] != 0xFF {
+            return None;
+        }
+        let id = jpeg[i + 1];
+        if id == 0xC0 {
+            return Some(i);
+        }
+        // All other segments here are length-prefixed (we're between
+        // SOI and SOF0, no standalone markers in that range).
+        if i + 3 >= jpeg.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        i += 2 + len;
+    }
+    None
+}
+
+/// Patch a JPEG's SOF0 height/width fields in-place. Layout of SOF0
+/// payload (after the 2-byte marker + 2-byte length): precision(1) +
+/// height(2) + width(2) + Nf(1) + per-component(3 × Nf).
+fn patch_sof_dims(jpeg: &mut [u8], width: u16, height: u16) {
+    let sof_off = find_sof0_offset(jpeg).expect("SOF0 marker not found");
+    let height_bytes = height.to_be_bytes();
+    let width_bytes = width.to_be_bytes();
+    // 0xFF C0 | len(2) | precision(1) | height(2) | width(2) | …
+    jpeg[sof_off + 5] = height_bytes[0];
+    jpeg[sof_off + 6] = height_bytes[1];
+    jpeg[sof_off + 7] = width_bytes[0];
+    jpeg[sof_off + 8] = width_bytes[1];
+}
+
+fn encode_minimal_jpeg() -> Vec<u8> {
+    let w = 16u32;
+    let h = 16u32;
+    let rgb = gradient_rgb(w, h);
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .encode_rgb(&rgb, w, h)
+        .unwrap();
+    jpeg
+}
+
+#[test]
+fn decode_rejects_zero_height() {
+    let mut jpeg = encode_minimal_jpeg();
+    patch_sof_dims(&mut jpeg, 16, 0);
+    let Err(err) = Decoder::new(&jpeg) else {
+        panic!("zero height should be rejected");
+    };
+    assert!(
+        matches!(err, DecodeError::InvalidDimensions(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn decode_rejects_zero_width() {
+    let mut jpeg = encode_minimal_jpeg();
+    patch_sof_dims(&mut jpeg, 0, 16);
+    let Err(err) = Decoder::new(&jpeg) else {
+        panic!("zero width should be rejected");
+    };
+    assert!(
+        matches!(err, DecodeError::InvalidDimensions(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn decode_rejects_oversized_dimensions() {
+    // 32768 > MAX_DIMENSION (16384) — caps the per-component plane
+    // allocation at a sane ceiling so a 50-byte malformed header
+    // can't demand multi-gigabyte allocations.
+    let mut jpeg = encode_minimal_jpeg();
+    patch_sof_dims(&mut jpeg, 32768, 32768);
+    let Err(err) = Decoder::new(&jpeg) else {
+        panic!("oversized dims should be rejected");
+    };
+    assert!(
+        matches!(err, DecodeError::InvalidDimensions(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn decode_accepts_max_supported_dimension() {
+    // 16384 is the cap — equal-or-under should pass header parse.
+    // (We don't actually decode a 16k×16k image in this test — too
+    // slow; the encoder produces a 16x16 JPEG and we patch the
+    // declared dims so Decoder::new sees 16384×16384 but the entropy
+    // data is for a 16x16 image. `Decoder::new` only validates the
+    // header, so it should succeed here even though `.decode()`
+    // would later fail on the truncated stream.)
+    let mut jpeg = encode_minimal_jpeg();
+    patch_sof_dims(&mut jpeg, 16384, 16384);
+    if Decoder::new(&jpeg).is_err() {
+        panic!("16384 is at the cap; header parse should succeed");
+    }
 }
 
 #[test]
