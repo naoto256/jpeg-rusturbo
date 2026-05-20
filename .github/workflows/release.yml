@@ -13,12 +13,12 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # pin-audit:2026-05-20 34e1148 | v4.3.1
         with:
           fetch-depth: 0  # so release notes can reference earlier history
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # pin-audit:2026-05-20 3bb1273 | v2.6.2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
