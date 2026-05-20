@@ -274,6 +274,21 @@ impl<'a> MarkerReader<'a> {
         }
         let height = self.read_u16()?;
         let width = self.read_u16()?;
+        // Reject zero dimensions and oversized images. JPEG's wire format
+        // allows up to 65535x65535, but blindly accepting that lets a
+        // 50-byte malformed header demand multi-GB allocations downstream
+        // (each component plane is `stride * padded_height` u8). The cap
+        // here matches what mainstream Rust JPEG decoders enforce
+        // (`image` / `jpeg-decoder` both gate around 16k).
+        if width == 0 || height == 0 {
+            return Err(DecodeError::InvalidDimensions("zero dimension"));
+        }
+        const MAX_DIMENSION: u16 = 16384;
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(DecodeError::InvalidDimensions(
+                "image dimension exceeds 16384 (raise the cap explicitly to opt in)",
+            ));
+        }
         let nf = self.read_u8()? as usize;
         if len != 8 + 3 * nf {
             return Err(DecodeError::Malformed("SOF length / Nf mismatch"));
