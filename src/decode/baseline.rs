@@ -213,33 +213,27 @@ fn decode_block_baseline(
 }
 
 fn handle_restart(br: &mut BitReader, prev_dc: &mut [i32; 4], expected: &mut u8) -> Result<()> {
-    // Drop pending bits and look for the RSTn marker.
+    // Drop pending bits — RSTn realigns the entropy stream on a byte
+    // boundary (T.81 F.1.5).
     br.reset_bit_buffer();
-    // The reader has likely already absorbed the marker via fill();
-    // surface it now.
-    // First, make sure marker was actually consumed — force a fill on
-    // 8 bits to drain pending zero-padding from the prior block end.
-    // If marker isn't visible yet, the next byte read will see it.
-    if br.marker().is_none() {
-        // Touch the reader with a no-effect read to flush; we expect
-        // the next data byte to be the marker prefix.
-        let _ = br.get_bits(0); // 0-bit read is a no-op
-    }
-    // Spin until we see a marker (the entropy buffer should be aligned
-    // here, so the very next bytes are 0xFF <rst>).
+    // Pull bytes until the reader surfaces a marker. `get_bits(8)`
+    // returns `Err(UnexpectedEof)` if the stream is truncated before a
+    // marker shows up; we **must** propagate that — silently swallowing
+    // the error would let a crafted JPEG (truncated mid-restart) spin
+    // this loop forever (CVE-class DoS).
     while br.marker().is_none() {
-        // Force one byte of fill; if it produces a marker, marker() will pick up.
-        // We try by attempting a 8-bit get which triggers fill internally.
-        let _ = br.get_bits(8);
+        br.get_bits(8)?;
     }
-    let m = br.marker().unwrap();
+    let m = br
+        .marker()
+        .expect("marker is Some — while loop only exits on Some");
     if !(0xD0..=0xD7).contains(&m) {
         return Err(DecodeError::Malformed("expected RSTn between intervals"));
     }
-    let rst_n = m - 0xD0;
-    if rst_n != *expected & 7 {
-        // libjpeg-turbo is lenient here; we accept any RST sequence.
-    }
+    // libjpeg-turbo is lenient about RST sequence — we accept any
+    // `rst_n` rather than failing on `rst_n != *expected & 7`, but the
+    // counter is still advanced so future audit / debug output stays
+    // honest about the expected slot.
     *expected = (*expected + 1) & 7;
     br.clear_marker();
     *prev_dc = [0; 4];
@@ -294,4 +288,53 @@ pub fn index_quant_tables<'a>(qts: &'a [QuantTable]) -> [Option<&'a QuantTable>;
         out[qt.id as usize] = Some(qt);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: previously, `handle_restart` swallowed `Err` from
+    /// `get_bits(8)` with `let _ = …`, which let a truncated JPEG (no
+    /// RST marker arrives) spin the loop forever — a cheap DoS via
+    /// crafted input. The fix propagates the error; this test pins it
+    /// down by handing the function an empty entropy stream and
+    /// asserting it returns within finite time with `UnexpectedEof`.
+    #[test]
+    fn handle_restart_errors_on_truncated_input() {
+        let bytes: &[u8] = &[];
+        let mut br = BitReader::new(bytes, 0);
+        let mut prev_dc = [42i32; 4];
+        let mut expected = 0u8;
+        let err = handle_restart(&mut br, &mut prev_dc, &mut expected).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}",
+        );
+        // The function bailed before reaching the predictor reset.
+        assert_eq!(prev_dc, [42, 42, 42, 42]);
+    }
+
+    #[test]
+    fn handle_restart_consumes_rst_marker_and_resets_predictors() {
+        // RST3 marker (0xFF 0xD3) with no preceding entropy bytes.
+        let bytes: &[u8] = &[0xFF, 0xD3];
+        let mut br = BitReader::new(bytes, 0);
+        let mut prev_dc = [123i32; 4];
+        let mut expected = 3u8;
+        handle_restart(&mut br, &mut prev_dc, &mut expected).expect("RST3 should be accepted");
+        assert_eq!(prev_dc, [0; 4]);
+        assert_eq!(expected, 4);
+    }
+
+    #[test]
+    fn handle_restart_rejects_non_rst_marker() {
+        // 0xFF 0xD9 = EOI, not an RST.
+        let bytes: &[u8] = &[0xFF, 0xD9];
+        let mut br = BitReader::new(bytes, 0);
+        let mut prev_dc = [0i32; 4];
+        let mut expected = 0u8;
+        let err = handle_restart(&mut br, &mut prev_dc, &mut expected).unwrap_err();
+        assert!(matches!(err, DecodeError::Malformed(_)));
+    }
 }
