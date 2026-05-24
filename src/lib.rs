@@ -122,6 +122,8 @@ mod tables;
 
 use std::io::{self, Write};
 
+use rayon::prelude::*;
+
 use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, PixelLayout, RGB, RGBA, RGBX};
 use crate::huffman::{BitWriter, HuffmanTable, encode_block};
 use crate::quant::Divisors;
@@ -233,6 +235,7 @@ pub struct JpegEncoder<W: Write> {
     restart_interval: u16,
     custom_quant: Option<QuantPair>,
     optimize_huffman: bool,
+    threads: u32,
 }
 
 impl<W: Write> JpegEncoder<W> {
@@ -254,7 +257,30 @@ impl<W: Write> JpegEncoder<W> {
             restart_interval: 0,
             custom_quant: None,
             optimize_huffman: false,
+            threads: 1,
         }
+    }
+
+    /// Set the parallelism budget for the DCT + quantize stage.
+    ///
+    /// - `1` (the default): fully serial — uses the same single-thread
+    ///   path as before and the output is byte-for-byte identical to a
+    ///   build that doesn't know about this knob at all.
+    /// - `0`: automatic — uses the ambient rayon thread pool, which by
+    ///   default sizes to the number of logical CPUs.
+    /// - `n > 1`: build a private rayon pool with `n` worker threads
+    ///   for this encode. The pool is constructed once per `encode_*`
+    ///   call and dropped on return, so the caller's global pool (if
+    ///   any) is left undisturbed.
+    ///
+    /// Only the per-MCU pixel-fetch / color-convert / forward-DCT /
+    /// quantize / zigzag work runs in parallel. The Huffman entropy
+    /// emit stays sequential because the DC predictor chain and the
+    /// bit-stream itself are MCU-ordered. The encoded JPEG bytes are
+    /// therefore identical regardless of how many threads run the
+    /// front half.
+    pub fn set_threads(&mut self, n: u32) {
+        self.threads = n;
     }
 
     /// Override the chroma subsampling mode for this encoder. Must be
@@ -494,50 +520,23 @@ impl<W: Write> JpegEncoder<W> {
         // above.
         bw.reserve(needed);
         let restart_interval = self.restart_interval;
-        match self.subsampling {
-            ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                &mut bw,
-                &div_luma,
-                &div_chroma,
-                &dc_luma,
-                &ac_luma,
-                &dc_chroma,
-                &ac_chroma,
-                restart_interval,
-            )?,
-            ChromaSubsampling::Yuv422 => encode_scan::<Yuv422Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                &mut bw,
-                &div_luma,
-                &div_chroma,
-                &dc_luma,
-                &ac_luma,
-                &dc_chroma,
-                &ac_chroma,
-                restart_interval,
-            )?,
-            ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                &mut bw,
-                &div_luma,
-                &div_chroma,
-                &dc_luma,
-                &ac_luma,
-                &dc_chroma,
-                &ac_chroma,
-                restart_interval,
-            )?,
-        }
+        let threads = self.threads;
+        dispatch_scan(
+            threads,
+            self.subsampling,
+            pixels,
+            width,
+            height,
+            layout,
+            &mut bw,
+            &div_luma,
+            &div_chroma,
+            &dc_luma,
+            &ac_luma,
+            &dc_chroma,
+            &ac_chroma,
+            restart_interval,
+        )?;
         bw.flush_to_byte_boundary()?;
 
         // ---- Trailer ----
@@ -610,7 +609,7 @@ fn encode_optimized<S: SamplingScheme, W: Write>(
     let mut cr_blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus);
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
-            S::quantize_one_mcu(
+            S::quantize_one_mcu_per_comp(
                 pixels,
                 width,
                 height,
@@ -781,18 +780,26 @@ trait SamplingScheme {
     /// One MCU's pixel footprint `(width, height)`.
     const MCU_W: u32;
     const MCU_H: u32;
-    /// Y blocks per MCU (= H * V; 4 for 4:2:0, 2 for 4:2:2, 1 for 4:4:4).
-    /// Used by the optimized-Huffman two-pass path to size the per-component
-    /// coefficient buffer.
+    /// Number of 8×8 blocks emitted per MCU: Y blocks followed by one
+    /// Cb and one Cr. 444 = 3, 422 = 4, 420 = 6. Used by the threaded
+    /// scan to size its per-MCU block buffer.
+    const BLOCKS_PER_MCU: usize;
+    /// Of the [`BLOCKS_PER_MCU`] blocks, how many are luma. The rest
+    /// are one Cb followed by one Cr.
+    ///
+    /// Also used by the optimized-Huffman two-pass path to size per-
+    /// component coefficient buffers.
+    ///
+    /// [`BLOCKS_PER_MCU`]: SamplingScheme::BLOCKS_PER_MCU
     const Y_BLOCKS_PER_MCU: usize;
 
-    /// Two-pass companion to [`encode_one_mcu`]: do the extract + DCT + quantize
-    /// half but append the quantized + zig-zagged blocks into per-component
-    /// buffers instead of entropy-coding them. Pass 1 of the optimized-Huffman
-    /// pipeline uses this; pass 2 then walks the buffers and calls
-    /// `encode_block` directly.
+    /// Optimized-Huffman pass-1 companion to [`encode_one_mcu`]: extract +
+    /// DCT + quantize one MCU, appending the resulting zig-zagged blocks
+    /// into per-component growing buffers instead of entropy-coding them.
+    /// Pass 2 of that pipeline then walks the buffers and calls
+    /// `encode_block` directly with the optimal Huffman tables.
     #[allow(clippy::too_many_arguments)]
-    fn quantize_one_mcu(
+    fn quantize_one_mcu_per_comp(
         pixels: &[u8],
         width: u32,
         height: u32,
@@ -823,6 +830,25 @@ trait SamplingScheme {
         dc_chroma: &HuffmanTable,
         ac_chroma: &HuffmanTable,
     ) -> io::Result<()>;
+
+    /// Threaded-path front half: pixel fetch + color convert + forward
+    /// DCT + quantize + zigzag for one MCU. Output is written to
+    /// `out`, which must have length [`BLOCKS_PER_MCU`] — first the
+    /// luma blocks, then Cb, then Cr, each already in zig-zag order.
+    ///
+    /// [`BLOCKS_PER_MCU`]: SamplingScheme::BLOCKS_PER_MCU
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    );
 }
 
 struct Yuv444Scheme;
@@ -830,9 +856,10 @@ impl SamplingScheme for Yuv444Scheme {
     const H_V: (u8, u8) = (1, 1);
     const MCU_W: u32 = 8;
     const MCU_H: u32 = 8;
+    const BLOCKS_PER_MCU: usize = 3;
     const Y_BLOCKS_PER_MCU: usize = 1;
 
-    fn quantize_one_mcu(
+    fn quantize_one_mcu_per_comp(
         pixels: &[u8],
         width: u32,
         height: u32,
@@ -916,6 +943,36 @@ impl SamplingScheme for Yuv444Scheme {
         )?;
         Ok(())
     }
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        let mut y_blk = [0i16; 64];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_block_ycbcr(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blk,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        out[0] = quantize_block(&mut y_blk, div_luma);
+        out[1] = quantize_block(&mut cb_blk, div_chroma);
+        out[2] = quantize_block(&mut cr_blk, div_chroma);
+    }
 }
 
 struct Yuv420Scheme;
@@ -923,9 +980,10 @@ impl SamplingScheme for Yuv420Scheme {
     const H_V: (u8, u8) = (2, 2);
     const MCU_W: u32 = 16;
     const MCU_H: u32 = 16;
+    const BLOCKS_PER_MCU: usize = 6;
     const Y_BLOCKS_PER_MCU: usize = 4;
 
-    fn quantize_one_mcu(
+    fn quantize_one_mcu_per_comp(
         pixels: &[u8],
         width: u32,
         height: u32,
@@ -1013,6 +1071,38 @@ impl SamplingScheme for Yuv420Scheme {
         )?;
         Ok(())
     }
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        let mut y_blocks = [[0i16; 64]; 4];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_mcu_420(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        for (i, blk) in y_blocks.iter_mut().enumerate() {
+            out[i] = quantize_block(blk, div_luma);
+        }
+        out[4] = quantize_block(&mut cb_blk, div_chroma);
+        out[5] = quantize_block(&mut cr_blk, div_chroma);
+    }
 }
 
 struct Yuv422Scheme;
@@ -1020,9 +1110,10 @@ impl SamplingScheme for Yuv422Scheme {
     const H_V: (u8, u8) = (2, 1);
     const MCU_W: u32 = 16;
     const MCU_H: u32 = 8;
+    const BLOCKS_PER_MCU: usize = 4;
     const Y_BLOCKS_PER_MCU: usize = 2;
 
-    fn quantize_one_mcu(
+    fn quantize_one_mcu_per_comp(
         pixels: &[u8],
         width: u32,
         height: u32,
@@ -1110,6 +1201,194 @@ impl SamplingScheme for Yuv422Scheme {
         )?;
         Ok(())
     }
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        let mut y_blocks = [[0i16; 64]; 2];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_mcu_422(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        for (i, blk) in y_blocks.iter_mut().enumerate() {
+            out[i] = quantize_block(blk, div_luma);
+        }
+        out[2] = quantize_block(&mut cb_blk, div_chroma);
+        out[3] = quantize_block(&mut cr_blk, div_chroma);
+    }
+}
+
+/// Pick the serial vs threaded path based on the `threads` knob, then
+/// monomorphize the scheme. `threads == 1` keeps the original
+/// single-thread call (= byte-exact regression-safe). `threads == 0`
+/// runs the threaded path on the ambient rayon pool. `threads > 1`
+/// builds a private pool sized to exactly that many workers, runs the
+/// scan inside `install`, and drops the pool on return so callers'
+/// global pools are left untouched.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_scan<W: Write>(
+    threads: u32,
+    subsampling: ChromaSubsampling,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    bw: &mut BitWriter<W>,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+    restart_interval: u16,
+) -> io::Result<()> {
+    if threads == 1 {
+        return match subsampling {
+            ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
+                pixels,
+                width,
+                height,
+                layout,
+                bw,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+                restart_interval,
+            ),
+            ChromaSubsampling::Yuv422 => encode_scan::<Yuv422Scheme, _>(
+                pixels,
+                width,
+                height,
+                layout,
+                bw,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+                restart_interval,
+            ),
+            ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
+                pixels,
+                width,
+                height,
+                layout,
+                bw,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+                restart_interval,
+            ),
+        };
+    }
+
+    // Front half on the chosen pool, back half always on the caller's
+    // thread. This keeps the parallel work pool-scoped without forcing
+    // `W: Send` on the bit writer.
+    let mcus_x;
+    let rows = match subsampling {
+        ChromaSubsampling::Yuv444 => {
+            mcus_x = width.div_ceil(Yuv444Scheme::MCU_W);
+            run_on_pool(threads, || {
+                parallel_quantize_rows::<Yuv444Scheme>(
+                    pixels, width, height, layout, div_luma, div_chroma,
+                )
+            })?
+        }
+        ChromaSubsampling::Yuv422 => {
+            mcus_x = width.div_ceil(Yuv422Scheme::MCU_W);
+            run_on_pool(threads, || {
+                parallel_quantize_rows::<Yuv422Scheme>(
+                    pixels, width, height, layout, div_luma, div_chroma,
+                )
+            })?
+        }
+        ChromaSubsampling::Yuv420 => {
+            mcus_x = width.div_ceil(Yuv420Scheme::MCU_W);
+            run_on_pool(threads, || {
+                parallel_quantize_rows::<Yuv420Scheme>(
+                    pixels, width, height, layout, div_luma, div_chroma,
+                )
+            })?
+        }
+    };
+
+    match subsampling {
+        ChromaSubsampling::Yuv444 => serial_emit_rows::<Yuv444Scheme, _>(
+            &rows,
+            mcus_x,
+            bw,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        ),
+        ChromaSubsampling::Yuv422 => serial_emit_rows::<Yuv422Scheme, _>(
+            &rows,
+            mcus_x,
+            bw,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        ),
+        ChromaSubsampling::Yuv420 => serial_emit_rows::<Yuv420Scheme, _>(
+            &rows,
+            mcus_x,
+            bw,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        ),
+    }
+}
+
+/// Run `f` on the ambient rayon pool (`threads == 0`) or on a freshly
+/// constructed local pool of `threads` workers (`threads > 1`). The
+/// local pool is dropped on return so the caller's global pool is left
+/// undisturbed.
+fn run_on_pool<F, R>(threads: u32, f: F) -> io::Result<R>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    if threads == 0 {
+        Ok(f())
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads as usize)
+            .build()
+            .map_err(io::Error::other)?;
+        Ok(pool.install(f))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1182,6 +1461,97 @@ fn encode_one_block<W: Write>(
     arch::backend::dct::fdct_islow(block);
     let zz = quant::quantize_and_zigzag(block, div);
     encode_block(bw, &zz, prev_dc, dc_tab, ac_tab)
+}
+
+/// Forward DCT + quantize + zigzag, returning the zig-zag-ordered
+/// coefficient block. Split from the entropy step so the threaded scan
+/// can run this half in parallel and emit serially.
+fn quantize_block(block: &mut [i16; 64], div: &Divisors) -> [i16; 64] {
+    arch::backend::dct::fdct_islow(block);
+    quant::quantize_and_zigzag(block, div)
+}
+
+/// Parallel front half of the threaded scan: for each MCU row, color
+/// convert + forward DCT + quantize + zigzag every MCU and return the
+/// row's quantized blocks. Pure data in / pure data out — no
+/// references to the bit writer, so this is the only piece that needs
+/// to be Send-friendly.
+fn parallel_quantize_rows<S: SamplingScheme>(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+) -> Vec<Vec<[i16; 64]>> {
+    let mcus_x = width.div_ceil(S::MCU_W);
+    let mcus_y = height.div_ceil(S::MCU_H);
+    let blocks_per_mcu = S::BLOCKS_PER_MCU;
+    let blocks_per_row = (mcus_x as usize) * blocks_per_mcu;
+
+    (0..mcus_y)
+        .into_par_iter()
+        .map(|my| {
+            let mut row: Vec<[i16; 64]> = vec![[0i16; 64]; blocks_per_row];
+            for mx in 0..mcus_x {
+                let start = (mx as usize) * blocks_per_mcu;
+                let slot = &mut row[start..start + blocks_per_mcu];
+                S::quantize_one_mcu(
+                    pixels, width, height, layout, mx, my, div_luma, div_chroma, slot,
+                );
+            }
+            row
+        })
+        .collect()
+}
+
+/// Serial back half: walk the parallel front half's output in raster
+/// order and emit Huffman bits. DC predictor chain and RSTn bookkeeping
+/// mirror [`encode_scan`] exactly so the byte stream is identical.
+///
+/// `rows.len()` is the number of MCU rows; `mcus_x` is MCUs per row.
+/// `total_mcus` (used for the "no trailing RSTn" check) is therefore
+/// `mcus_x * rows.len()`.
+#[allow(clippy::too_many_arguments)]
+fn serial_emit_rows<S: SamplingScheme, W: Write>(
+    rows: &[Vec<[i16; 64]>],
+    mcus_x: u32,
+    bw: &mut BitWriter<W>,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+    restart_interval: u16,
+) -> io::Result<()> {
+    let blocks_per_mcu = S::BLOCKS_PER_MCU;
+    let y_blocks = S::Y_BLOCKS_PER_MCU;
+    let mut prev_dc = DcPredictors::default();
+    let restart_interval = restart_interval as u32;
+    let mut mcus_since_rst: u32 = 0;
+    let mut next_rst: u8 = 0;
+    let mut mcu_count: u64 = 0;
+    let total_mcus = mcus_x as u64 * rows.len() as u64;
+    for row in rows {
+        for mx in 0..mcus_x as usize {
+            if restart_interval > 0 && mcus_since_rst == restart_interval && mcu_count < total_mcus
+            {
+                bw.write_restart(next_rst)?;
+                next_rst = (next_rst + 1) & 7;
+                mcus_since_rst = 0;
+                prev_dc = DcPredictors::default();
+            }
+            let start = mx * blocks_per_mcu;
+            let blocks = &row[start..start + blocks_per_mcu];
+            for blk in &blocks[..y_blocks] {
+                prev_dc.y = encode_block(bw, blk, prev_dc.y, dc_luma, ac_luma)?;
+            }
+            prev_dc.cb = encode_block(bw, &blocks[y_blocks], prev_dc.cb, dc_chroma, ac_chroma)?;
+            prev_dc.cr = encode_block(bw, &blocks[y_blocks + 1], prev_dc.cr, dc_chroma, ac_chroma)?;
+            mcus_since_rst += 1;
+            mcu_count += 1;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
