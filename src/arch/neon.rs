@@ -321,256 +321,305 @@ pub mod dct {
     }
 
     // ---- IDCT (jidctint) constants ----
-    const I_FIX_0_298_631_336: i32 = 2446;
-    const I_FIX_0_390_180_644: i32 = 3196;
-    const I_FIX_0_541_196_100: i32 = 4433;
-    const I_FIX_0_765_366_865: i32 = 6270;
-    const I_FIX_0_899_976_223: i32 = 7373;
-    const I_FIX_1_175_875_602: i32 = 9633;
-    const I_FIX_1_501_321_110: i32 = 12299;
-    const I_FIX_1_847_759_065: i32 = 15137;
-    const I_FIX_1_961_570_560: i32 = 16069;
-    const I_FIX_2_053_119_869: i32 = 16819;
-    const I_FIX_2_562_915_447: i32 = 20995;
-    const I_FIX_3_072_711_026: i32 = 25172;
+    //
+    // Caller-input contract: this kernel mirrors libjpeg-turbo
+    // `jsimd_idct_islow_neon`. Intermediate sums of dequantized
+    // coefficients are computed in i16, so the caller must ensure every
+    // dequantized coefficient fits in `i16` and that pair-sums of
+    // odd-row inputs (`row1+row3`, `row5+row7` etc.) also fit in i16.
+    // Conforming JPEG bitstreams satisfy this; pathological inputs
+    // beyond libjpeg-turbo's documented range may produce wrap-around
+    // output. The scalar reference at `arch::scalar::dct::idct_islow`
+    // uses an i32 workspace and is safe for any `i16` input — use it
+    // (via `--features force-scalar`) if you need the conservative path.
+
+    // Constants packed as 3 × 4 i16 lanes for `vmull_lane_s16` /
+    // `vmlal_lane_s16` / `vmlsl_lane_s16` indexing. Layout matches
+    // libjpeg-turbo `jsimd_idct_islow_neon_consts`.
+    const I_CONSTS: [i16; 12] = [
+        // consts1: lane 0..3
+        7373,  // F_0_899
+        4433,  // F_0_541
+        20995, // F_2_562
+        -4927, // F_0_298 - F_0_899
+        // consts2
+        4926,  // F_1_501 - F_0_899
+        -4176, // F_2_053 - F_2_562
+        10703, // F_0_541 + F_0_765
+        9633,  // F_1_175
+        // consts3
+        6437,   // F_1_175 - F_0_390
+        -10704, // F_0_541 - F_1_847
+        4177,   // F_3_072 - F_2_562
+        -6436,  // F_1_175 - F_1_961
+    ];
+
     const I_CONST_BITS: i32 = 13;
     const I_PASS1_BITS: i32 = 2;
     const I_DESCALE_P1: i32 = I_CONST_BITS - I_PASS1_BITS;
-    const I_SHIFT2: i32 = I_CONST_BITS + I_PASS1_BITS + 3;
-    const I_LEVEL_SHIFT_BIAS: i32 = 128 << I_SHIFT2;
+    // Pass-2 total descale is 18 (CONST_BITS + PASS1_BITS + 3); we
+    // split it as `vaddhn` (>>16 truncating) + `vqrshrn_n_s16<2>`
+    // (>>2 rounding saturating). This is libjpeg-turbo's pattern.
+    const I_DESCALE_P2_LATE: i32 = I_CONST_BITS + I_PASS1_BITS + 3 - 16;
 
-    /// jidctint butterfly on 4 columns held as i32 lanes. Returns the
-    /// 8 row-sums *before* descale; caller applies the right-shift.
+    /// jidctint pass-1 regular, 4x8 half. Reads 8 input rows (4 cols
+    /// each), writes 16 i16 to each of `ws1` / `ws2` (rows 0-3 →
+    /// ws1 transposed, rows 4-7 → ws2 transposed).
     ///
     /// # Safety
-    /// `target_arch = "aarch64"` guarantees NEON.
+    /// NEON enabled; `ws1`/`ws2` must each be writable for 16 i16.
     #[target_feature(enable = "neon")]
     #[inline]
-    unsafe fn idct_butterfly(r: [int32x4_t; 8]) -> [int32x4_t; 8] {
-        // Even part — rows 0/2/4/6.
-        let z1e = vmulq_n_s32(vaddq_s32(r[2], r[6]), I_FIX_0_541_196_100);
-        let tmp2 = vmlaq_n_s32(z1e, r[6], -I_FIX_1_847_759_065);
-        let tmp3 = vmlaq_n_s32(z1e, r[2], I_FIX_0_765_366_865);
-        let tmp0 = vshlq_n_s32::<I_CONST_BITS>(vaddq_s32(r[0], r[4]));
-        let tmp1 = vshlq_n_s32::<I_CONST_BITS>(vsubq_s32(r[0], r[4]));
-        let tmp10 = vaddq_s32(tmp0, tmp3);
-        let tmp13 = vsubq_s32(tmp0, tmp3);
-        let tmp11 = vaddq_s32(tmp1, tmp2);
-        let tmp12 = vsubq_s32(tmp1, tmp2);
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn idct_pass1_regular(
+        row0: int16x4_t,
+        row1: int16x4_t,
+        row2: int16x4_t,
+        row3: int16x4_t,
+        row4: int16x4_t,
+        row5: int16x4_t,
+        row6: int16x4_t,
+        row7: int16x4_t,
+        ws1: *mut i16,
+        ws2: *mut i16,
+    ) {
+        unsafe {
+            let consts1 = vld1_s16(I_CONSTS.as_ptr());
+            let consts2 = vld1_s16(I_CONSTS.as_ptr().add(4));
+            let consts3 = vld1_s16(I_CONSTS.as_ptr().add(8));
 
-        // Odd part — rows 1/3/5/7. Note the scalar names the rows
-        // t0=row7, t1=row5, t2=row3, t3=row1.
-        let t0 = r[7];
-        let t1 = r[5];
-        let t2 = r[3];
-        let t3 = r[1];
-        let z1 = vaddq_s32(t0, t3);
-        let z2 = vaddq_s32(t1, t2);
-        let z3 = vaddq_s32(t0, t2);
-        let z4 = vaddq_s32(t1, t3);
-        let z5 = vmulq_n_s32(vaddq_s32(z3, z4), I_FIX_1_175_875_602);
+            // ---- Even part ----
+            let z2 = row2;
+            let z3 = row6;
+            let mut tmp2 = vmull_lane_s16::<1>(z2, consts1); // z2 * F_0_541
+            let mut tmp3 = vmull_lane_s16::<2>(z2, consts2); // z2 * (F_0_541+F_0_765)
+            tmp2 = vmlal_lane_s16::<1>(tmp2, z3, consts3); // += z3 * (F_0_541-F_1_847)
+            tmp3 = vmlal_lane_s16::<1>(tmp3, z3, consts1); // += z3 * F_0_541
 
-        let t0m = vmulq_n_s32(t0, I_FIX_0_298_631_336);
-        let t1m = vmulq_n_s32(t1, I_FIX_2_053_119_869);
-        let t2m = vmulq_n_s32(t2, I_FIX_3_072_711_026);
-        let t3m = vmulq_n_s32(t3, I_FIX_1_501_321_110);
-        let z1 = vmulq_n_s32(z1, -I_FIX_0_899_976_223);
-        let z2 = vmulq_n_s32(z2, -I_FIX_2_562_915_447);
-        let z3 = vmulq_n_s32(z3, -I_FIX_1_961_570_560);
-        let z4 = vmulq_n_s32(z4, -I_FIX_0_390_180_644);
+            let z2 = row0;
+            let z3 = row4;
+            let tmp0 = vshll_n_s16::<I_CONST_BITS>(vadd_s16(z2, z3));
+            let tmp1 = vshll_n_s16::<I_CONST_BITS>(vsub_s16(z2, z3));
 
-        let z3 = vaddq_s32(z3, z5);
-        let z4 = vaddq_s32(z4, z5);
+            let tmp10 = vaddq_s32(tmp0, tmp3);
+            let tmp13 = vsubq_s32(tmp0, tmp3);
+            let tmp11 = vaddq_s32(tmp1, tmp2);
+            let tmp12 = vsubq_s32(tmp1, tmp2);
 
-        let to0 = vaddq_s32(vaddq_s32(t0m, z1), z3);
-        let to1 = vaddq_s32(vaddq_s32(t1m, z2), z4);
-        let to2 = vaddq_s32(vaddq_s32(t2m, z2), z3);
-        let to3 = vaddq_s32(vaddq_s32(t3m, z1), z4);
+            // ---- Odd part ----
+            let t0 = row7;
+            let t1 = row5;
+            let t2 = row3;
+            let t3 = row1;
 
-        [
-            vaddq_s32(tmp10, to3),
-            vaddq_s32(tmp11, to2),
-            vaddq_s32(tmp12, to1),
-            vaddq_s32(tmp13, to0),
-            vsubq_s32(tmp13, to0),
-            vsubq_s32(tmp12, to1),
-            vsubq_s32(tmp11, to2),
-            vsubq_s32(tmp10, to3),
-        ]
+            let z3_s16 = vadd_s16(t0, t2);
+            let z4_s16 = vadd_s16(t1, t3);
+
+            // Refactored per the libjpeg-turbo comment block:
+            //   z3 = z3 * (F_1_175 - F_1_961) + z4 * F_1_175
+            //   z4 = z3 * F_1_175 + z4 * (F_1_175 - F_0_390)
+            let mut z3 = vmull_lane_s16::<3>(z3_s16, consts3); // z3 * (F_1_175-F_1_961)
+            let mut z4 = vmull_lane_s16::<3>(z3_s16, consts2); // z3 * F_1_175
+            z3 = vmlal_lane_s16::<3>(z3, z4_s16, consts2); // += z4 * F_1_175
+            z4 = vmlal_lane_s16::<0>(z4, z4_s16, consts3); // += z4 * (F_1_175-F_0_390)
+
+            // Refactored: tmpN = tmpN * (FIX_N - mult_pair) - tmp_other * mult_pair
+            let mut tmp0 = vmull_lane_s16::<3>(t0, consts1); // t0*(F_0_298-F_0_899)
+            let mut tmp1 = vmull_lane_s16::<1>(t1, consts2); // t1*(F_2_053-F_2_562)
+            let mut tmp2 = vmull_lane_s16::<2>(t2, consts3); // t2*(F_3_072-F_2_562)
+            let mut tmp3 = vmull_lane_s16::<0>(t3, consts2); // t3*(F_1_501-F_0_899)
+
+            tmp0 = vmlsl_lane_s16::<0>(tmp0, t3, consts1); // -= t3 * F_0_899
+            tmp1 = vmlsl_lane_s16::<2>(tmp1, t2, consts1); // -= t2 * F_2_562
+            tmp2 = vmlsl_lane_s16::<2>(tmp2, t1, consts1); // -= t1 * F_2_562
+            tmp3 = vmlsl_lane_s16::<0>(tmp3, t0, consts1); // -= t0 * F_0_899
+
+            tmp0 = vaddq_s32(tmp0, z3);
+            tmp1 = vaddq_s32(tmp1, z4);
+            tmp2 = vaddq_s32(tmp2, z3);
+            tmp3 = vaddq_s32(tmp3, z4);
+
+            // Descale by 11 + narrow to i16. For real JPEG coefficients
+            // the results fit easily in i16.
+            let rows_0123 = int16x4x4_t(
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp10, tmp3)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp11, tmp2)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp12, tmp1)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp13, tmp0)),
+            );
+            let rows_4567 = int16x4x4_t(
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp13, tmp0)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp12, tmp1)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp11, tmp2)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp10, tmp3)),
+            );
+
+            // `vst4_s16` writes the 4 vectors interleaved, which is
+            // equivalent to transposing the 4x4 block.
+            vst4_s16(ws1, rows_0123);
+            vst4_s16(ws2, rows_4567);
+        }
     }
 
-    /// 4x4 transpose of i32 lanes, in registers.
-    #[inline(always)]
-    fn transpose_4x4_s32(
-        a: int32x4_t,
-        b: int32x4_t,
-        c: int32x4_t,
-        d: int32x4_t,
-    ) -> (int32x4_t, int32x4_t, int32x4_t, int32x4_t) {
+    /// jidctint pass-2 regular, 4x8 half. Reads 32 i16 from
+    /// `workspace`, writes 4 output rows (8 u8 each) at
+    /// `output_base + (buf_offset + r) * 8` for r in 0..4.
+    ///
+    /// # Safety
+    /// NEON enabled; `workspace` must be readable for 32 i16;
+    /// `output_base` must be writable for `(buf_offset + 4) * 8` bytes.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn idct_pass2_regular(workspace: *const i16, output_base: *mut u8, buf_offset: usize) {
         unsafe {
-            let ab_lo = vtrn1q_s32(a, b); // (a0,b0, a2,b2)
-            let ab_hi = vtrn2q_s32(a, b); // (a1,b1, a3,b3)
-            let cd_lo = vtrn1q_s32(c, d); // (c0,d0, c2,d2)
-            let cd_hi = vtrn2q_s32(c, d); // (c1,d1, c3,d3)
-            let r0 = vreinterpretq_s32_s64(vtrn1q_s64(
-                vreinterpretq_s64_s32(ab_lo),
-                vreinterpretq_s64_s32(cd_lo),
-            )); // (a0,b0,c0,d0)
-            let r1 = vreinterpretq_s32_s64(vtrn1q_s64(
-                vreinterpretq_s64_s32(ab_hi),
-                vreinterpretq_s64_s32(cd_hi),
-            )); // (a1,b1,c1,d1)
-            let r2 = vreinterpretq_s32_s64(vtrn2q_s64(
-                vreinterpretq_s64_s32(ab_lo),
-                vreinterpretq_s64_s32(cd_lo),
-            )); // (a2,b2,c2,d2)
-            let r3 = vreinterpretq_s32_s64(vtrn2q_s64(
-                vreinterpretq_s64_s32(ab_hi),
-                vreinterpretq_s64_s32(cd_hi),
-            )); // (a3,b3,c3,d3)
-            (r0, r1, r2, r3)
+            let consts1 = vld1_s16(I_CONSTS.as_ptr());
+            let consts2 = vld1_s16(I_CONSTS.as_ptr().add(4));
+            let consts3 = vld1_s16(I_CONSTS.as_ptr().add(8));
+
+            // ---- Even part. Workspace is laid out as 8 contiguous 4-i16
+            // groups (one per "column-of-original" after the pass-1
+            // transpose). Index k reads workspace[k*4 .. k*4+4].
+            let z2 = vld1_s16(workspace.add(2 * 4));
+            let z3 = vld1_s16(workspace.add(6 * 4));
+            let mut tmp2 = vmull_lane_s16::<1>(z2, consts1);
+            let mut tmp3 = vmull_lane_s16::<2>(z2, consts2);
+            tmp2 = vmlal_lane_s16::<1>(tmp2, z3, consts3);
+            tmp3 = vmlal_lane_s16::<1>(tmp3, z3, consts1);
+
+            let z2 = vld1_s16(workspace);
+            let z3 = vld1_s16(workspace.add(4 * 4));
+            let tmp0 = vshll_n_s16::<I_CONST_BITS>(vadd_s16(z2, z3));
+            let tmp1 = vshll_n_s16::<I_CONST_BITS>(vsub_s16(z2, z3));
+
+            let tmp10 = vaddq_s32(tmp0, tmp3);
+            let tmp13 = vsubq_s32(tmp0, tmp3);
+            let tmp11 = vaddq_s32(tmp1, tmp2);
+            let tmp12 = vsubq_s32(tmp1, tmp2);
+
+            // ---- Odd part ----
+            let t0 = vld1_s16(workspace.add(7 * 4));
+            let t1 = vld1_s16(workspace.add(5 * 4));
+            let t2 = vld1_s16(workspace.add(3 * 4));
+            let t3 = vld1_s16(workspace.add(4));
+
+            let z3_s16 = vadd_s16(t0, t2);
+            let z4_s16 = vadd_s16(t1, t3);
+
+            let mut z3 = vmull_lane_s16::<3>(z3_s16, consts3);
+            let mut z4 = vmull_lane_s16::<3>(z3_s16, consts2);
+            z3 = vmlal_lane_s16::<3>(z3, z4_s16, consts2);
+            z4 = vmlal_lane_s16::<0>(z4, z4_s16, consts3);
+
+            let mut tmp0 = vmull_lane_s16::<3>(t0, consts1);
+            let mut tmp1 = vmull_lane_s16::<1>(t1, consts2);
+            let mut tmp2 = vmull_lane_s16::<2>(t2, consts3);
+            let mut tmp3 = vmull_lane_s16::<0>(t3, consts2);
+
+            tmp0 = vmlsl_lane_s16::<0>(tmp0, t3, consts1);
+            tmp1 = vmlsl_lane_s16::<2>(tmp1, t2, consts1);
+            tmp2 = vmlsl_lane_s16::<2>(tmp2, t1, consts1);
+            tmp3 = vmlsl_lane_s16::<0>(tmp3, t0, consts1);
+
+            tmp0 = vaddq_s32(tmp0, z3);
+            tmp1 = vaddq_s32(tmp1, z4);
+            tmp2 = vaddq_s32(tmp2, z3);
+            tmp3 = vaddq_s32(tmp3, z4);
+
+            // Final descale-and-narrow:
+            //   total >> 18 with rounding + signed→u8 saturation + +128.
+            // Split as `vaddhn_s32` (high-half add: (a+b)>>16, truncating)
+            // and `vqrshrn_n_s16<2>` (rounding + saturating narrow to i8).
+            // The level shift +128 is applied as a wrap-around `vadd_u8`
+            // after reinterpreting the i8 result as u8 — for a saturated
+            // i8 in `[-128, 127]`, +128 mod 256 maps exactly to `[0, 255]`.
+            let cols_02_s16 = vcombine_s16(vaddhn_s32(tmp10, tmp3), vaddhn_s32(tmp12, tmp1));
+            let cols_13_s16 = vcombine_s16(vaddhn_s32(tmp11, tmp2), vaddhn_s32(tmp13, tmp0));
+            let cols_46_s16 = vcombine_s16(vsubhn_s32(tmp13, tmp0), vsubhn_s32(tmp11, tmp2));
+            let cols_57_s16 = vcombine_s16(vsubhn_s32(tmp12, tmp1), vsubhn_s32(tmp10, tmp3));
+
+            let cols_02_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_02_s16);
+            let cols_13_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_13_s16);
+            let cols_46_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_46_s16);
+            let cols_57_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_57_s16);
+
+            let center = vdup_n_u8(128);
+            let cols_02_u8 = vadd_u8(vreinterpret_u8_s8(cols_02_s8), center);
+            let cols_13_u8 = vadd_u8(vreinterpret_u8_s8(cols_13_s8), center);
+            let cols_46_u8 = vadd_u8(vreinterpret_u8_s8(cols_46_s8), center);
+            let cols_57_u8 = vadd_u8(vreinterpret_u8_s8(cols_57_s8), center);
+
+            // Final 4x8 transpose-and-store using `vst4_lane_u16`.
+            // Zipping adjacent pseudo-columns lets us treat output
+            // elements as u16 pairs.
+            let cols_01_23 = vzip_u8(cols_02_u8, cols_13_u8);
+            let cols_45_67 = vzip_u8(cols_46_u8, cols_57_u8);
+            let quad = uint16x4x4_t(
+                vreinterpret_u16_u8(cols_01_23.0),
+                vreinterpret_u16_u8(cols_01_23.1),
+                vreinterpret_u16_u8(cols_45_67.0),
+                vreinterpret_u16_u8(cols_45_67.1),
+            );
+
+            let row0 = output_base.add((buf_offset) * 8).cast::<u16>();
+            let row1 = output_base.add((buf_offset + 1) * 8).cast::<u16>();
+            let row2 = output_base.add((buf_offset + 2) * 8).cast::<u16>();
+            let row3 = output_base.add((buf_offset + 3) * 8).cast::<u16>();
+            vst4_lane_u16::<0>(row0, quad);
+            vst4_lane_u16::<1>(row1, quad);
+            vst4_lane_u16::<2>(row2, quad);
+            vst4_lane_u16::<3>(row3, quad);
         }
     }
 
     /// # Safety
     /// `target_arch = "aarch64"` guarantees NEON. `coef` / `output` are
     /// fixed-size references; no caller-side invariants beyond the
-    /// standard reference rules.
+    /// standard reference rules and the i16-range contract documented
+    /// near `I_CONSTS`.
     #[target_feature(enable = "neon")]
     unsafe fn idct_islow_inner(coef: &[i16; 64], output: &mut [u8; 64]) {
         unsafe {
-            // Load 8 rows of dequantized coefficients.
+            let mut ws_l = [0i16; 32];
+            let mut ws_r = [0i16; 32];
             let p = coef.as_ptr();
-            let r0 = vld1q_s16(p);
-            let r1 = vld1q_s16(p.add(8));
-            let r2 = vld1q_s16(p.add(16));
-            let r3 = vld1q_s16(p.add(24));
-            let r4 = vld1q_s16(p.add(32));
-            let r5 = vld1q_s16(p.add(40));
-            let r6 = vld1q_s16(p.add(48));
-            let r7 = vld1q_s16(p.add(56));
 
-            // Pass 1: NEON lanes are columns; full-vector butterfly =
-            // 1D-IDCT over rows for each of 8 columns in parallel. Two
-            // halves cover the 8 columns (4 per i32x4).
-            let lo = idct_butterfly([
-                vmovl_s16(vget_low_s16(r0)),
-                vmovl_s16(vget_low_s16(r1)),
-                vmovl_s16(vget_low_s16(r2)),
-                vmovl_s16(vget_low_s16(r3)),
-                vmovl_s16(vget_low_s16(r4)),
-                vmovl_s16(vget_low_s16(r5)),
-                vmovl_s16(vget_low_s16(r6)),
-                vmovl_s16(vget_low_s16(r7)),
-            ]);
-            let hi = idct_butterfly([
-                vmovl_s16(vget_high_s16(r0)),
-                vmovl_s16(vget_high_s16(r1)),
-                vmovl_s16(vget_high_s16(r2)),
-                vmovl_s16(vget_high_s16(r3)),
-                vmovl_s16(vget_high_s16(r4)),
-                vmovl_s16(vget_high_s16(r5)),
-                vmovl_s16(vget_high_s16(r6)),
-                vmovl_s16(vget_high_s16(r7)),
-            ]);
+            // Pass 1, left 4x8 half (columns 0-3). Writes ws_l[0..16]
+            // and ws_r[0..16] in transposed 4x4 quadrants.
+            idct_pass1_regular(
+                vld1_s16(p),
+                vld1_s16(p.add(8)),
+                vld1_s16(p.add(16)),
+                vld1_s16(p.add(24)),
+                vld1_s16(p.add(32)),
+                vld1_s16(p.add(40)),
+                vld1_s16(p.add(48)),
+                vld1_s16(p.add(56)),
+                ws_l.as_mut_ptr(),
+                ws_r.as_mut_ptr(),
+            );
 
-            // Descale by 11 with rounding. Kept as i32 — the scalar
-            // workspace is i32 too, and extreme i16 inputs (DC near
-            // ±32767) overflow i16 here.
-            let ws_lo: [int32x4_t; 8] = [
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[0]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[1]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[2]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[3]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[4]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[5]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[6]),
-                vrshrq_n_s32::<I_DESCALE_P1>(lo[7]),
-            ];
-            let ws_hi: [int32x4_t; 8] = [
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[0]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[1]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[2]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[3]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[4]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[5]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[6]),
-                vrshrq_n_s32::<I_DESCALE_P1>(hi[7]),
-            ];
+            // Pass 1, right 4x8 half (columns 4-7). Writes
+            // ws_l[16..32] and ws_r[16..32].
+            idct_pass1_regular(
+                vld1_s16(p.add(4)),
+                vld1_s16(p.add(12)),
+                vld1_s16(p.add(20)),
+                vld1_s16(p.add(28)),
+                vld1_s16(p.add(36)),
+                vld1_s16(p.add(44)),
+                vld1_s16(p.add(52)),
+                vld1_s16(p.add(60)),
+                ws_l.as_mut_ptr().add(16),
+                ws_r.as_mut_ptr().add(16),
+            );
 
-            // 8x8 i32 transpose by 4x4 quadrants. Conceptually:
-            //   T[c][r] = WS[r][c]
-            // Off-diagonal quadrants are swapped (TR ↔ BL).
-            let (tl0, tl1, tl2, tl3) = transpose_4x4_s32(ws_lo[0], ws_lo[1], ws_lo[2], ws_lo[3]);
-            let (tl4, tl5, tl6, tl7) = transpose_4x4_s32(ws_hi[0], ws_hi[1], ws_hi[2], ws_hi[3]);
-            let (th0, th1, th2, th3) = transpose_4x4_s32(ws_lo[4], ws_lo[5], ws_lo[6], ws_lo[7]);
-            let (th4, th5, th6, th7) = transpose_4x4_s32(ws_hi[4], ws_hi[5], ws_hi[6], ws_hi[7]);
-            // After transpose: t_lo[c] = (ws[0][c]..ws[3][c]),
-            //                  t_hi[c] = (ws[4][c]..ws[7][c]).
-
-            // Pass 2: NEON lanes are now rows; butterfly = 1D-IDCT
-            // over columns for each of 8 rows in parallel.
-            let p2_lo = idct_butterfly([tl0, tl1, tl2, tl3, tl4, tl5, tl6, tl7]);
-            let p2_hi = idct_butterfly([th0, th1, th2, th3, th4, th5, th6, th7]);
-
-            // Descale by 18 with rounding and folded-in +128 level shift.
-            // After this, lanes are in approximately [0, 255] (still i32
-            // pending saturation for pathological inputs).
-            let bias = vdupq_n_s32(I_LEVEL_SHIFT_BIAS);
-            let p2_lo: [int32x4_t; 8] = [
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[0], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[1], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[2], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[3], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[4], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[5], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[6], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_lo[7], bias)),
-            ];
-            let p2_hi: [int32x4_t; 8] = [
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[0], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[1], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[2], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[3], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[4], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[5], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[6], bias)),
-                vrshrq_n_s32::<I_SHIFT2>(vaddq_s32(p2_hi[7], bias)),
-            ];
-
-            // p2_lo[c] / p2_hi[c] hold output[r][c] in lane r (column
-            // orientation). Transpose back to row orientation so each
-            // vector is one row of the output, ready for the u8 store.
-            let (or0_lo, or1_lo, or2_lo, or3_lo) =
-                transpose_4x4_s32(p2_lo[0], p2_lo[1], p2_lo[2], p2_lo[3]);
-            let (or0_hi, or1_hi, or2_hi, or3_hi) =
-                transpose_4x4_s32(p2_lo[4], p2_lo[5], p2_lo[6], p2_lo[7]);
-            let (or4_lo, or5_lo, or6_lo, or7_lo) =
-                transpose_4x4_s32(p2_hi[0], p2_hi[1], p2_hi[2], p2_hi[3]);
-            let (or4_hi, or5_hi, or6_hi, or7_hi) =
-                transpose_4x4_s32(p2_hi[4], p2_hi[5], p2_hi[6], p2_hi[7]);
-
-            // Saturate i32 → u8 ([0, 255]) via the standard two-step
-            // chain `vqmovn_s32` → `vqmovun_s16`, matching scalar's
-            // `i32::clamp(0, 255)` even for extreme overflow.
-            let row_u8 = |lo: int32x4_t, hi: int32x4_t| -> uint8x8_t {
-                let s16 = vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi));
-                vqmovun_s16(s16)
-            };
-            let row0 = row_u8(or0_lo, or0_hi);
-            let row1 = row_u8(or1_lo, or1_hi);
-            let row2 = row_u8(or2_lo, or2_hi);
-            let row3 = row_u8(or3_lo, or3_hi);
-            let row4 = row_u8(or4_lo, or4_hi);
-            let row5 = row_u8(or5_lo, or5_hi);
-            let row6 = row_u8(or6_lo, or6_hi);
-            let row7 = row_u8(or7_lo, or7_hi);
-
-            let q = output.as_mut_ptr();
-            vst1q_u8(q, vcombine_u8(row0, row1));
-            vst1q_u8(q.add(16), vcombine_u8(row2, row3));
-            vst1q_u8(q.add(32), vcombine_u8(row4, row5));
-            vst1q_u8(q.add(48), vcombine_u8(row6, row7));
+            // Pass 2: ws_l → output rows 0-3, ws_r → output rows 4-7.
+            // The pass-1 transposed layout means pass 2's "row N" inputs
+            // are actually column N of the original ws — that's our
+            // implicit transpose between passes.
+            let out = output.as_mut_ptr();
+            idct_pass2_regular(ws_l.as_ptr(), out, 0);
+            idct_pass2_regular(ws_r.as_ptr(), out, 4);
         }
     }
 
