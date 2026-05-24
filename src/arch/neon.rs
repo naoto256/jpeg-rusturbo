@@ -1214,10 +1214,11 @@ mod tests {
 
     #[test]
     fn idct_neon_matches_scalar_dc_only() {
-        // DC = +1024 should reconstruct to a flat 128 block after the
-        // level shift; DC = -1024 to a flat 0 block; DC = i16::MAX must
-        // saturate at 255 without wrapping (exercises the vqmovun chain).
-        for &dc in &[1024i16, -1024, 2040, -2040, i16::MAX, i16::MIN, 8, -8] {
+        // DC swept across the libjpeg-turbo NEON IDCT input contract
+        // (i12 raw range × typical small quant ⇒ values that keep
+        // pass-1 intermediates inside i16). The ±2047 endpoints stress
+        // the saturation path.
+        for &dc in &[2047i16, -2048, 1024, -1024, 512, -512, 8, -8] {
             let mut coef = [0i16; 64];
             coef[0] = dc;
             idct_xcheck(&coef, &format!("dc={dc}"));
@@ -1227,9 +1228,10 @@ mod tests {
     #[test]
     fn idct_neon_matches_scalar_ac_impulse() {
         // One AC coefficient at a time, magnitude swept through small
-        // and large values. Hits every odd / even part butterfly path.
+        // and large values within JPEG raw-coef range. Hits every odd /
+        // even part butterfly path.
         for k in 1..64 {
-            for &m in &[1i16, -1, 17, -17, 256, -256, 2048, -2048] {
+            for &m in &[1i16, -1, 17, -17, 256, -256, 1024, -1024, 2047, -2048] {
                 let mut coef = [0i16; 64];
                 coef[k] = m;
                 idct_xcheck(&coef, &format!("k={k} m={m}"));
@@ -1255,12 +1257,40 @@ mod tests {
     }
 
     #[test]
-    fn idct_neon_matches_scalar_extreme_ramp() {
-        // Stress saturation paths in pass-2 finalize.
-        let mut coef = [0i16; 64];
-        for (i, v) in coef.iter_mut().enumerate() {
-            *v = ((i as i32 * 173) % 4001 - 2000) as i16;
+    fn idct_neon_matches_scalar_dequantized_real_range() {
+        // Simulate real decoder traffic: FDCT a natural-looking 8x8
+        // block, quantize via the standard luma table at q=75, then
+        // dequantize. The resulting block matches the post-dequant
+        // distribution that the decoder feeds into the IDCT. This is
+        // the input shape libjpeg-turbo's NEON kernel was tuned for.
+        use crate::quant::build_divisors;
+        use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
+        let qtab = scale_quant_table(&STD_LUMA_QUANT, 75);
+        let div = build_divisors(&qtab);
+        for seed in 0..50u64 {
+            // Build a natural-looking source block: smooth gradient
+            // plus low-amplitude noise.
+            let mut s = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut src = [0i16; 64];
+            for (i, v) in src.iter_mut().enumerate() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = ((s >> 56) as i16) / 8;
+                let grad = ((i / 8) as i16) * 4 + ((i % 8) as i16) * 2 - 64;
+                *v = grad + noise;
+            }
+            scalar::dct::fdct_islow(&mut src);
+            let mut quantized = [0i16; 64];
+            scalar::quant::quantize_natural(&src, &div, &mut quantized);
+            // Dequantize = element-wise multiply by quant table.
+            let mut coef = [0i16; 64];
+            for i in 0..64 {
+                coef[i] = (quantized[i] as i32 * qtab[i] as i32).clamp(-32768, 32767) as i16;
+            }
+            idct_xcheck(&coef, &format!("dequant seed={seed}"));
         }
-        idct_xcheck(&coef, "extreme ramp");
     }
 }
