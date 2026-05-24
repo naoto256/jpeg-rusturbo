@@ -647,18 +647,18 @@ pub mod color {
             //   lo128 = [a.lo4, b.lo4]   hi128 = [a.hi4, b.hi4]
             // To restore [pixels 0..7, pixels 8..15] order we permute
             // 64-bit lanes by 0xD8 = [0, 2, 1, 3].
-            let perm = 0b11_01_10_00;
-            let r_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(r_lo, r_hi));
-            let g_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(g_lo, g_hi));
-            let b_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(b_lo, b_hi));
+            const PERM: i32 = 0b11_01_10_00;
+            let r_i16 = _mm256_permute4x64_epi64::<PERM>(_mm256_packs_epi32(r_lo, r_hi));
+            let g_i16 = _mm256_permute4x64_epi64::<PERM>(_mm256_packs_epi32(g_lo, g_hi));
+            let b_i16 = _mm256_permute4x64_epi64::<PERM>(_mm256_packs_epi32(b_lo, b_hi));
 
             // i16 → u8 with unsigned saturation. `packus_epi16(a, a)`
             // collapses 16 i16 in one ymm into 16 u8 in the low 128
             // (per-lane: lo128 of a → bytes 0..7 in lo of each 128-bit
             // half), so we permute again.
-            let r_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(r_i16, r_i16));
-            let g_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(g_i16, g_i16));
-            let b_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(b_i16, b_i16));
+            let r_u8 = _mm256_permute4x64_epi64::<PERM>(_mm256_packus_epi16(r_i16, r_i16));
+            let g_u8 = _mm256_permute4x64_epi64::<PERM>(_mm256_packus_epi16(g_i16, g_i16));
+            let b_u8 = _mm256_permute4x64_epi64::<PERM>(_mm256_packus_epi16(b_i16, b_i16));
 
             (
                 _mm256_castsi256_si128(r_u8),
@@ -1436,6 +1436,7 @@ pub mod dct {
 mod tests {
     use super::*;
     use crate::arch::scalar;
+    use crate::color::PixelLayout;
 
     #[test]
     fn quant_avx2_matches_scalar_random() {
