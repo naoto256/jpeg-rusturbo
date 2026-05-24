@@ -119,12 +119,12 @@ pub fn decode_baseline_scan_into(
                 for (scan_idx, sc) in scan.components.iter().enumerate() {
                     let (comp_idx, comp) = find_component(frame, sc.component_id)?;
                     let plane = &mut planes[comp_idx];
-                    let dc_tbl = dc_tables[sc.dc_table as usize].as_ref().ok_or(
-                        DecodeError::Malformed("scan refers to undefined DC table"),
-                    )?;
-                    let ac_tbl = ac_tables[sc.ac_table as usize].as_ref().ok_or(
-                        DecodeError::Malformed("scan refers to undefined AC table"),
-                    )?;
+                    let dc_tbl = dc_tables[sc.dc_table as usize]
+                        .as_ref()
+                        .ok_or(DecodeError::Malformed("scan refers to undefined DC table"))?;
+                    let ac_tbl = ac_tables[sc.ac_table as usize]
+                        .as_ref()
+                        .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
                     let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
                         "scan refers to undefined quant table",
                     ))?;
@@ -189,8 +189,7 @@ pub fn decode_baseline_scan_into(
                 zz_coef.fill(0);
                 decode_block_baseline(&mut br, dc_tbl, ac_tbl, &mut prev_dc[0], &mut zz_coef)?;
                 for k in 0..64 {
-                    nat_coef[ZIGZAG[k]] =
-                        zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
+                    nat_coef[ZIGZAG[k]] = zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
                 }
                 let mut block = [0u8; 64];
                 arch::backend::dct::idct_islow(&nat_coef, &mut block);

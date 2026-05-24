@@ -77,9 +77,9 @@ pub fn decode_progressive(
         let blocks_y = (frame.height as usize * comp.v as usize)
             .div_ceil(v_max * 8)
             .max(1);
-        let total = blocks_x.checked_mul(blocks_y).ok_or(DecodeError::Malformed(
-            "progressive block count overflow",
-        ))?;
+        let total = blocks_x
+            .checked_mul(blocks_y)
+            .ok_or(DecodeError::Malformed("progressive block count overflow"))?;
         comps.push(CoeffComponent {
             component: *comp,
             blocks_x,
@@ -185,11 +185,11 @@ fn run_progressive_scan(
                                 if scan.ah == 0 {
                                     decode_dc_first_block(
                                         &mut br,
-                                        dc_tables[entry.dc_table as usize]
-                                            .as_ref()
-                                            .ok_or(DecodeError::Malformed(
+                                        dc_tables[entry.dc_table as usize].as_ref().ok_or(
+                                            DecodeError::Malformed(
                                                 "scan refers to undefined DC table",
-                                            ))?,
+                                            ),
+                                        )?,
                                         &mut prev_dc[entry.comp_idx],
                                         scan.al,
                                         &mut dummy,
@@ -203,11 +203,9 @@ fn run_progressive_scan(
                             if scan.ah == 0 {
                                 decode_dc_first_block(
                                     &mut br,
-                                    dc_tables[entry.dc_table as usize]
-                                        .as_ref()
-                                        .ok_or(DecodeError::Malformed(
-                                            "scan refers to undefined DC table",
-                                        ))?,
+                                    dc_tables[entry.dc_table as usize].as_ref().ok_or(
+                                        DecodeError::Malformed("scan refers to undefined DC table"),
+                                    )?,
                                     &mut prev_dc[entry.comp_idx],
                                     scan.al,
                                     coef,
@@ -225,9 +223,9 @@ fn run_progressive_scan(
         // ---- AC scan: always non-interleaved (Ns == 1, enforced) ----
         let sc = &scan.components[0];
         let comp_idx = find_component_idx(frame, sc.component_id)?;
-        let ac_tbl = ac_tables[sc.ac_table as usize].as_ref().ok_or(
-            DecodeError::Malformed("scan refers to undefined AC table"),
-        )?;
+        let ac_tbl = ac_tables[sc.ac_table as usize]
+            .as_ref()
+            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
         let blocks_x = comps[comp_idx].blocks_x;
         let blocks_y = comps[comp_idx].blocks_y;
         for by in 0..blocks_y {
@@ -238,10 +236,25 @@ fn run_progressive_scan(
                 }
                 let coef = comps[comp_idx].block_mut(bx, by);
                 if scan.ah == 0 {
-                    decode_ac_first_block(&mut br, ac_tbl, scan.ss, scan.se, scan.al, &mut eobrun, coef)?;
+                    decode_ac_first_block(
+                        &mut br,
+                        ac_tbl,
+                        scan.ss,
+                        scan.se,
+                        scan.al,
+                        &mut eobrun,
+                        coef,
+                    )?;
                 } else {
                     decode_ac_refine_block(
-                        &mut br, ac_tbl, scan.ss, scan.se, scan.ah, scan.al, &mut eobrun, coef,
+                        &mut br,
+                        ac_tbl,
+                        scan.ss,
+                        scan.se,
+                        scan.ah,
+                        scan.al,
+                        &mut eobrun,
+                        coef,
                     )?;
                 }
                 mcus_since_restart += 1;
@@ -609,16 +622,14 @@ fn finalize_to_planes(
                 let zz = &cc.blocks[by * cc.blocks_x + bx];
                 // De-zig-zag and dequantize.
                 for k in 0..64 {
-                    nat_coef[ZIGZAG[k]] =
-                        zz[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
+                    nat_coef[ZIGZAG[k]] = zz[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
                 }
                 arch::backend::dct::idct_islow(&nat_coef, &mut block);
                 let base_x = bx * 8;
                 let base_y = by * 8;
                 for j in 0..8 {
                     let dst_off = (base_y + j) * stride + base_x;
-                    samples[dst_off..dst_off + 8]
-                        .copy_from_slice(&block[j * 8..j * 8 + 8]);
+                    samples[dst_off..dst_off + 8].copy_from_slice(&block[j * 8..j * 8 + 8]);
                 }
             }
         }
