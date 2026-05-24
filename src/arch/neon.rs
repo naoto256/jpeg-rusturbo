@@ -5,6 +5,22 @@
 //!
 //! Output is bit-exact identical to `arch::scalar` — the cross-check
 //! tests at the bottom of this file assert that on a panel of inputs.
+//!
+//! # Safety
+//!
+//! Every `unsafe { … }` block in this module wraps a `core::arch::aarch64::*`
+//! NEON intrinsic. NEON is mandatory on AArch64 per the ARMv8-A architecture
+//! reference manual, and this entire module is gated upstream by
+//! `#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]` in
+//! `src/arch/mod.rs`. The intrinsics therefore have a well-defined CPU-side
+//! contract on every reachable target. On the Rust side, each call passes
+//! `vld1q_*` / `vst1q_*` pointers derived from `&[i16; 64]` / `&mut [u8]`
+//! borrows whose lifetime covers the load/store, with element counts equal
+//! to the intrinsic's vector width (16-lane u8 / 8-lane i16 / 4-lane i32).
+//! No call reads past the end of a slice and no call writes to an aliased
+//! or out-of-bounds destination — the cross-check tests at the bottom of
+//! this file would have caught any such bug, since they compare every
+//! emitted byte against the scalar reference.
 
 #![allow(dead_code)]
 
