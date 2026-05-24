@@ -481,6 +481,11 @@ pub mod color {
     }
 
     /// Per-row YCbCr → RGB(A) converter.
+    ///
+    /// AVX2 fast path: processes 16-pixel chunks via `ycc_block16_avx2`;
+    /// the final `n % 16` pixels and the entire request on non-AVX2 CPUs
+    /// fall through to the scalar reference. Bit-identical to
+    /// `arch::scalar::color::ycc_row_to_rgb` on every input.
     pub fn ycc_row_to_rgb(
         y: &[u8],
         cb: &[u8],
@@ -489,7 +494,268 @@ pub mod color {
         n: usize,
         layout: PixelLayout,
     ) {
-        crate::arch::scalar::color::ycc_row_to_rgb(y, cb, cr, out, n, layout)
+        debug_assert!(y.len() >= n && cb.len() >= n && cr.len() >= n);
+        debug_assert!(out.len() >= n * layout.bpp);
+        if n >= 16 && std::arch::is_x86_feature_detected!("avx2") {
+            let chunks = n / 16;
+            let bulk = chunks * 16;
+            unsafe {
+                ycc_bulk_avx2(
+                    y.as_ptr(),
+                    cb.as_ptr(),
+                    cr.as_ptr(),
+                    out.as_mut_ptr(),
+                    chunks,
+                    layout,
+                );
+            }
+            let tail = n - bulk;
+            if tail > 0 {
+                crate::arch::scalar::color::ycc_row_to_rgb(
+                    &y[bulk..],
+                    &cb[bulk..],
+                    &cr[bulk..],
+                    &mut out[bulk * layout.bpp..],
+                    tail,
+                    layout,
+                );
+            }
+        } else {
+            crate::arch::scalar::color::ycc_row_to_rgb(y, cb, cr, out, n, layout)
+        }
+    }
+
+    /// # Safety
+    /// - AVX2 must be available (caller is gated by `is_x86_feature_detected`).
+    /// - `y`, `cb`, `cr` must each be readable for at least `chunks * 16` bytes.
+    /// - `out` must be writable for at least `chunks * 16 * layout.bpp` bytes.
+    #[target_feature(enable = "avx2")]
+    unsafe fn ycc_bulk_avx2(
+        y: *const u8,
+        cb: *const u8,
+        cr: *const u8,
+        out: *mut u8,
+        chunks: usize,
+        layout: PixelLayout,
+    ) {
+        unsafe {
+            let bpp = layout.bpp;
+            for k in 0..chunks {
+                let (r, g, b) = compute_rgb_block16(y.add(k * 16), cb.add(k * 16), cr.add(k * 16));
+                let dst = out.add(k * 16 * bpp);
+                if bpp == 4 {
+                    store_block16_bpp4(r, g, b, dst, layout);
+                } else {
+                    store_block16_bpp3(r, g, b, dst, layout);
+                }
+            }
+            _mm256_zeroupper();
+        }
+    }
+
+    /// Inverse YCbCr → RGB for 16 contiguous pixels.
+    ///
+    /// Computes per-pixel:
+    /// ```text
+    ///   R = clamp(Y + ((I_CR_R * (Cr-128) + HALF) >> 16), 0, 255)
+    ///   G = clamp(Y - ((I_CB_G * (Cb-128) + I_CR_G * (Cr-128) + HALF) >> 16), 0, 255)
+    ///   B = clamp(Y + ((I_CB_B * (Cb-128) + HALF) >> 16), 0, 255)
+    /// ```
+    /// in i32 arithmetic, then saturating-packs to u8. The saturating
+    /// pack chain (`packs_epi32` → `packus_epi16`) reproduces the scalar
+    /// `clamp(0, 255)` bit-for-bit.
+    ///
+    /// Returns `(R, G, B)` as three xmm registers, each holding 16 u8
+    /// channel samples in natural pixel order.
+    ///
+    /// # Safety
+    /// - AVX2 must be enabled.
+    /// - Each input pointer must be readable for 16 bytes.
+    #[inline(always)]
+    unsafe fn compute_rgb_block16(
+        y: *const u8,
+        cb: *const u8,
+        cr: *const u8,
+    ) -> (__m128i, __m128i, __m128i) {
+        unsafe {
+            const I_CR_R: i32 = 91881;
+            const I_CB_G: i32 = 22554;
+            const I_CR_G: i32 = 46802;
+            const I_CB_B: i32 = 116130;
+            const HALF: i32 = 1 << 15;
+
+            let y_i16 = _mm256_cvtepu8_epi16(_mm_loadu_si128(y as *const __m128i));
+            let cb_i16 = _mm256_sub_epi16(
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(cb as *const __m128i)),
+                _mm256_set1_epi16(128),
+            );
+            let cr_i16 = _mm256_sub_epi16(
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(cr as *const __m128i)),
+                _mm256_set1_epi16(128),
+            );
+
+            // Split i16x16 into two i32x8 halves: lo lane (pixels 0..7)
+            // and hi lane (pixels 8..15).
+            let y_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(y_i16));
+            let y_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(y_i16));
+            let cb_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(cb_i16));
+            let cb_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(cb_i16));
+            let cr_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(cr_i16));
+            let cr_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(cr_i16));
+
+            let k_cr_r = _mm256_set1_epi32(I_CR_R);
+            let k_cb_g = _mm256_set1_epi32(I_CB_G);
+            let k_cr_g = _mm256_set1_epi32(I_CR_G);
+            let k_cb_b = _mm256_set1_epi32(I_CB_B);
+            let half = _mm256_set1_epi32(HALF);
+
+            // Cb/Cr ∈ [-128, 127] and constants fit in 18 bits, so each
+            // product fits in i32 without overflow.
+            let cr_r_lo =
+                _mm256_srai_epi32::<16>(_mm256_add_epi32(_mm256_mullo_epi32(cr_lo, k_cr_r), half));
+            let cr_r_hi =
+                _mm256_srai_epi32::<16>(_mm256_add_epi32(_mm256_mullo_epi32(cr_hi, k_cr_r), half));
+            let r_lo = _mm256_add_epi32(y_lo, cr_r_lo);
+            let r_hi = _mm256_add_epi32(y_hi, cr_r_hi);
+
+            let cb_b_lo =
+                _mm256_srai_epi32::<16>(_mm256_add_epi32(_mm256_mullo_epi32(cb_lo, k_cb_b), half));
+            let cb_b_hi =
+                _mm256_srai_epi32::<16>(_mm256_add_epi32(_mm256_mullo_epi32(cb_hi, k_cb_b), half));
+            let b_lo = _mm256_add_epi32(y_lo, cb_b_lo);
+            let b_hi = _mm256_add_epi32(y_hi, cb_b_hi);
+
+            let g_sub_lo = _mm256_srai_epi32::<16>(_mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(cb_lo, k_cb_g),
+                    _mm256_mullo_epi32(cr_lo, k_cr_g),
+                ),
+                half,
+            ));
+            let g_sub_hi = _mm256_srai_epi32::<16>(_mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(cb_hi, k_cb_g),
+                    _mm256_mullo_epi32(cr_hi, k_cr_g),
+                ),
+                half,
+            ));
+            let g_lo = _mm256_sub_epi32(y_lo, g_sub_lo);
+            let g_hi = _mm256_sub_epi32(y_hi, g_sub_hi);
+
+            // i32 → i16 with signed saturation. `packs_epi32(a, b)`
+            // interleaves per 128-bit lane:
+            //   lo128 = [a.lo4, b.lo4]   hi128 = [a.hi4, b.hi4]
+            // To restore [pixels 0..7, pixels 8..15] order we permute
+            // 64-bit lanes by 0xD8 = [0, 2, 1, 3].
+            let perm = 0b11_01_10_00;
+            let r_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(r_lo, r_hi));
+            let g_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(g_lo, g_hi));
+            let b_i16 = _mm256_permute4x64_epi64::<perm>(_mm256_packs_epi32(b_lo, b_hi));
+
+            // i16 → u8 with unsigned saturation. `packus_epi16(a, a)`
+            // collapses 16 i16 in one ymm into 16 u8 in the low 128
+            // (per-lane: lo128 of a → bytes 0..7 in lo of each 128-bit
+            // half), so we permute again.
+            let r_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(r_i16, r_i16));
+            let g_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(g_i16, g_i16));
+            let b_u8 = _mm256_permute4x64_epi64::<perm>(_mm256_packus_epi16(b_i16, b_i16));
+
+            (
+                _mm256_castsi256_si128(r_u8),
+                _mm256_castsi256_si128(g_u8),
+                _mm256_castsi256_si128(b_u8),
+            )
+        }
+    }
+
+    /// Interleave R/G/B (+ 0xFF alpha) into a 64-byte 4-bpp output for 16
+    /// pixels. The channel-to-byte mapping is derived from `layout`; only
+    /// the six bpp=4 layouts (RGBA / BGRA / ARGB / ABGR / RGBX / BGRX)
+    /// are valid here.
+    ///
+    /// # Safety
+    /// - AVX2 / SSE2 must be enabled.
+    /// - `out` must be writable for 64 bytes.
+    /// - `layout.bpp` must be 4.
+    #[inline(always)]
+    unsafe fn store_block16_bpp4(
+        r: __m128i,
+        g: __m128i,
+        b: __m128i,
+        out: *mut u8,
+        layout: PixelLayout,
+    ) {
+        unsafe {
+            let alpha = _mm_set1_epi8(0xFFu8 as i8);
+            // Pick the channel xmm that should land at byte offsets 0/1/2
+            // (and the 0xFF pad goes at the leftover offset 3 - r - g - b
+            // within the source ordering). We sort r/g/b/alpha into c0..c3
+            // such that pixel layout = [c0, c1, c2, c3].
+            let r_off = layout.r_off;
+            let g_off = layout.g_off;
+            let b_off = layout.b_off;
+            let a_off = 6 - r_off - g_off - b_off;
+            let mut slot = [alpha; 4];
+            slot[r_off] = r;
+            slot[g_off] = g;
+            slot[b_off] = b;
+            slot[a_off] = alpha;
+
+            // unpack[lo|hi]_epi8(c01, c23) gives, per byte position i in [0,16):
+            //   lo: c01[i/2] if i even, c23[i/2] if i odd? Actually
+            //   _mm_unpacklo_epi8(a, b) = [a0 b0 a1 b1 ... a7 b7]. So
+            //   pairing slot[0]/slot[1] gives [c0_0 c1_0 c0_1 c1_1 ...].
+            let c01_lo = _mm_unpacklo_epi8(slot[0], slot[1]);
+            let c01_hi = _mm_unpackhi_epi8(slot[0], slot[1]);
+            let c23_lo = _mm_unpacklo_epi8(slot[2], slot[3]);
+            let c23_hi = _mm_unpackhi_epi8(slot[2], slot[3]);
+
+            // unpack[lo|hi]_epi16 pairs the (c0,c1) bytes with (c2,c3)
+            // bytes per pixel into 4-byte groups.
+            let px_0_3 = _mm_unpacklo_epi16(c01_lo, c23_lo);
+            let px_4_7 = _mm_unpackhi_epi16(c01_lo, c23_lo);
+            let px_8_11 = _mm_unpacklo_epi16(c01_hi, c23_hi);
+            let px_12_15 = _mm_unpackhi_epi16(c01_hi, c23_hi);
+
+            _mm_storeu_si128(out as *mut __m128i, px_0_3);
+            _mm_storeu_si128(out.add(16) as *mut __m128i, px_4_7);
+            _mm_storeu_si128(out.add(32) as *mut __m128i, px_8_11);
+            _mm_storeu_si128(out.add(48) as *mut __m128i, px_12_15);
+        }
+    }
+
+    /// Interleave R/G/B into a 48-byte 3-bpp output for 16 pixels. AVX2
+    /// shines on the per-channel math; the 3-byte cross-lane interleave
+    /// is done by spilling each channel to a 16-byte stack buffer and
+    /// scalar-storing each pixel, which is simpler than the asm-style
+    /// shuffle-and-permute and still benefits from the SIMD compute.
+    ///
+    /// # Safety
+    /// - AVX2 / SSE2 must be enabled.
+    /// - `out` must be writable for 48 bytes.
+    /// - `layout.bpp` must be 3 (RGB / BGR).
+    #[inline(always)]
+    unsafe fn store_block16_bpp3(
+        r: __m128i,
+        g: __m128i,
+        b: __m128i,
+        out: *mut u8,
+        layout: PixelLayout,
+    ) {
+        unsafe {
+            let mut rb = [0u8; 16];
+            let mut gb = [0u8; 16];
+            let mut bb = [0u8; 16];
+            _mm_storeu_si128(rb.as_mut_ptr() as *mut __m128i, r);
+            _mm_storeu_si128(gb.as_mut_ptr() as *mut __m128i, g);
+            _mm_storeu_si128(bb.as_mut_ptr() as *mut __m128i, b);
+            for i in 0..16 {
+                let p = out.add(i * 3);
+                *p.add(layout.r_off) = rb[i];
+                *p.add(layout.g_off) = gb[i];
+                *p.add(layout.b_off) = bb[i];
+            }
+        }
     }
 }
 
@@ -1595,6 +1861,153 @@ mod tests {
                 scalar::quant::quantize_natural(block, &div, &mut s);
                 quant::quantize_natural(block, &div, &mut a);
                 assert_eq!(s, a, "q={q}");
+            }
+        }
+    }
+
+    // ---- ycc_row_to_rgb (decoder color) cross-check ----
+
+    fn lcg_next(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 56) as u8
+    }
+
+    fn fill_lcg(buf: &mut [u8], seed: u64) {
+        let mut s = seed;
+        for v in buf.iter_mut() {
+            *v = lcg_next(&mut s);
+        }
+    }
+
+    /// Run scalar + AVX2 for the same (y, cb, cr) inputs at `layout` and
+    /// `n`, then assert byte-identical output.
+    fn assert_ycc_match(y: &[u8], cb: &[u8], cr: &[u8], n: usize, layout: PixelLayout, tag: &str) {
+        let bpp = layout.bpp;
+        let mut out_s = vec![0u8; n * bpp];
+        let mut out_a = vec![0u8; n * bpp];
+        scalar::color::ycc_row_to_rgb(y, cb, cr, &mut out_s, n, layout);
+        color::ycc_row_to_rgb(y, cb, cr, &mut out_a, n, layout);
+        assert_eq!(out_s, out_a, "{tag} bpp={bpp}");
+    }
+
+    fn all_layouts() -> [(PixelLayout, &'static str); 8] {
+        use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, RGB, RGBA, RGBX};
+        [
+            (RGB, "RGB"),
+            (BGR, "BGR"),
+            (RGBA, "RGBA"),
+            (BGRA, "BGRA"),
+            (ARGB, "ARGB"),
+            (ABGR, "ABGR"),
+            (RGBX, "RGBX"),
+            (BGRX, "BGRX"),
+        ]
+    }
+
+    #[test]
+    fn ycc_row_to_rgb_avx2_matches_scalar_all_layouts_n16() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Random panel that exercises all u8 inputs.
+        let mut y = [0u8; 16];
+        let mut cb = [0u8; 16];
+        let mut cr = [0u8; 16];
+        fill_lcg(&mut y, 0xC0DE_0001);
+        fill_lcg(&mut cb, 0xC0DE_0002);
+        fill_lcg(&mut cr, 0xC0DE_0003);
+        for (layout, tag) in all_layouts() {
+            assert_ycc_match(&y, &cb, &cr, 16, layout, tag);
+        }
+    }
+
+    #[test]
+    fn ycc_row_to_rgb_avx2_matches_scalar_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Sweep every (y, cb_centered, cr_centered) extreme combination
+        // across a 16-pixel block. With 16 lanes we can cover the 8 corner
+        // cases of {0, 255}^3 plus 8 mid-range checks in a single block.
+        let panels: [(u8, u8, u8); 16] = [
+            (0, 0, 0),
+            (0, 0, 255),
+            (0, 255, 0),
+            (0, 255, 255),
+            (255, 0, 0),
+            (255, 0, 255),
+            (255, 255, 0),
+            (255, 255, 255),
+            (128, 128, 128),
+            (16, 128, 128),
+            (235, 128, 128),
+            (128, 16, 128),
+            (128, 240, 128),
+            (128, 128, 16),
+            (128, 128, 240),
+            (200, 50, 200),
+        ];
+        let mut y = [0u8; 16];
+        let mut cb = [0u8; 16];
+        let mut cr = [0u8; 16];
+        for (i, (yi, cbi, cri)) in panels.iter().enumerate() {
+            y[i] = *yi;
+            cb[i] = *cbi;
+            cr[i] = *cri;
+        }
+        for (layout, tag) in all_layouts() {
+            assert_ycc_match(&y, &cb, &cr, 16, layout, tag);
+        }
+    }
+
+    #[test]
+    fn ycc_row_to_rgb_avx2_matches_scalar_chroma_sweep() {
+        // Exhaustively cover every (cb, cr) ∈ [0, 256)^2. Per block we
+        // pin cb to a constant value and let cr step through a 16-value
+        // window, so 256 cb values × 16 cr windows = 4096 blocks covers
+        // all 65536 combinations. Y is given LCG jitter to keep the
+        // rounding term varied.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut y = [0u8; 16];
+        for cb_val in 0..=255u16 {
+            let cb = [cb_val as u8; 16];
+            for cr_block in 0..16u16 {
+                let mut cr = [0u8; 16];
+                for (i, v) in cr.iter_mut().enumerate() {
+                    *v = (cr_block * 16 + i as u16) as u8;
+                }
+                fill_lcg(
+                    &mut y,
+                    0xF00D_0000 ^ cb_val as u64 ^ ((cr_block as u64) << 8),
+                );
+                for (layout, tag) in all_layouts() {
+                    assert_ycc_match(&y, &cb, &cr, 16, layout, tag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ycc_row_to_rgb_avx2_matches_scalar_with_tail() {
+        // n not a multiple of 16: AVX2 handles the first 16-pixel chunks,
+        // the tail (1..15 pixels) falls through to scalar. Verify the
+        // boundary by sweeping n through {1, 7, 8, 15, 16, 17, 31, 33, 47}.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut y = [0u8; 64];
+        let mut cb = [0u8; 64];
+        let mut cr = [0u8; 64];
+        fill_lcg(&mut y, 0xBEEF_0001);
+        fill_lcg(&mut cb, 0xBEEF_0002);
+        fill_lcg(&mut cr, 0xBEEF_0003);
+        for n in [1usize, 7, 8, 15, 16, 17, 31, 32, 33, 47] {
+            for (layout, tag) in all_layouts() {
+                assert_ycc_match(&y[..n], &cb[..n], &cr[..n], n, layout, tag);
             }
         }
     }
