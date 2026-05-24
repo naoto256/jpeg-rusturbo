@@ -11,6 +11,7 @@ mod baseline;
 mod error;
 mod huffman;
 mod markers;
+mod progressive;
 
 pub use error::{DecodeError, Result};
 
@@ -47,9 +48,6 @@ impl<'a> Decoder<'a> {
         let mut reader = MarkerReader::new(src);
         let (headers, first_scan) = reader.read_to_scan()?;
         let entropy_start = reader.pos();
-        if headers.frame.progressive {
-            return Err(DecodeError::Unsupported("progressive JPEG (0.4.0 roadmap)"));
-        }
         Ok(Self {
             src,
             headers,
@@ -73,18 +71,27 @@ impl<'a> Decoder<'a> {
     pub fn decode(self, format: PixelFormat) -> Result<Vec<u8>> {
         let layout: PixelLayout = format.into();
 
-        let (dc_tables, ac_tables) = baseline::build_huffman_tables(&self.headers.huffman)?;
-        let qt_by_id = baseline::index_quant_tables(&self.headers.quant);
-
-        let (planes, _br) = baseline::decode_baseline_scan(
-            self.src,
-            self.entropy_start,
-            &self.headers,
-            &self.first_scan,
-            &dc_tables,
-            &ac_tables,
-            &qt_by_id,
-        )?;
+        let planes = if self.headers.frame.progressive {
+            progressive::decode_progressive(
+                self.src,
+                self.entropy_start,
+                &self.headers,
+                self.first_scan,
+            )?
+        } else {
+            let (dc_tables, ac_tables) = baseline::build_huffman_tables(&self.headers.huffman)?;
+            let qt_by_id = baseline::index_quant_tables(&self.headers.quant);
+            let (planes, _br) = baseline::decode_baseline_scan(
+                self.src,
+                self.entropy_start,
+                &self.headers,
+                &self.first_scan,
+                &dc_tables,
+                &ac_tables,
+                &qt_by_id,
+            )?;
+            planes
+        };
 
         compose_output(&planes, &self.headers, layout)
     }
@@ -182,11 +189,16 @@ fn compose_output(
 }
 
 /// Copy `width` bytes from `plane.samples` row `j` into `dst`.
+/// Out-of-range `j` (e.g. when the component has been vertically
+/// downsampled below the output height — non-conventional sampling
+/// layouts where Y is not the highest-sampled component) is clamped to
+/// the last available row; fancy upsample will address this properly in
+/// the 0.4.0 chroma-upsample refactor.
 fn copy_plane_row(plane: &DecodedPlane, j: usize, dst: &mut [u8], width: usize) {
+    let j = j.min(plane.plane_height.saturating_sub(1));
     let off = j * plane.stride;
     let take = width.min(plane.plane_width);
     dst[..take].copy_from_slice(&plane.samples[off..off + take]);
-    // Fill any tail (in case width > plane_width — unusual).
     if take < width {
         let last = dst[take - 1];
         dst[take..width].fill(last);

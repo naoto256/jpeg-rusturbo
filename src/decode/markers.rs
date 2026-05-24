@@ -141,6 +141,15 @@ impl<'a> MarkerReader<'a> {
         Self { buf, pos: 0 }
     }
 
+    /// Resume parsing at byte offset `pos`. Used by the progressive
+    /// decoder: after a scan finishes the bit-reader leaves the cursor
+    /// immediately past the marker that terminated entropy data, and we
+    /// need a fresh `MarkerReader` to walk any intervening DHT/DQT/DRI
+    /// segments before the next SOS.
+    pub fn resume_at(buf: &'a [u8], pos: usize) -> Self {
+        Self { buf, pos }
+    }
+
     /// Current byte position, useful when handing off to the entropy
     /// decoder mid-stream.
     pub fn pos(&self) -> usize {
@@ -263,6 +272,63 @@ impl<'a> MarkerReader<'a> {
         }
     }
 
+    /// Walk markers between two progressive scans, returning either the
+    /// next [`ScanHeader`] (SOS reached) or `None` (EOI reached). Updates
+    /// any intervening DHT / DQT / DRI segments in-place so the caller
+    /// can rebuild its Huffman / quantization tables before the next
+    /// scan runs.
+    ///
+    /// `pending_marker` lets the caller pass in a marker that was
+    /// already consumed by the entropy decoder (the BitReader pulls
+    /// `0xFF <id>` off the byte stream when it spots a non-RST marker,
+    /// so the marker prefix is gone before this reader picks up).
+    pub fn next_scan_or_end(
+        &mut self,
+        frame: &FrameHeader,
+        huffman: &mut Vec<HuffmanTableSpec>,
+        quant: &mut Vec<QuantTable>,
+        restart_interval: &mut u16,
+        pending_marker: Option<u8>,
+    ) -> Result<Option<ScanHeader>> {
+        let mut next = pending_marker;
+        loop {
+            let marker = match next.take() {
+                Some(m) => m,
+                None => self.read_marker()?,
+            };
+            match marker {
+                M_SOS => return Ok(Some(self.parse_sos(frame)?)),
+                M_EOI => return Ok(None),
+                M_DHT => self.parse_dht(huffman)?,
+                M_DQT => self.parse_dqt(quant)?,
+                M_DRI => {
+                    let len = self.read_u16()?;
+                    if len != 4 {
+                        return Err(DecodeError::Malformed("bad DRI length"));
+                    }
+                    *restart_interval = self.read_u16()?;
+                }
+                M_COM | 0xE0..=0xEF => {
+                    let len = self.read_u16()?;
+                    if len < 2 {
+                        return Err(DecodeError::Malformed("bad segment length"));
+                    }
+                    self.read_slice(len as usize - 2)?;
+                }
+                M_SOF0 | M_SOF2 | 0xC1 | 0xC3..=0xC7 | 0xC9..=0xCF => {
+                    return Err(DecodeError::Malformed("unexpected SOF between scans"));
+                }
+                _ => {
+                    let len = self.read_u16()?;
+                    if len < 2 {
+                        return Err(DecodeError::Malformed("bad unknown segment length"));
+                    }
+                    self.read_slice(len as usize - 2)?;
+                }
+            }
+        }
+    }
+
     fn parse_sof(&mut self, progressive: bool) -> Result<FrameHeader> {
         let len = self.read_u16()? as usize;
         if len < 8 {
@@ -311,6 +377,17 @@ impl<'a> MarkerReader<'a> {
             }
             components.push(Component { id, h, v, qt });
         }
+        // T.81 A.2.2 — for single-component scans the MCU is exactly
+        // one data unit regardless of the declared H/V sampling factors.
+        // Encoders that produce single-component frames with H=V=2 (some
+        // grayscale tools do this for legacy reasons) would otherwise
+        // confuse downstream block-grid sizing. Normalize to H=V=1 so
+        // the per-component grid matches the decoded block count.
+        if components.len() == 1 {
+            components[0].h = 1;
+            components[0].v = 1;
+        }
+
         Ok(FrameHeader {
             precision,
             height,

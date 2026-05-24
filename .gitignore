@@ -7,3 +7,12 @@ Cargo.lock
 
 # Local audit receipts (operator-internal, see code-audit skill).
 .audit/
+
+# Local development scaffolding (gitignored corpora, scratch experiments,
+# ad-hoc benchmarks). Anything under .scratch/ is operator-only and never
+# committed; release-candidate fixtures go under tests/fixtures/ instead.
+.scratch/
+# Ad-hoc test harness files that live in tests/ for cargo integration but
+# are operator-only iteration tools (gated #[ignore], not part of any
+# release).
+tests/_scratch_*.rs
