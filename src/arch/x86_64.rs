@@ -1279,6 +1279,113 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // -----------------------------------------------------------------
+    // IDCT cross-checks: every byte of the AVX2 output must match the
+    // scalar reference for the full input set we care about (DC-only,
+    // single AC impulses, ramp, random natural-image-shaped blocks,
+    // and saturation extremes).
+    // -----------------------------------------------------------------
+
+    fn run_idct_cross(coef: &[i16; 64]) {
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        scalar::dct::idct_islow(coef, &mut a);
+        dct::idct_islow(coef, &mut b);
+        assert_eq!(a, b, "AVX2 IDCT diverges from scalar for input {coef:?}");
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_zeros() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        run_idct_cross(&[0i16; 64]);
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_dc_only() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Span DC across both signs and a few typical magnitudes.
+        for dc in [-2048i16, -256, -1, 0, 1, 256, 2047] {
+            let mut block = [0i16; 64];
+            block[0] = dc;
+            run_idct_cross(&block);
+        }
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_ac_impulses() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Place a unit and a large impulse at every AC position. This
+        // exercises every coefficient lane in every column / row pair.
+        for k in 1..64 {
+            for &mag in &[1i16, -1, 256, -256, 1024, -1024] {
+                let mut block = [0i16; 64];
+                block[k] = mag;
+                run_idct_cross(&block);
+            }
+        }
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_ramp() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut block = [0i16; 64];
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = (i as i16) * 8 - 256;
+        }
+        run_idct_cross(&block);
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_random() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // 100 natural-image-shaped blocks (i.e. dequantized coefficient
+        // magnitudes that drop off with frequency).
+        for seed in 0..100u64 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut block = [0i16; 64];
+            for k in 0..64 {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (s >> 32) as i32;
+                let scale = (1024i32 >> (k / 8)).max(1);
+                block[k] = (r % (scale * 2 + 1) - scale) as i16;
+            }
+            run_idct_cross(&block);
+        }
+    }
+
+    #[test]
+    fn idct_avx2_matches_scalar_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Full i16 saturation pattern — well outside the JPEG-valid
+        // dequant range, but the asm's late-saturating pack should still
+        // collapse to the same clamped output as scalar.
+        let mut block = [0i16; 64];
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { i16::MAX } else { i16::MIN };
+        }
+        run_idct_cross(&block);
+
+        // Alternating ±large within typical dequant range too.
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 4096 } else { -4096 };
+        }
+        run_idct_cross(&block);
+    }
+
     #[test]
     fn h2v2_downsample_avx2_matches_scalar_random() {
         if !std::arch::is_x86_feature_detected!("avx2") {
