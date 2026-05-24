@@ -125,11 +125,23 @@ fn baseline_420_odd_size_17x17() {
     );
 }
 
-// Note: `partial_progressive.jpg` is also vendored but isn't asserted
-// here — it's an intentionally truncated stream that `image` decodes
-// leniently and we reject as malformed. The tolerant-marker recovery
-// work (separate task) will revisit it; for now it sits in the corpus
-// as a future test target.
+/// `partial_progressive.jpg` carries 18 bytes of stray padding between
+/// the last DHT and the final SOS — typical of encoders that leave
+/// trailing junk in intermediate progressive output. Both image and
+/// our decoder skip the padding via tolerant `read_marker`. At 4x4 the
+/// fancy-upsample edge handling diverges by ≤ 8/channel from image's
+/// (16 pixels total, every one of them is an edge); the looser bound
+/// just acknowledges that, the key assertion is "we decode it at all".
+#[test]
+fn progressive_444_partial_4x4_with_stray_bytes() {
+    assert_decode_agrees(
+        "tests/fixtures/progressive/partial_progressive.jpg",
+        Thresholds {
+            max_diff: 8,
+            min_psnr: 30.0,
+        },
+    );
+}
 
 #[test]
 fn progressive_444_medium_650x470() {

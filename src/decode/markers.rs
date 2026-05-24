@@ -188,21 +188,34 @@ impl<'a> MarkerReader<'a> {
 
     /// Read the next marker code: skip any 0xFF fill bytes (T.81 B.1.1.2),
     /// then expect a non-0x00, non-0xFF byte as the marker id.
+    ///
+    /// Tolerant variant: stray bytes between segments (some encoders leave
+    /// trailing padding or junk between SOS / DHT / EOI; see e.g.
+    /// `partial_progressive.jpg` in our test corpus) are silently skipped
+    /// until the next `0xFF` is found. Most other decoders (libjpeg-turbo,
+    /// zune-jpeg) behave the same way; without this we'd reject streams
+    /// the rest of the ecosystem reads fine.
     fn read_marker(&mut self) -> Result<u8> {
-        // Skip fill 0xFF bytes (T.81 B.1.1.2 allows any number of them).
-        let first = self.read_u8()?;
-        if first != 0xFF {
-            return Err(DecodeError::Malformed("expected 0xFF marker prefix"));
+        // Skip non-0xFF garbage until the next marker prefix or EOF.
+        while self.pos < self.buf.len() && self.buf[self.pos] != 0xFF {
+            self.pos += 1;
         }
-        loop {
-            let m = self.read_u8()?;
-            if m != 0xFF {
-                if m == 0x00 {
-                    return Err(DecodeError::Malformed("stray 0xFF 0x00 outside scan"));
-                }
-                return Ok(m);
-            }
+        if self.pos >= self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
         }
+        // Consume the 0xFF and any 0xFF fill bytes that follow.
+        while self.pos < self.buf.len() && self.buf[self.pos] == 0xFF {
+            self.pos += 1;
+        }
+        if self.pos >= self.buf.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let m = self.buf[self.pos];
+        self.pos += 1;
+        if m == 0x00 {
+            return Err(DecodeError::Malformed("stray 0xFF 0x00 outside scan"));
+        }
+        Ok(m)
     }
 
     /// Read header markers up to and including SOS, returning the
