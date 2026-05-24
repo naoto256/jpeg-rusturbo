@@ -275,7 +275,19 @@ pub mod color {
         crate::arch::scalar::color::h2v1_upsample(src, dst)
     }
 
-    /// Per-row YCbCr → RGB(A) converter.
+    /// Fixed-point constants for the inverse color transform, identical
+    /// to the ones in `arch::scalar::color::ycc_row_to_rgb`. They do not
+    /// fit in `i16`, so the NEON code lifts intermediates to `s32` lanes
+    /// and uses `vmulq_n_s32` / `vmlaq_n_s32`.
+    const I_CR_R: i32 = 91881; // 1.40200 << 16
+    const I_CB_G: i32 = 22554; // 0.34414 << 16
+    const I_CR_G: i32 = 46802; // 0.71414 << 16
+    const I_CB_B: i32 = 116130; // 1.77200 << 16
+    const ICC_HALF: i32 = 1 << 15;
+
+    /// Per-row YCbCr → RGB(A) converter. Processes 16-pixel chunks via
+    /// NEON; any tail (`n % 16`) falls back to the scalar reference.
+    /// Bit-exact equivalent to `arch::scalar::color::ycc_row_to_rgb`.
     pub fn ycc_row_to_rgb(
         y: &[u8],
         cb: &[u8],
@@ -284,7 +296,170 @@ pub mod color {
         n: usize,
         layout: PixelLayout,
     ) {
-        crate::arch::scalar::color::ycc_row_to_rgb(y, cb, cr, out, n, layout)
+        debug_assert!(y.len() >= n && cb.len() >= n && cr.len() >= n);
+        debug_assert!(out.len() >= n * layout.bpp);
+
+        let chunks = n / 16;
+        let main = chunks * 16;
+        if chunks > 0 {
+            unsafe {
+                ycc_row_main_inner(
+                    y.as_ptr(),
+                    cb.as_ptr(),
+                    cr.as_ptr(),
+                    out.as_mut_ptr(),
+                    chunks,
+                    layout,
+                );
+            }
+        }
+        let tail = n - main;
+        if tail > 0 {
+            crate::arch::scalar::color::ycc_row_to_rgb(
+                &y[main..],
+                &cb[main..],
+                &cr[main..],
+                &mut out[main * layout.bpp..],
+                tail,
+                layout,
+            );
+        }
+    }
+
+    /// Compute R, G, B for one s32x4 batch (4 pixels). `cb_s32` /
+    /// `cr_s32` are already `(input - 128)` lifted to s32 lanes.
+    #[target_feature(enable = "neon")]
+    unsafe fn batch_rgb(
+        y_s32: int32x4_t,
+        cb_s32: int32x4_t,
+        cr_s32: int32x4_t,
+        half: int32x4_t,
+    ) -> (int32x4_t, int32x4_t, int32x4_t) {
+        let r_diff = vshrq_n_s32::<16>(vaddq_s32(vmulq_n_s32(cr_s32, I_CR_R), half));
+        let b_diff = vshrq_n_s32::<16>(vaddq_s32(vmulq_n_s32(cb_s32, I_CB_B), half));
+        let g_acc = vmlaq_n_s32(vmulq_n_s32(cb_s32, I_CB_G), cr_s32, I_CR_G);
+        let g_diff = vshrq_n_s32::<16>(vaddq_s32(g_acc, half));
+        (
+            vaddq_s32(y_s32, r_diff),
+            vsubq_s32(y_s32, g_diff),
+            vaddq_s32(y_s32, b_diff),
+        )
+    }
+
+    /// Widen an s16x8 vector to two s32x4 vectors (low / high halves).
+    #[target_feature(enable = "neon")]
+    unsafe fn widen_s16x8(v: int16x8_t) -> (int32x4_t, int32x4_t) {
+        (vmovl_s16(vget_low_s16(v)), vmovl_s16(vget_high_s16(v)))
+    }
+
+    /// Pack four s32x4 RGB components (16 pixels) into one u8x16 channel,
+    /// saturating-clamp to `[0, 255]`. The intermediate s32 lanes lie in
+    /// ~`[-180, 435]`, comfortably inside s16 range, so the narrow to
+    /// s16 cannot overflow; the final `vqmovun_s16` clamps to `[0, 255]`.
+    #[target_feature(enable = "neon")]
+    unsafe fn pack_channel_u8(
+        a: int32x4_t,
+        b: int32x4_t,
+        c: int32x4_t,
+        d: int32x4_t,
+    ) -> uint8x16_t {
+        let lo = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+        let hi = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        vcombine_u8(vqmovun_s16(lo), vqmovun_s16(hi))
+    }
+
+    /// # Safety
+    /// - `y_ptr`, `cb_ptr`, `cr_ptr` must each be readable for `chunks * 16` bytes.
+    /// - `out_ptr` must be writable for `chunks * 16 * layout.bpp` bytes.
+    /// - `layout.bpp` must be 3 or 4.
+    /// - `target_arch = "aarch64"` guarantees NEON is available.
+    #[target_feature(enable = "neon")]
+    unsafe fn ycc_row_main_inner(
+        y_ptr: *const u8,
+        cb_ptr: *const u8,
+        cr_ptr: *const u8,
+        out_ptr: *mut u8,
+        chunks: usize,
+        layout: PixelLayout,
+    ) {
+        unsafe {
+            let half = vdupq_n_s32(ICC_HALF);
+            let level_shift = vdupq_n_s16(128);
+            let bpp = layout.bpp;
+
+            for k in 0..chunks {
+                let y8 = vld1q_u8(y_ptr.add(k * 16));
+                let cb8 = vld1q_u8(cb_ptr.add(k * 16));
+                let cr8 = vld1q_u8(cr_ptr.add(k * 16));
+
+                // u8 → s16 (8 lanes each, low / high halves).
+                let y_l = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(y8)));
+                let y_h = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(y8)));
+                let cb_l = vsubq_s16(
+                    vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(cb8))),
+                    level_shift,
+                );
+                let cb_h = vsubq_s16(
+                    vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(cb8))),
+                    level_shift,
+                );
+                let cr_l = vsubq_s16(
+                    vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(cr8))),
+                    level_shift,
+                );
+                let cr_h = vsubq_s16(
+                    vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(cr8))),
+                    level_shift,
+                );
+
+                // Widen each s16x8 to two s32x4 (4 sub-batches × 4 lanes = 16 pixels).
+                let (y0, y1) = widen_s16x8(y_l);
+                let (y2, y3) = widen_s16x8(y_h);
+                let (cb0, cb1) = widen_s16x8(cb_l);
+                let (cb2, cb3) = widen_s16x8(cb_h);
+                let (cr0, cr1) = widen_s16x8(cr_l);
+                let (cr2, cr3) = widen_s16x8(cr_h);
+
+                let (r0, g0, b0) = batch_rgb(y0, cb0, cr0, half);
+                let (r1, g1, b1) = batch_rgb(y1, cb1, cr1, half);
+                let (r2, g2, b2) = batch_rgb(y2, cb2, cr2, half);
+                let (r3, g3, b3) = batch_rgb(y3, cb3, cr3, half);
+
+                let r = pack_channel_u8(r0, r1, r2, r3);
+                let g = pack_channel_u8(g0, g1, g2, g3);
+                let b = pack_channel_u8(b0, b1, b2, b3);
+
+                let dst = out_ptr.add(k * 16 * bpp);
+                if bpp == 3 {
+                    // RGB (r_off=0) or BGR (r_off=2).
+                    let triple = if layout.r_off == 0 {
+                        uint8x16x3_t(r, g, b)
+                    } else {
+                        uint8x16x3_t(b, g, r)
+                    };
+                    vst3q_u8(dst, triple);
+                } else {
+                    let alpha = vdupq_n_u8(0xFF);
+                    // Channel order in the stored 4-tuple is determined by
+                    // (r_off, g_off, b_off, a_off) where a_off is the
+                    // remaining index in {0,1,2,3}.
+                    let a_off = 6 - layout.r_off - layout.g_off - layout.b_off;
+                    let mut ch = [r, g, b, alpha];
+                    // Re-order ch so that ch[i] is the channel for output byte i.
+                    let mut out_order = [alpha; 4];
+                    out_order[layout.r_off] = ch[0];
+                    out_order[layout.g_off] = ch[1];
+                    out_order[layout.b_off] = ch[2];
+                    out_order[a_off] = ch[3];
+                    // `ch` consumed; silence unused-mut.
+                    let _ = &mut ch;
+                    vst4q_u8(
+                        dst,
+                        uint8x16x4_t(out_order[0], out_order[1], out_order[2], out_order[3]),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1289,7 +1464,7 @@ pub mod huffman {
 mod tests {
     use super::*;
     use crate::arch::scalar;
-    use crate::color::RGBA;
+    use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, PixelLayout, RGB, RGBA, RGBX};
 
     fn random_block(seed: u64) -> [i16; 64] {
         let mut s = seed
@@ -1303,6 +1478,98 @@ mod tests {
             *v = ((s >> 33) as i32 % 256 - 128) as i16;
         }
         b
+    }
+
+    fn ycc_xcheck_layout(layout: PixelLayout, n: usize, seed: u64) {
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        let mut y = vec![0u8; n];
+        let mut cb = vec![0u8; n];
+        let mut cr = vec![0u8; n];
+        for i in 0..n {
+            y[i] = next();
+            cb[i] = next();
+            cr[i] = next();
+        }
+        let mut out_s = vec![0u8; n * layout.bpp];
+        let mut out_n = vec![0u8; n * layout.bpp];
+        scalar::color::ycc_row_to_rgb(&y, &cb, &cr, &mut out_s, n, layout);
+        color::ycc_row_to_rgb(&y, &cb, &cr, &mut out_n, n, layout);
+        assert_eq!(out_s, out_n, "layout={:?} n={n} seed={seed}", layout);
+    }
+
+    #[test]
+    fn ycc_neon_matches_scalar_all_layouts() {
+        // Edge values + multi-chunk: tail handling, boundary samples,
+        // and the eight pixel layouts.
+        for &layout in &[RGB, BGR, RGBA, BGRA, ARGB, ABGR, RGBX, BGRX] {
+            for &n in &[1usize, 7, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 100] {
+                for seed in 0..3u64 {
+                    ycc_xcheck_layout(layout, n, seed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ycc_neon_matches_scalar_extremes() {
+        // Saturation: pure-black, pure-white, and the corners of Cb/Cr.
+        for &layout in &[RGB, BGRA, ARGB, RGBX] {
+            for n in [16usize, 17, 32, 47] {
+                let y = vec![0u8; n];
+                let cb = vec![0u8; n];
+                let cr = vec![255u8; n];
+                let mut a = vec![0u8; n * layout.bpp];
+                let mut b = vec![0u8; n * layout.bpp];
+                scalar::color::ycc_row_to_rgb(&y, &cb, &cr, &mut a, n, layout);
+                color::ycc_row_to_rgb(&y, &cb, &cr, &mut b, n, layout);
+                assert_eq!(a, b, "extreme y=0,cb=0,cr=255 layout={:?} n={n}", layout);
+
+                let y = vec![255u8; n];
+                let cb = vec![255u8; n];
+                let cr = vec![0u8; n];
+                scalar::color::ycc_row_to_rgb(&y, &cb, &cr, &mut a, n, layout);
+                color::ycc_row_to_rgb(&y, &cb, &cr, &mut b, n, layout);
+                assert_eq!(a, b, "extreme y=255,cb=255,cr=0 layout={:?} n={n}", layout);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel micro-bench, run with --ignored --nocapture"]
+    fn ycc_neon_micro_bench() {
+        use std::time::Instant;
+        let n = 16 * 256;
+        let iters = 100_000;
+        let y: Vec<u8> = (0..n).map(|i| (i * 37 % 256) as u8).collect();
+        let cb: Vec<u8> = (0..n).map(|i| (i * 71 % 256) as u8).collect();
+        let cr: Vec<u8> = (0..n).map(|i| (i * 113 % 256) as u8).collect();
+        let mut out = vec![0u8; n * 4];
+        let t = Instant::now();
+        for _ in 0..iters {
+            scalar::color::ycc_row_to_rgb(&y, &cb, &cr, &mut out, n, RGBA);
+            std::hint::black_box(&out);
+        }
+        let s = t.elapsed().as_nanos() as f64 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            color::ycc_row_to_rgb(&y, &cb, &cr, &mut out, n, RGBA);
+            std::hint::black_box(&out);
+        }
+        let nv = t.elapsed().as_nanos() as f64 / iters as f64;
+        println!(
+            "  ycc_row_to_rgb n={n}: scalar={:.2}us neon={:.2}us speedup={:.2}x",
+            s / 1000.0,
+            nv / 1000.0,
+            s / nv
+        );
     }
 
     #[test]
