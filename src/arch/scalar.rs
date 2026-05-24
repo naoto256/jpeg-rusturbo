@@ -334,6 +334,11 @@ pub mod dct {
     /// Pass 1 processes columns into a scaled i32 workspace; pass 2
     /// processes rows from the workspace, descales, level-shifts by
     /// +128, and clamps to `[0, 255]`.
+    ///
+    /// The i32 workspace makes this implementation safe for any `i16`
+    /// input, including adversarial values that would overflow the i16
+    /// workspace used by the NEON port. Build with `--features
+    /// force-scalar` if you need that guarantee on aarch64.
     pub fn idct_islow(coef: &[i16; 64], output: &mut [u8; 64]) {
         let mut ws = [0i32; 64];
 
