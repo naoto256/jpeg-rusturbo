@@ -1199,4 +1199,68 @@ mod tests {
         );
     }
 
+    fn idct_xcheck(coef: &[i16; 64], tag: &str) {
+        let mut s = [0u8; 64];
+        let mut n = [0u8; 64];
+        scalar::dct::idct_islow(coef, &mut s);
+        dct::idct_islow(coef, &mut n);
+        assert_eq!(s, n, "{tag}");
+    }
+
+    #[test]
+    fn idct_neon_matches_scalar_zeros() {
+        idct_xcheck(&[0i16; 64], "zeros");
+    }
+
+    #[test]
+    fn idct_neon_matches_scalar_dc_only() {
+        // DC = +1024 should reconstruct to a flat 128 block after the
+        // level shift; DC = -1024 to a flat 0 block; DC = i16::MAX must
+        // saturate at 255 without wrapping (exercises the vqmovun chain).
+        for &dc in &[1024i16, -1024, 2040, -2040, i16::MAX, i16::MIN, 8, -8] {
+            let mut coef = [0i16; 64];
+            coef[0] = dc;
+            idct_xcheck(&coef, &format!("dc={dc}"));
+        }
+    }
+
+    #[test]
+    fn idct_neon_matches_scalar_ac_impulse() {
+        // One AC coefficient at a time, magnitude swept through small
+        // and large values. Hits every odd / even part butterfly path.
+        for k in 1..64 {
+            for &m in &[1i16, -1, 17, -17, 256, -256, 2048, -2048] {
+                let mut coef = [0i16; 64];
+                coef[k] = m;
+                idct_xcheck(&coef, &format!("k={k} m={m}"));
+            }
+        }
+    }
+
+    #[test]
+    fn idct_neon_matches_scalar_natural() {
+        // Round-trip a forward-DCT'd natural-looking block: ramp plus
+        // mild noise, then idct. Models the realistic decoder input
+        // distribution (small AC, modest DC).
+        for seed in 0..100u64 {
+            let mut block = random_block(seed);
+            // Reduce magnitude so post-FDCT values stay decoder-realistic.
+            for v in block.iter_mut() {
+                *v = (*v / 4).saturating_add(if seed.is_multiple_of(3) { 32 } else { 0 });
+            }
+            // FDCT in place to get a coef-shaped distribution.
+            scalar::dct::fdct_islow(&mut block);
+            idct_xcheck(&block, &format!("natural seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn idct_neon_matches_scalar_extreme_ramp() {
+        // Stress saturation paths in pass-2 finalize.
+        let mut coef = [0i16; 64];
+        for (i, v) in coef.iter_mut().enumerate() {
+            *v = ((i as i32 * 173) % 4001 - 2000) as i16;
+        }
+        idct_xcheck(&coef, "extreme ramp");
+    }
 }
