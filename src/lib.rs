@@ -332,7 +332,7 @@ impl<W: Write> JpegEncoder<W> {
     ///
     /// When set, `set_quality()` is bypassed entirely — the supplied
     /// tables go through verbatim. To recover the default behavior
-    /// (Annex K + quality scaling) call [`clear_quant_tables`].
+    /// (Annex K + quality scaling) call [`Self::clear_quant_tables`].
     ///
     /// Each entry must be in `1..=255` (a zero quantizer divides DCT
     /// coefficients by zero and is rejected by every conforming
@@ -346,7 +346,7 @@ impl<W: Write> JpegEncoder<W> {
     }
 
     /// Clear any custom quantization tables previously installed via
-    /// [`set_quant_tables`]; subsequent encodes use the Annex K +
+    /// [`Self::set_quant_tables`]; subsequent encodes use the Annex K +
     /// quality-scaled defaults again.
     pub fn clear_quant_tables(&mut self) {
         self.custom_quant = None;
