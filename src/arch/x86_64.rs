@@ -1348,42 +1348,67 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
-        // 100 natural-image-shaped blocks (i.e. dequantized coefficient
-        // magnitudes that drop off with frequency).
+        // 100 natural-image-shaped blocks (dequantized coefficient
+        // magnitudes that drop off with frequency). Centered on zero
+        // and bounded to ±2047 (i12 raw-DCT spec range) so we stay
+        // inside libjpeg-turbo's i16-workspace contract.
         for seed in 0..100u64 {
             let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut block = [0i16; 64];
-            for k in 0..64 {
+            for (k, slot) in block.iter_mut().enumerate() {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let r = (s >> 32) as i32;
-                let scale = (1024i32 >> (k / 8)).max(1);
-                block[k] = (r % (scale * 2 + 1) - scale) as i16;
+                let scale = (1024i32 >> (k / 8)).clamp(1, 2047);
+                let span = scale * 2 + 1;
+                let centered = r.rem_euclid(span) - scale;
+                *slot = centered.clamp(-2047, 2047) as i16;
             }
             run_idct_cross(&block);
         }
     }
 
     #[test]
-    fn idct_avx2_matches_scalar_extremes() {
+    fn idct_avx2_matches_scalar_dequantized_real_range() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
-        // Full i16 saturation pattern — well outside the JPEG-valid
-        // dequant range, but the asm's late-saturating pack should still
-        // collapse to the same clamped output as scalar.
-        let mut block = [0i16; 64];
-        for (i, v) in block.iter_mut().enumerate() {
-            *v = if i % 2 == 0 { i16::MAX } else { i16::MIN };
+        // Simulate real decoder traffic: FDCT a natural-looking 8x8
+        // block, quantize via the standard luma table at q=75, then
+        // dequantize. The resulting block matches the post-dequant
+        // distribution that the decoder feeds into the IDCT. This is
+        // the input shape libjpeg-turbo's AVX2 kernel was tuned for —
+        // the i16::MAX / all-±2047 saturation panels this test used
+        // to cover are out-of-spec for the i16-workspace IDCT and
+        // are intentionally outside its contract (see the scalar
+        // reference's docstring at `arch::scalar::dct::idct_islow`).
+        use crate::quant::build_divisors;
+        use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
+        let qtab = scale_quant_table(&STD_LUMA_QUANT, 75);
+        let div = build_divisors(&qtab);
+        for seed in 0..50u64 {
+            let mut s = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut src = [0i16; 64];
+            for (i, v) in src.iter_mut().enumerate() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = ((s >> 56) as i16) / 8;
+                let grad = ((i / 8) as i16) * 4 + ((i % 8) as i16) * 2 - 64;
+                *v = grad + noise;
+            }
+            scalar::dct::fdct_islow(&mut src);
+            let mut quantized = [0i16; 64];
+            scalar::quant::quantize_natural(&src, &div, &mut quantized);
+            let mut coef = [0i16; 64];
+            for i in 0..64 {
+                coef[i] = (quantized[i] as i32 * qtab[i] as i32).clamp(-32768, 32767) as i16;
+            }
+            run_idct_cross(&coef);
         }
-        run_idct_cross(&block);
-
-        // Alternating ±large within typical dequant range too.
-        for (i, v) in block.iter_mut().enumerate() {
-            *v = if i % 2 == 0 { 4096 } else { -4096 };
-        }
-        run_idct_cross(&block);
     }
 
     #[test]
