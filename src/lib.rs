@@ -200,6 +200,36 @@ impl From<PixelFormat> for PixelLayout {
     }
 }
 
+/// Run-time `ChromaSubsampling` enum → static `SamplingScheme` type
+/// dispatch. The trait is consumed by generic functions
+/// (`encode_scan<S>`, `encode_optimized<S>`, `parallel_quantize_rows<S>`
+/// etc.) which monomorphize per scheme; this macro routes the runtime
+/// enum to the right monomorphization in a single place per call site.
+///
+/// `$S` is bound as a type alias to the matched scheme inside the body,
+/// so callers write `S::H_V` / `encode_optimized::<S, _>(...)` once and
+/// the macro expands the match. Adding a new variant requires editing
+/// only this macro plus the `enum ChromaSubsampling` declaration —
+/// every other call site keeps working without modification.
+macro_rules! dispatch_scheme {
+    ($subsampling:expr, $S:ident => $body:expr) => {
+        match $subsampling {
+            ChromaSubsampling::Yuv444 => {
+                type $S = Yuv444Scheme;
+                $body
+            }
+            ChromaSubsampling::Yuv422 => {
+                type $S = Yuv422Scheme;
+                $body
+            }
+            ChromaSubsampling::Yuv420 => {
+                type $S = Yuv420Scheme;
+                $body
+            }
+        }
+    };
+}
+
 /// JPEG encoder over an arbitrary [`Write`] sink.
 ///
 /// Public API mirrors [`image::codecs::jpeg::JpegEncoder`] so call
@@ -477,11 +507,7 @@ impl<W: Write> JpegEncoder<W> {
         markers::write_dqt(&mut self.out, 0, &luma_q)?;
         markers::write_dqt(&mut self.out, 1, &chroma_q)?;
 
-        let (h_y, v_y) = match self.subsampling {
-            ChromaSubsampling::Yuv444 => Yuv444Scheme::H_V,
-            ChromaSubsampling::Yuv422 => Yuv422Scheme::H_V,
-            ChromaSubsampling::Yuv420 => Yuv420Scheme::H_V,
-        };
+        let (h_y, v_y) = dispatch_scheme!(self.subsampling, S => S::H_V);
         markers::write_sof0(
             &mut self.out,
             width as u16,
@@ -567,17 +593,9 @@ impl<W: Write> JpegEncoder<W> {
                 scale_quant_table(&STD_CHROMA_QUANT, self.quality),
             ),
         };
-        match self.subsampling {
-            ChromaSubsampling::Yuv444 => encode_optimized::<Yuv444Scheme, _>(
-                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
-            ),
-            ChromaSubsampling::Yuv422 => encode_optimized::<Yuv422Scheme, _>(
-                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
-            ),
-            ChromaSubsampling::Yuv420 => encode_optimized::<Yuv420Scheme, _>(
-                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
-            ),
-        }
+        dispatch_scheme!(self.subsampling, S => encode_optimized::<S, _>(
+            self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
+        ))
     }
 }
 
@@ -771,7 +789,7 @@ struct DcPredictors {
 ///
 /// Each impl owns its MCU geometry and the per-MCU encode work — the
 /// generic `encode_scan` below just iterates MCUs and forwards. Adding a
-/// new scheme is "impl this trait + add a variant + add two match arms",
+/// new scheme is "impl this trait + add a variant + register here",
 /// no scan-level surgery required (Rule of Three: prep work at 2 instances).
 trait SamplingScheme {
     /// `(h_factor, v_factor)` for the Y component in SOF0. Cb/Cr are
@@ -1260,115 +1278,42 @@ fn dispatch_scan<W: Write>(
     restart_interval: u16,
 ) -> io::Result<()> {
     if threads == 1 {
-        return match subsampling {
-            ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                bw,
-                div_luma,
-                div_chroma,
-                dc_luma,
-                ac_luma,
-                dc_chroma,
-                ac_chroma,
-                restart_interval,
-            ),
-            ChromaSubsampling::Yuv422 => encode_scan::<Yuv422Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                bw,
-                div_luma,
-                div_chroma,
-                dc_luma,
-                ac_luma,
-                dc_chroma,
-                ac_chroma,
-                restart_interval,
-            ),
-            ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
-                pixels,
-                width,
-                height,
-                layout,
-                bw,
-                div_luma,
-                div_chroma,
-                dc_luma,
-                ac_luma,
-                dc_chroma,
-                ac_chroma,
-                restart_interval,
-            ),
-        };
+        return dispatch_scheme!(subsampling, S => encode_scan::<S, _>(
+            pixels,
+            width,
+            height,
+            layout,
+            bw,
+            div_luma,
+            div_chroma,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        ));
     }
 
     // Front half on the chosen pool, back half always on the caller's
     // thread. This keeps the parallel work pool-scoped without forcing
     // `W: Send` on the bit writer.
-    let mcus_x;
-    let rows = match subsampling {
-        ChromaSubsampling::Yuv444 => {
-            mcus_x = width.div_ceil(Yuv444Scheme::MCU_W);
-            run_on_pool(threads, || {
-                parallel_quantize_rows::<Yuv444Scheme>(
-                    pixels, width, height, layout, div_luma, div_chroma,
-                )
-            })?
-        }
-        ChromaSubsampling::Yuv422 => {
-            mcus_x = width.div_ceil(Yuv422Scheme::MCU_W);
-            run_on_pool(threads, || {
-                parallel_quantize_rows::<Yuv422Scheme>(
-                    pixels, width, height, layout, div_luma, div_chroma,
-                )
-            })?
-        }
-        ChromaSubsampling::Yuv420 => {
-            mcus_x = width.div_ceil(Yuv420Scheme::MCU_W);
-            run_on_pool(threads, || {
-                parallel_quantize_rows::<Yuv420Scheme>(
-                    pixels, width, height, layout, div_luma, div_chroma,
-                )
-            })?
-        }
-    };
+    let (mcus_x, rows) = dispatch_scheme!(subsampling, S => (
+        width.div_ceil(S::MCU_W),
+        run_on_pool(threads, || {
+            parallel_quantize_rows::<S>(pixels, width, height, layout, div_luma, div_chroma)
+        })?,
+    ));
 
-    match subsampling {
-        ChromaSubsampling::Yuv444 => serial_emit_rows::<Yuv444Scheme, _>(
-            &rows,
-            mcus_x,
-            bw,
-            dc_luma,
-            ac_luma,
-            dc_chroma,
-            ac_chroma,
-            restart_interval,
-        ),
-        ChromaSubsampling::Yuv422 => serial_emit_rows::<Yuv422Scheme, _>(
-            &rows,
-            mcus_x,
-            bw,
-            dc_luma,
-            ac_luma,
-            dc_chroma,
-            ac_chroma,
-            restart_interval,
-        ),
-        ChromaSubsampling::Yuv420 => serial_emit_rows::<Yuv420Scheme, _>(
-            &rows,
-            mcus_x,
-            bw,
-            dc_luma,
-            ac_luma,
-            dc_chroma,
-            ac_chroma,
-            restart_interval,
-        ),
-    }
+    dispatch_scheme!(subsampling, S => serial_emit_rows::<S, _>(
+        &rows,
+        mcus_x,
+        bw,
+        dc_luma,
+        ac_luma,
+        dc_chroma,
+        ac_chroma,
+        restart_interval,
+    ))
 }
 
 /// Run `f` on the ambient rayon pool (`threads == 0`) or on a freshly

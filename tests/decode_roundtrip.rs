@@ -270,11 +270,16 @@ fn run_restart_roundtrip(w: u32, h: u32, interval: u16, sub: ChromaSubsampling, 
 
     // Spot-check DRI + at least one RSTn in the byte stream.
     let has_dri = jpeg.windows(2).any(|p| p == [0xFF, 0xDD]);
-    let has_rst = jpeg.windows(2).any(|p| matches!(p, [0xFF, b] if (0xD0..=0xD7).contains(b)));
+    let has_rst = jpeg
+        .windows(2)
+        .any(|p| matches!(p, [0xFF, b] if (0xD0..=0xD7).contains(b)));
     assert!(has_dri, "encoded stream missing DRI segment");
     assert!(has_rst, "encoded stream missing RSTn marker");
 
-    let decoded = Decoder::new(&jpeg).unwrap().decode(PixelFormat::Rgb).unwrap();
+    let decoded = Decoder::new(&jpeg)
+        .unwrap()
+        .decode(PixelFormat::Rgb)
+        .unwrap();
     let psnr = psnr_rgb(&rgb, &decoded);
     assert!(
         psnr >= min_psnr,
@@ -311,7 +316,10 @@ fn custom_quant_tables_lossless_q1() {
     enc.set_subsampling(ChromaSubsampling::Yuv444);
     enc.set_quant_tables([1u8; 64], [1u8; 64]);
     enc.encode_rgb(&rgb, w, h).expect("encode");
-    let decoded = Decoder::new(&jpeg).unwrap().decode(PixelFormat::Rgb).unwrap();
+    let decoded = Decoder::new(&jpeg)
+        .unwrap()
+        .decode(PixelFormat::Rgb)
+        .unwrap();
     let psnr = psnr_rgb(&rgb, &decoded);
     // With qi=1 quantization is effectively lossless on the DCT path;
     // residual error comes only from color conversion rounding (~1 LSB).
@@ -339,7 +347,10 @@ fn custom_quant_clear_falls_back_to_quality() {
         .encode_rgb(&rgb, w, h)
         .unwrap();
 
-    assert_eq!(jpeg_custom, jpeg_default, "clear should reproduce default output");
+    assert_eq!(
+        jpeg_custom, jpeg_default,
+        "clear should reproduce default output"
+    );
 }
 
 #[test]

@@ -202,46 +202,6 @@ pub fn decode_baseline_scan_into(
     Ok((br.pos(), br.marker()))
 }
 
-/// Convenience wrapper around [`decode_baseline_scan_into`]: allocates
-/// planes, runs one scan, returns the bit reader at the marker that
-/// terminated entropy data. Single-SOS interleaved baseline streams
-/// can use this in a single call; multi-SOS streams should call
-/// [`decode_baseline_multi`] instead.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // legacy single-scan entry kept for symmetry
-pub fn decode_baseline_scan<'a>(
-    src: &'a [u8],
-    entropy_start: usize,
-    headers: &DecoderHeaders,
-    scan: &ScanHeader,
-    dc_tables: &[Option<HuffmanDecodeTable>; 4],
-    ac_tables: &[Option<HuffmanDecodeTable>; 4],
-    qt_by_id: &[Option<&QuantTable>; 4],
-) -> Result<(DecodedPlanes, BitReader<'a>)> {
-    let mut planes = allocate_planes(&headers.frame);
-    let (pos, _marker) = decode_baseline_scan_into(
-        src,
-        entropy_start,
-        headers,
-        scan,
-        dc_tables,
-        ac_tables,
-        qt_by_id,
-        &mut planes,
-    )?;
-    // Re-create a BitReader anchored at the post-entropy position so
-    // legacy callers can introspect the marker. The reader is empty.
-    let br = BitReader::new(src, pos);
-    Ok((
-        DecodedPlanes {
-            width: headers.frame.width as u32,
-            height: headers.frame.height as u32,
-            components: planes,
-        },
-        br,
-    ))
-}
-
 /// Decode a (possibly multi-scan) baseline JPEG by looping over SOS
 /// markers, threading any intervening DHT / DQT / DRI segments back
 /// into the working header tables, and dispatching each scan into the
