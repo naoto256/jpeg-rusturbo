@@ -579,21 +579,79 @@ pub mod dct {
     #[target_feature(enable = "neon")]
     unsafe fn idct_islow_inner(coef: &[i16; 64], output: &mut [u8; 64]) {
         unsafe {
+            let p = coef.as_ptr();
+
+            // Load all 16 i16x4 row halves up-front: they are needed
+            // either way (sparse detection + regular pass 1).
+            let r0l = vld1_s16(p);
+            let r0r = vld1_s16(p.add(4));
+            let r1l = vld1_s16(p.add(8));
+            let r1r = vld1_s16(p.add(12));
+            let r2l = vld1_s16(p.add(16));
+            let r2r = vld1_s16(p.add(20));
+            let r3l = vld1_s16(p.add(24));
+            let r3r = vld1_s16(p.add(28));
+            let r4l = vld1_s16(p.add(32));
+            let r4r = vld1_s16(p.add(36));
+            let r5l = vld1_s16(p.add(40));
+            let r5r = vld1_s16(p.add(44));
+            let r6l = vld1_s16(p.add(48));
+            let r6r = vld1_s16(p.add(52));
+            let r7l = vld1_s16(p.add(56));
+            let r7r = vld1_s16(p.add(60));
+
+            // DC-only fast path: detect blocks whose only nonzero
+            // coefficient is `coef[0]` (the DC term). For natural
+            // images this is a common case — large smooth regions of
+            // the image compress to DC-only blocks after quantization.
+            //
+            // For such a block, the IDCT output is a constant value:
+            //   output[r][c] = clamp((dc + 4) >> 3 + 128, 0, 255)
+            // (derived from the scalar pipeline: ws[r][0] = dc * 4,
+            // ws[*][1..] = 0, pass-2 final descale-and-narrow with the
+            // +128 level shift collapses to (dc + 4) >> 3 + 128.)
+            //
+            // Detection: OR-reduce row 0 AC lanes (cols 1-3 of left
+            // half, all of right half) and all of rows 1-7. Zero
+            // result ⇒ DC-only.
+            let r0l_ac = vset_lane_s16::<0>(0, r0l);
+            let mut bm = vorr_s16(r0l_ac, r0r);
+            bm = vorr_s16(bm, vorr_s16(r1l, r1r));
+            bm = vorr_s16(bm, vorr_s16(r2l, r2r));
+            bm = vorr_s16(bm, vorr_s16(r3l, r3r));
+            bm = vorr_s16(bm, vorr_s16(r4l, r4r));
+            bm = vorr_s16(bm, vorr_s16(r5l, r5r));
+            bm = vorr_s16(bm, vorr_s16(r6l, r6r));
+            bm = vorr_s16(bm, vorr_s16(r7l, r7r));
+            let bm_u64 = vget_lane_u64::<0>(vreinterpret_u64_s16(bm));
+
+            if bm_u64 == 0 {
+                let dc = vget_lane_s16::<0>(r0l) as i32;
+                let val = (((dc + 4) >> 3) + 128).clamp(0, 255) as u8;
+                let dup = vdupq_n_u8(val);
+                let q = output.as_mut_ptr();
+                vst1q_u8(q, dup);
+                vst1q_u8(q.add(16), dup);
+                vst1q_u8(q.add(32), dup);
+                vst1q_u8(q.add(48), dup);
+                return;
+            }
+
+            // Regular path.
             let mut ws_l = [0i16; 32];
             let mut ws_r = [0i16; 32];
-            let p = coef.as_ptr();
 
             // Pass 1, left 4x8 half (columns 0-3). Writes ws_l[0..16]
             // and ws_r[0..16] in transposed 4x4 quadrants.
             idct_pass1_regular(
-                vld1_s16(p),
-                vld1_s16(p.add(8)),
-                vld1_s16(p.add(16)),
-                vld1_s16(p.add(24)),
-                vld1_s16(p.add(32)),
-                vld1_s16(p.add(40)),
-                vld1_s16(p.add(48)),
-                vld1_s16(p.add(56)),
+                r0l,
+                r1l,
+                r2l,
+                r3l,
+                r4l,
+                r5l,
+                r6l,
+                r7l,
                 ws_l.as_mut_ptr(),
                 ws_r.as_mut_ptr(),
             );
@@ -601,14 +659,14 @@ pub mod dct {
             // Pass 1, right 4x8 half (columns 4-7). Writes
             // ws_l[16..32] and ws_r[16..32].
             idct_pass1_regular(
-                vld1_s16(p.add(4)),
-                vld1_s16(p.add(12)),
-                vld1_s16(p.add(20)),
-                vld1_s16(p.add(28)),
-                vld1_s16(p.add(36)),
-                vld1_s16(p.add(44)),
-                vld1_s16(p.add(52)),
-                vld1_s16(p.add(60)),
+                r0r,
+                r1r,
+                r2r,
+                r3r,
+                r4r,
+                r5r,
+                r6r,
+                r7r,
                 ws_l.as_mut_ptr().add(16),
                 ws_r.as_mut_ptr().add(16),
             );
@@ -1266,11 +1324,31 @@ mod tests {
         // DC swept across the libjpeg-turbo NEON IDCT input contract
         // (i12 raw range × typical small quant ⇒ values that keep
         // pass-1 intermediates inside i16). The ±2047 endpoints stress
-        // the saturation path.
+        // the saturation path. This panel also exercises the DC-only
+        // sparse fast path (rows 1-7 all zero).
         for &dc in &[2047i16, -2048, 1024, -1024, 512, -512, 8, -8] {
             let mut coef = [0i16; 64];
             coef[0] = dc;
             idct_xcheck(&coef, &format!("dc={dc}"));
+        }
+    }
+
+    #[test]
+    fn idct_neon_sparse_path_dc_only() {
+        // Direct verification of the DC-only sparse path: dense DC
+        // sweep including saturation extremes and zero. The sparse
+        // detection must trigger for every input here (all AC == 0).
+        for dc in -2048i16..=2047i16 {
+            let mut coef = [0i16; 64];
+            coef[0] = dc;
+            // Compute scalar reference for this DC and compare. The
+            // scalar produces a flat block: `clamp((dc+4)>>3 + 128, 0, 255)`.
+            let expected = ((((dc as i32) + 4) >> 3) + 128).clamp(0, 255) as u8;
+            let mut neon_out = [0u8; 64];
+            dct::idct_islow(&coef, &mut neon_out);
+            for (i, &v) in neon_out.iter().enumerate() {
+                assert_eq!(v, expected, "dc={dc} pos={i}");
+            }
         }
     }
 
