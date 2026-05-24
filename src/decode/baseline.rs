@@ -154,13 +154,14 @@ pub fn decode_baseline_scan_into(
             }
         }
     } else {
-        // Non-interleaved: still iterate MCU-major (libjpeg-turbo
-        // jdcoefct convention — within each frame MCU, decode the
-        // scanned component's `Hi × Vi` blocks in MCU-relative raster
-        // order). Pure per-component raster aligns with MCU-major only
-        // when `Vi == 1`; for `Vi > 1` (e.g. 4:2:0 Y), the two orders
-        // diverge and pure raster mis-pairs blocks with the encoder's
-        // emission order.
+        // Non-interleaved scan: per T.81 A.2.2/A.2.4 the MCU collapses
+        // to a single data unit and the component's blocks are walked
+        // in left-to-right top-to-bottom raster order. Block counts
+        // come from the spec formula `ceil(W*Hi/(Hmax*8))`, NOT from
+        // `mcus_x * Hi` — for unaligned widths (e.g. 65x65 4:2:2) the
+        // two diverge and `mcus_x * Hi` over-counts by one block per
+        // row, de-syncing the bit reader the same way the progressive
+        // path tripped on synthetic_image.jpg.
         let sc = &scan.components[0];
         let (comp_idx, comp) = find_component(frame, sc.component_id)?;
         let dc_tbl = dc_tables[sc.dc_table as usize]
@@ -173,33 +174,27 @@ pub fn decode_baseline_scan_into(
             "scan refers to undefined quant table",
         ))?;
         let plane = &mut planes[comp_idx];
-        for my in 0..mcus_y {
-            for mx in 0..mcus_x {
+        let blocks_x = (frame.width as usize * comp.h as usize)
+            .div_ceil(h_max as usize * 8)
+            .max(1);
+        let blocks_y = (frame.height as usize * comp.v as usize)
+            .div_ceil(v_max as usize * 8)
+            .max(1);
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
                 if restart_interval > 0 && mcus_since_restart == restart_interval {
                     handle_restart(&mut br, &mut prev_dc, &mut expected_rst)?;
                     mcus_since_restart = 0;
                 }
-                for v_block in 0..(comp.v as u32) {
-                    for h_block in 0..(comp.h as u32) {
-                        zz_coef.fill(0);
-                        decode_block_baseline(
-                            &mut br,
-                            dc_tbl,
-                            ac_tbl,
-                            &mut prev_dc[0],
-                            &mut zz_coef,
-                        )?;
-                        for k in 0..64 {
-                            nat_coef[ZIGZAG[k]] =
-                                zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
-                        }
-                        let mut block = [0u8; 64];
-                        arch::backend::dct::idct_islow(&nat_coef, &mut block);
-                        let base_x = (mx * comp.h as u32 + h_block) as usize * 8;
-                        let base_y = (my * comp.v as u32 + v_block) as usize * 8;
-                        place_block(plane, base_x, base_y, &block);
-                    }
+                zz_coef.fill(0);
+                decode_block_baseline(&mut br, dc_tbl, ac_tbl, &mut prev_dc[0], &mut zz_coef)?;
+                for k in 0..64 {
+                    nat_coef[ZIGZAG[k]] =
+                        zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
                 }
+                let mut block = [0u8; 64];
+                arch::backend::dct::idct_islow(&nat_coef, &mut block);
+                place_block(plane, bx * 8, by * 8, &block);
                 mcus_since_restart += 1;
             }
         }
