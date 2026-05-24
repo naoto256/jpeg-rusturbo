@@ -4,12 +4,13 @@
 //! Run with:
 //!
 //! ```text
-//! cargo test --release --test comparison_bench -- --nocapture comparison_print
+//! cargo test --release --test comparison_bench -- --ignored --nocapture
 //! ```
 //!
-//! The output is intentionally human-readable plaintext rather than
-//! the usual `assert_*!` test failure mode — this is the harness we
-//! cite in BENCH.md and the README.
+//! Gated by `#[ignore]` so it doesn't run on default `cargo test` (would add
+//! ~10 seconds per invocation). The output is intentionally human-readable
+//! plaintext rather than the usual `assert_*!` test failure mode — this is
+//! the harness we cite in BENCH.md and the README.
 
 use image::ImageEncoder;
 use image::codecs::jpeg::JpegEncoder as ImageJpegEncoder;
@@ -79,6 +80,7 @@ fn decode_with_image(jpeg: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[ignore]
 fn comparison_print() {
     let cases = [
         ("1592x1124 (session)", 1592u32, 1124u32),
@@ -91,24 +93,33 @@ fn comparison_print() {
         "jpeg-rusturbo vs image — {} iters per case (median of single timed batch)",
         ITER
     );
-    println!();
-    println!("=== Encode (q=80, 4:2:0) ===");
-    println!(
-        "{:<24}  {:>12}  {:>12}  {:>7}",
-        "case", "ours (us)", "image (us)", "ratio"
-    );
-    for &(label, w, h) in &cases {
-        let rgb = make_image(w, h);
-        let ours_us = time_us(|| {
-            let buf = encode_with_ours(&rgb, w, h, 80, ChromaSubsampling::Yuv420);
-            std::hint::black_box(buf);
-        });
-        let theirs_us = time_us(|| {
-            let buf = encode_with_image(&rgb, w, h, 80);
-            std::hint::black_box(buf);
-        });
-        let ratio = theirs_us / ours_us;
-        println!("{label:<24}  {ours_us:>12.1}  {theirs_us:>12.1}  {ratio:>5.2}x",);
+
+    // `image` crate's JPEG encoder is hardcoded to 4:2:0; we vary our side only
+    // for completeness. Ratio is meaningful only on the 4:2:0 row.
+    for &(sub_label, sub) in &[
+        ("4:4:4", ChromaSubsampling::Yuv444),
+        ("4:2:2", ChromaSubsampling::Yuv422),
+        ("4:2:0", ChromaSubsampling::Yuv420),
+    ] {
+        println!();
+        println!("=== Encode (q=80, ours={sub_label} | image=4:2:0 fixed) ===");
+        println!(
+            "{:<24}  {:>12}  {:>12}  {:>7}",
+            "case", "ours (us)", "image (us)", "ratio"
+        );
+        for &(label, w, h) in &cases {
+            let rgb = make_image(w, h);
+            let ours_us = time_us(|| {
+                let buf = encode_with_ours(&rgb, w, h, 80, sub);
+                std::hint::black_box(buf);
+            });
+            let theirs_us = time_us(|| {
+                let buf = encode_with_image(&rgb, w, h, 80);
+                std::hint::black_box(buf);
+            });
+            let ratio = theirs_us / ours_us;
+            println!("{label:<24}  {ours_us:>12.1}  {theirs_us:>12.1}  {ratio:>5.2}x",);
+        }
     }
 
     println!();
