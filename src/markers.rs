@@ -77,12 +77,25 @@ pub fn write_sof0<W: Write>(
 /// DHT — Define Huffman Table. Writes one table (DC or AC) at class
 /// `tc` (0 = DC, 1 = AC), destination `th`. (B.2.4.2)
 pub fn write_dht<W: Write>(w: &mut W, tc: u8, th: u8, table: &StdHuffman) -> io::Result<()> {
-    let n_values = table.values.len() as u16;
+    write_dht_bits_values(w, tc, th, &table.bits, table.values)
+}
+
+/// DHT writer working from raw bits[16] + values[] (used by the
+/// optimized-Huffman path, which builds its tables at runtime instead
+/// of pointing at a `StdHuffman` constant).
+pub fn write_dht_bits_values<W: Write>(
+    w: &mut W,
+    tc: u8,
+    th: u8,
+    bits: &[u8; 16],
+    values: &[u8],
+) -> io::Result<()> {
+    let n_values = values.len() as u16;
     w.write_all(&[0xFF, 0xC4])?;
     write_be_u16(w, 2 + 1 + 16 + n_values)?;
     w.write_all(&[((tc & 0xF) << 4) | (th & 0xF)])?;
-    w.write_all(&table.bits)?;
-    w.write_all(table.values)?;
+    w.write_all(bits)?;
+    w.write_all(values)?;
     Ok(())
 }
 
