@@ -171,3 +171,32 @@ fn optimized_with_restart_interval_matches_default_psnr() {
         opt_out.len(),
     );
 }
+
+/// Regression: with the synthetic XOR-pattern image (used by the bench
+/// harness) at 4:2:2 q=70, the optimal Huffman builder produces a
+/// histogram skewed enough that K.3 length-limiting kicks in, leaving
+/// symbols with pre-truncation codesize > 16. An earlier implementation
+/// looped HUFFVAL construction only over length 1..=16 and silently
+/// dropped those symbols, causing `bits_out.sum() > values.len()` and
+/// an out-of-bounds panic when the encoder later expanded the table.
+/// Now we loop up to MAX_CLEN; this test pins the fix.
+#[test]
+fn k3_truncated_table_round_trips() {
+    let (w, h) = (1592u32, 1124u32);
+    // Same generator as src/bin/bench.rs.
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x ^ y) & 0xFF) as u8;
+            let g = ((x.wrapping_add(y)) & 0xFF) as u8;
+            let b = (((x.wrapping_mul(7)) ^ (y.wrapping_mul(13))) & 0xFF) as u8;
+            rgb.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let jpeg = encode(&rgb, w, h, 70, ChromaSubsampling::Yuv422, true);
+    let decoded = Decoder::new(&jpeg)
+        .expect("parse")
+        .decode(PixelFormat::Rgb)
+        .expect("decode");
+    assert_eq!(decoded.len(), rgb.len(), "decoded size mismatch");
+}

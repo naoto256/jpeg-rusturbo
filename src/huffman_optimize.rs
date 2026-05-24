@@ -199,12 +199,19 @@ pub fn build_optimal_huffman(
         bits_out[k - 1] = bits[k] as u8;
     }
 
-    // Build HUFFVAL: for each length 1..=16, append all real symbols
-    // (skipping the reserved index 256) whose codesize matches, in
-    // ascending symbol order.
+    // Build HUFFVAL: for each length 1..=MAX_CLEN, append all real
+    // symbols (skipping the reserved index 256) whose codesize matches,
+    // in ascending symbol order. We loop up to MAX_CLEN (not 16) because
+    // K.3 length-limiting reshapes `bits[]` but does NOT rewrite the
+    // per-symbol `codesize[]` array — symbols whose original codesize
+    // was > 16 still need to be listed, and they get placed in canonical
+    // order matching the truncated bits[] distribution (the symbol-to-
+    // code mapping is determined by the ORDER of symbols in HUFFVAL,
+    // not by their codesize label). This mirrors libjpeg-turbo's
+    // jpeg_gen_optimal_table.
     let n_values: usize = bits_out.iter().map(|&b| b as usize).sum();
     let mut values = Vec::with_capacity(n_values);
-    for length in 1..=16u32 {
+    for length in 1..=MAX_CLEN as u32 {
         for (sym, &sz) in codesize.iter().take(256).enumerate() {
             if sz == length {
                 values.push(sym as u8);
