@@ -1,273 +1,244 @@
 # `jpeg-rusturbo` benchmarks
 
-Measured on Apple Silicon (M-series) at 100 iterations per resolution
-after a 3-iteration warm-up. Build: `cargo build --release --bin bench`
-(NEON) and `cargo build --release --bin bench --features force-scalar`
-(scalar). Single-shot wall-clock; no statistical filtering — variance
-between runs is well under 1%.
+All numbers below come from the unified harness in `src/bin/bench.rs`
+(encode-side) and `tests/comparison_bench.rs` (vs the `image` crate).
+Methodology is intentionally simple — single timed batch, 50 measured
+iterations after a 3-iteration warm-up, no statistical filtering. The
+synthetic XOR-pattern image (`make_image` in `bench.rs`) keeps the AC
+histogram non-degenerate so the entropy coder isn't artificially
+fast, and gives pixel-identical inputs across hosts for
+apples-to-apples comparison.
 
-## Encode time (ms/iter, full RGBA → JPEG, quality 80, 4:2:0)
+Reproduce on any host with:
 
-| Resolution                  | Scalar (force-scalar) | NEON  | Speedup |
-| --------------------------- | --------------------: | ----: | ------: |
-| 1592 x 1124 (session size)  |             10.89 ms  | 8.36 ms |  1.30x |
-| 1920 x 1080 (1080p)         |             12.44 ms  | 9.22 ms |  1.35x |
-| 3840 x 2160 (4K)            |             51.73 ms  | 37.92 ms | 1.36x |
+```sh
+cargo run --release --bin bench -- --section all                          # SIMD build
+cargo run --release --features force-scalar --bin bench -- --section all  # scalar fallback
+cargo test  --release --test comparison_bench -- --ignored --nocapture    # vs image crate
+```
 
-Output bytes are byte-identical between scalar and NEON builds (verified
-in the bench output: `423839 / 488459 / 1940692 bytes` in both modes).
-This is the bit-exact equivalence we set out to achieve when switching
-from an f32 AAN DCT to libjpeg-turbo's integer LL&M scheme — the
-NEON kernels are a true drop-in for the scalar reference.
+## Hosts
 
-## Where the speedup is, and isn't
+| Label                | CPU                                | Cores | SIMD floor       |
+| -------------------- | ---------------------------------- | ----- | ---------------- |
+| Apple M-series       | Apple Silicon (M-series)           | 8 P+E | NEON (always-on) |
+| Intel Xeon Broadwell | Xeon E5-2673 v4 @ 2.30 GHz         | 4 vCPU | AVX2            |
 
-The 1.3-1.36x figure is below the 2-4x speculative target we initially
-aimed for. The most likely reason: the Huffman entropy coder
-remains scalar (we leave it scalar by design — libjpeg-turbo
-itself doesn't have an aarch64 NEON Huffman kernel in the
-matching shape, and the loop is too branchy to vectorize well), and
-LLVM's autovectorizer does a respectable job on the integer LL&M DCT and
-the reciprocal-multiply quantizer in the scalar path at `-O3`.
+Intel Xeon was a fresh `Standard_D4s_v3` Linux VM (Ubuntu 24.04,
+Rust stable). Apple M-series was a developer laptop with background
+chat / IDE running — performance-core load was light but non-zero,
+so trust the *ratios* more than the raw ms numbers there.
 
-A rough per-stage breakdown (estimated from %time of `cargo flamegraph`,
-not committed to the repo) for 4K:
+---
 
-  Color/downsample  ~25%  (NEON: ~3.0x;  scalar: 1.0x)
-  Forward DCT       ~20%  (NEON: ~2.5x;  scalar: 1.0x)
-  Quantize+zig-zag  ~10%  (NEON: ~1.8x;  scalar: 1.0x)
-  Huffman           ~35%  (scalar in both)
-  Marker writes/IO  ~10%  (scalar in both)
+## Section A — encode pipeline
 
-So the NEON kernels themselves are doing roughly the expected speedup;
-Amdahl's law just bounds the whole-pipeline number.
+`q=80`, single thread, optimize-huffman off. Pure encode time
+(JpegEncoder::encode_rgba), ms/iter.
 
-## Huffman 64-bit accumulator
+### Apple M-series (aarch64)
 
-The initial NEON port left the Huffman entropy coder scalar with a
-32-bit accumulator; flamegraphs put it at ~30-35% of total encode time,
-by far the dominant remaining cost. This pass rewrites it without
-touching the public API:
+| Resolution                  | 4:4:4 NEON | 4:4:4 scalar | 4:2:2 NEON | 4:2:2 scalar | 4:2:0 NEON | 4:2:0 scalar |
+| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
+| 1592 × 1124 (session size)  |   10.79 ms |     14.49 ms |    7.54 ms |     10.69 ms |    5.56 ms |      8.63 ms |
+| 1920 × 1080 (1080p)         |   12.42 ms |     16.81 ms |    8.60 ms |     12.36 ms |    6.39 ms |      9.99 ms |
+| 3840 × 2160 (4K)            |   47.55 ms |     65.58 ms |   34.18 ms |     48.31 ms |   25.80 ms |     44.68 ms |
 
-  - **64-bit bit accumulator.** Each `write_bits` now appends with one
-    shift+OR; we drain four bytes at a time (when `nbits ≥ 32`) instead
-    of one. ~4x fewer per-symbol drain checks.
-  - **Branchless inner path.** The drain check is the only branch on the
-    common path; symbol packing is straight-line shifts.
-  - **Packed Huffman table.** Single `[u32; 256]` per table holding
-    `(length << 16) | code` — one load per symbol, no parallel-array
-    overhead.
-  - **Internal byte buffer.** The bit accumulator drains into an owned
-    `Vec<u8>` and forwards to the user's `Write` exactly once per scan
-    (in `flush_to_byte_boundary`). One `write_all` per frame instead of
-    one per byte.
-  - **NEON-assisted AC zero scan** (aarch64, gated by `force-scalar`).
-    Loads 8 i16 at a time, takes `vmaxvq_u16(vabsq_s16(...))`, skips the
-    whole group when zero. The hot case for q=70-80 natural images.
+NEON speedup vs `force-scalar`: 1.34× (4:4:4 4K) → 1.73× (4:2:0 4K).
+The 4:2:0 path benefits more because chroma downsample and the
+horizontal-half color-convert MCU loops are where the explicit NEON
+kernels do the most work; pure 4:4:4 is closer to the LLVM
+autovectorized scalar floor.
 
-Bit-exact output preserved — `bytes` columns below match the prior
-NEON-only build exactly (`423839 / 488459 / 1940692`), and a new
-`equiv_*` test panel asserts byte-identity vs a reference encoder
-modeled on the prior NEON-only implementation.
+### Intel Xeon Broadwell (x86_64)
 
-### Encode time after the Huffman pass (ms/iter, q=80, 4:2:0)
+| Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
+| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
+| 1592 × 1124 (session size)  |   47.11 ms |     75.69 ms |   31.07 ms |     58.16 ms |   24.53 ms |     42.40 ms |
+| 1920 × 1080 (1080p)         |   54.03 ms |     90.61 ms |   35.21 ms |     64.84 ms |   26.59 ms |     49.24 ms |
+| 3840 × 2160 (4K)            |  215.03 ms |    352.49 ms |  142.58 ms |    253.57 ms |  112.19 ms |    196.41 ms |
 
-| Resolution                  | NEON (initial) | NEON (+ Huffman) | NEON Δ | scalar (initial) | scalar (+ Huffman) | scalar Δ |
-| --------------------------- | -----------: | -------------: | -----: | -------------: | ---------------: | -------: |
-| 1592 x 1124 (session size)  |      8.55 ms |        5.92 ms | -30.8% |       11.18 ms |          8.08 ms |   -27.7% |
-| 1920 x 1080 (1080p)         |      9.42 ms |        6.75 ms | -28.3% |       12.85 ms |          9.17 ms |   -28.6% |
-| 3840 x 2160 (4K)            |     39.12 ms |       27.23 ms | -30.4% |       52.73 ms |         38.12 ms |   -27.7% |
+AVX2 speedup vs `force-scalar`: 1.61× (4:4:4 4K) → 1.75× (4:2:0 4K).
+Broadwell is two generations behind Apple Silicon on per-clock
+throughput, so absolute ms are larger; the ratios are what's
+portable.
 
-Roughly a third of total wall-clock time vanished in both NEON and
-scalar paths, matching the flamegraph-derived estimate of Huffman's
-share. The `force-scalar` build benefits too because the 64-bit
-accumulator, branchless packing, packed LUT, and byte buffer are all
-target-independent — only the AC zero-scan SIMD is aarch64-gated.
+Output bytes are byte-identical across SIMD ↔ scalar and across
+hosts (e.g. 4K 4:2:0 q=80 = `1940692` bytes everywhere). This is the
+bit-exact equivalence we set out to preserve when porting
+libjpeg-turbo's integer LL&M DCT, and is asserted in the unit tests.
 
-### Cumulative (f32 baseline → Huffman pass)
+---
 
-| Resolution                  | f32 AAN baseline (scalar) | NEON + Huffman | Total speedup |
-| --------------------------- | -------------------: | -------------: | ------------: |
-| 1592 x 1124                 |          ~10.96 ms\* |        5.92 ms |        1.85x  |
-| 1920 x 1080                 |          ~12.50 ms\* |        6.75 ms |        1.85x  |
-| 3840 x 2160                 |          ~51.44 ms\* |       27.23 ms |        1.89x  |
+## Section B — threads scaling
 
-\* f32 baseline numbers reproduced from earlier measurements; not
-re-measured for this section.
+`q=80`, 4:2:0, optimize-huffman off. Threads are MCU-rows partitioned
+across rayon worker pool; `threads=auto` picks `available_parallelism()`.
 
-## x86_64 AVX2 port
+### Apple M-series (NEON, 8 cores)
 
-This pass ports the four hot kernels (color RGB→YCbCr, chroma
-downsample, integer LL&M FDCT, reciprocal-multiply quantize) to x86_64
-AVX2, translated from libjpeg-turbo's `simd/x86_64/*-avx2.asm`. Color
-is AVX2-fast for the bpp=4 hot path (`n=16`, any of RGBA / BGRA /
-ARGB / ABGR / RGBX / BGRX); narrower calls and 3-byte inputs still go
-through scalar. The scaffolding (arch backend modules, runtime AVX2
-detection, CI-friendly cfg plumbing) lives in `src/arch/`.
+| Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
+| ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
+| 1920×1080 (1080p)  |   6.18 ms |   4.68 ms |   4.08 ms |   3.71 ms |      3.70 ms |            1.67× |
+| 3840×2160 (4K)     |  25.39 ms |  18.37 ms |  15.70 ms |  14.52 ms |     13.90 ms |            1.83× |
 
-The Huffman AC scan is bitmap-driven: a nonzero bitmap (`u64`)
-collapses zero runs into a single `trailing_zeros` jump per nonzero.
-On x86_64 the bitmap is built with SSE2 (`pcmpeqw + packsswb +
-pmovmskb`, translated from `jchuff-sse2.asm`); the rest of the
-entropy emitter stays scalar (AC-symbol-emission and the 64-bit bit
-accumulator both autovectorize well in scalar form).
+### Intel Xeon Broadwell (AVX2, 4 vCPU)
 
-### Setup — Intel Ice Lake
+| Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
+| ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
+| 1920×1080 (1080p)  |  27.32 ms |  20.36 ms |  20.56 ms |  20.77 ms |     20.42 ms |            1.34× |
+| 3840×2160 (4K)     | 111.39 ms |  81.98 ms |  76.94 ms |  78.19 ms |     76.78 ms |            1.45× |
 
-Measured on Intel Xeon Platinum 8370C (Ice Lake-SP, 2 vCPU,
-Ubuntu 24.04) at 100 iterations per resolution after a 3-iteration
-warm-up. Five repeated runs, variance < 1 % across runs; numbers
-below are the median.
+The 4-vCPU Broadwell saturates at 2 threads — beyond that the
+parallel quantize-rows stage doesn't have enough work per chunk to
+offset rayon's scheduling cost. The 8-core Apple host gets clean
+1.8× at 4K, less at 1080p (Amdahl: serial-emit-rows holds about a
+third of total time on this content).
 
-#### 4:2:0
+Output bytes are byte-identical across all thread counts (asserted
+in `tests/threaded.rs`); threading partitions the per-MCU work but
+the entropy coder emits the same bitstream.
 
-| Resolution                  | scalar (force-scalar) | AVX2     | speedup |
-| --------------------------- | --------------------: | -------: | ------: |
-| 1592 x 1124 (session size)  |             24.31 ms  | 11.82 ms |  2.06x  |
-| 1920 x 1080 (1080p)         |             27.93 ms  | 13.65 ms |  2.05x  |
-| 3840 x 2160 (4K)            |            109.98 ms  | 53.50 ms |  2.06x  |
+---
 
-Output bytes: `423839 / 488459 / 1940692` — byte-identical to scalar
-and to the Apple Silicon NEON build, verified by the cross-check unit
-tests and the roundtrip suite.
+## Section C — optimized Huffman (size)
 
-#### 4:2:2
+`set_optimize_huffman(true)` enables a second pass: count symbol
+frequencies, build canonical Huffman tables (T.81 K.2/K.3), re-emit
+the scan. Size delta is host-independent (it's purely about the
+tables); we show the Apple M-series numbers, the Intel numbers are
+identical to within rounding.
 
-| Resolution                  | scalar (force-scalar) | AVX2     | speedup |
-| --------------------------- | --------------------: | -------: | ------: |
-| 1592 x 1124 (session size)  |             31.15 ms  | 15.29 ms |  2.04x  |
-| 1920 x 1080 (1080p)         |             35.73 ms  | 17.45 ms |  2.05x  |
-| 3840 x 2160 (4K)            |            140.87 ms  | 68.18 ms |  2.07x  |
+### Size delta vs default tables (4K, all subsamplings × quality)
 
-Output bytes: `568676 / 654460 / 2618066`. The 4:2:2 path runs 4 DCT
-blocks per 16×8 MCU (vs 6 per 16×16 4:2:0 MCU), so per-pixel work
-grows by ~1.33×; the AVX2 path tracks that growth closely.
+| Subsampling | q  | bytes (off) | bytes (on)  | Δ        |
+| ----------- | -- | ----------: | ----------: | -------: |
+| 4:4:4       | 70 |   2,804,405 |   2,644,405 |   −5.71% |
+| 4:4:4       | 80 |   3,701,792 |   3,491,157 |   −5.69% |
+| 4:4:4       | 90 |   5,663,832 |   5,344,940 |   −5.63% |
+| 4:2:2       | 70 |   1,996,329 |   1,886,443 |   −5.50% |
+| 4:2:2       | 80 |   2,618,066 |   2,478,247 |   −5.34% |
+| 4:2:2       | 90 |   3,984,627 |   3,773,697 |   −5.29% |
+| 4:2:0       | 70 |   1,498,562 |   1,419,961 |   −5.25% |
+| 4:2:0       | 80 |   1,940,692 |   1,846,090 |   −4.87% |
+| 4:2:0       | 90 |   2,905,130 |   2,771,322 |   −4.61% |
 
-### Where the AVX2 speedup is
+Roughly a consistent **−5%** across the matrix on synthetic content.
+On natural photographic input the win typically sits in the 4–10%
+range, matching `cjpeg -optimize`.
 
-The ~2.05× whole-pipeline speedup is what Amdahl's law predicts once
-the bitmap-driven Huffman scan trims the previously scalar-dominated
-AC walk and the remaining color / DCT / quant / chroma downsample
-kernels keep hitting ~3× in their SIMD bodies.
+### Time cost (two-pass)
 
-A rough per-stage breakdown on the Ice Lake host (AVX2):
+Two-pass means encode roughly doubles in wall-clock. On 4K 4:2:0 q=80:
 
-  Color/downsample      ~25%  (AVX2: ~3.0x;  scalar: 1.0x)
-  Forward DCT           ~20%  (AVX2: ~2.7x;  scalar: 1.0x)
-  Quantize+zig-zag      ~10%  (AVX2: ~2.5x;  scalar: 1.0x)
-  Huffman bitmap + walk ~30%  (SSE2 bitmap + scalar emitter; ~1.4x)
-  Marker writes/IO      ~15%  (scalar in both)
+| Host                        | off (ms) | on (ms) | factor |
+| --------------------------- | -------: | ------: | -----: |
+| Apple M-series (NEON)       |    26.28 |   47.24 | 1.80×  |
+| Intel Xeon Broadwell (AVX2) |   111.94 |  161.54 | 1.44×  |
 
-### Apple Silicon (NEON)
+Worth it when bandwidth matters more than CPU; opt-in by default for
+exactly that trade-off.
 
-Measured on Apple M-series at 100 iterations after a 3-iteration
-warm-up. Five repeated runs, variance < 1 %; numbers below are the
-median.
+---
 
-#### 4:2:0
+## vs `image` crate
 
-| Resolution                  | scalar (force-scalar) | NEON     | speedup |
-| --------------------------- | --------------------: | -------: | ------: |
-| 1592 x 1124 (session size)  |              8.54 ms  |  5.49 ms |  1.56x  |
-| 1920 x 1080 (1080p)         |              9.94 ms  |  6.23 ms |  1.60x  |
-| 3840 x 2160 (4K)            |             41.96 ms  | 25.04 ms |  1.68x  |
+`image` (`v0.25`) is the de-facto Rust image library. It bundles a
+scalar JPEG encoder hardcoded to 4:2:0, and routes JPEG decode
+through `zune-jpeg` (SIMD-accelerated). We bench both sides on the
+same synthetic content from the same harness on each host.
 
-#### 4:2:2
+### Encode (RGB → JPEG, q=80)
 
-| Resolution                  | scalar (force-scalar) | NEON     | speedup |
-| --------------------------- | --------------------: | -------: | ------: |
-| 1592 x 1124 (session size)  |             10.68 ms  |  7.43 ms |  1.44x  |
-| 1920 x 1080 (1080p)         |             12.32 ms  |  8.45 ms |  1.46x  |
-| 3840 x 2160 (4K)            |             47.94 ms  | 33.00 ms |  1.45x  |
+| Host                 | Resolution | ours 4:2:0 | image (4:2:0) | ratio (img/ours) |
+| -------------------- | ---------- | ---------: | ------------: | ---------------: |
+| Apple M-series (NEON) | 1592×1124 |    5.62 ms |      14.36 ms |            2.56× |
+|                      | 1920×1080  |    6.32 ms |      16.22 ms |            2.57× |
+|                      | 3840×2160  |   24.93 ms |      63.00 ms |            2.53× |
+| Intel Xeon (AVX2)    | 1592×1124  |   29.75 ms |      94.71 ms |            3.18× |
+|                      | 1920×1080  |   34.16 ms |     108.19 ms |            3.17× |
+|                      | 3840×2160  |  134.55 ms |     432.59 ms |            3.22× |
 
-NEON whole-pipeline speedup is more modest than AVX2 here because the
-Apple M-series scalar path already runs the autovectorized Huffman /
-quantize / DCT inner loops well; the explicit NEON kernels for color
-convert, FDCT, quantize, chroma downsample, and the Huffman nonzero
-bitmap claw back the remaining fixed-point arithmetic that LLVM
-doesn't fully cover.
-
-### Cumulative timeline (4K, 4:2:0, q=80)
-
-| Configuration                                  | aarch64        | x86_64 (Ice Lake) |
-| ---------------------------------------------- | -------------: | ----------------: |
-| f32 AAN baseline (scalar)                      |     ~51.44 ms\* |                 — |
-| NEON SIMD kernels (color/FDCT/quant/downsample)|        37.92 ms |                 — |
-| NEON + Huffman 64-bit accumulator              |        27.23 ms |                 — |
-| AVX2 + backend-dispatch refactor               |        28.50 ms |          63.93 ms |
-| **Bitmap-driven Huffman (NEON + SSE2)**        |     **25.04 ms** |       **53.50 ms** |
-| force-scalar (reference, current)              |        41.96 ms |         109.98 ms |
-
-\* f32 baseline reproduced from earlier measurements.
-
-The aarch64 column at the "AVX2 + backend-dispatch refactor" row is
-the NEON build measured pre-bitmap; the next row reflects the
-bitmap-driven AC scan plus NEON nonzero-bitmap kernel landed
-together with the SSE2 counterpart on x86_64.
-
-## Out of scope (still)
-
-  - AVX-512 versions of the four kernels. Ice Lake has AVX-512 but the
-    server market is bifurcated (Zen 4 has it, Zen 2/3 don't, Alder
-    Lake P-cores have it disabled in many bins). AVX2 is the safe
-    floor.
-  - Full SIMD AC-symbol-emission (run-length + magnitude + Huffman
-    table lookup + bit-writer drain). The bitmap is now SIMD'd, but
-    the per-nonzero emission stays scalar — it's tight enough that
-    LLVM autovectorizes the bit-writer drain and the table lookups
-    don't reshape cleanly into SIMD.
-  - x86 32-bit and SSE2-only fallback. Non-AVX2 x86_64 already runs
-    via the scalar path through runtime feature detection; AVX2 has
-    been the de-facto floor for new code since ~2014. (SSE2 is the
-    x86_64-v1 baseline and is always available for the Huffman
-    nonzero-bitmap kernel.)
-
-## vs `image` crate (added in 0.3.0)
-
-`image` is the de-facto Rust image library. It bundles a scalar JPEG
-encoder and routes JPEG decode through `zune-jpeg` (SIMD-accelerated).
-The numbers below are from `tests/comparison_bench.rs` (50 warmed
-iterations, single timed batch) on the same hosts as the
-self-comparison tables above.
-
-### Encode (RGB → JPEG, q=80, 4:2:0)
-
-| Host                                | Resolution | ours        | image       | ratio (img/ours) |
-| ----------------------------------- | ---------- | ----------: | ----------: | ---------------: |
-| Apple M-series (NEON)               | 1592×1124  |     5.66 ms |    14.49 ms |            2.56× |
-|                                     | 1920×1080  |     6.20 ms |    15.99 ms |            2.58× |
-|                                     | 3840×2160  |    24.33 ms |    61.75 ms |            2.54× |
-| Intel Xeon Platinum 8370C (AVX2)    | 1592×1124  |    16.03 ms |    62.01 ms |            3.87× |
-|                                     | 1920×1080  |    18.34 ms |    71.32 ms |            3.89× |
-|                                     | 3840×2160  |    72.09 ms |   276.49 ms |            3.84× |
+For reference, our 4:4:4 and 4:2:2 numbers are in Section A above —
+`image` only supports 4:2:0 so the ratio above is the fair encode-
+vs-encode comparison.
 
 ### Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
 
-| Host                                | Resolution | ours        | image       | ratio (img/ours) |
-| ----------------------------------- | ---------- | ----------: | ----------: | ---------------: |
-| Apple M-series (NEON)               | 1592×1124  |    11.11 ms |     4.22 ms |            0.38× |
-|                                     | 1920×1080  |    12.68 ms |     4.88 ms |            0.38× |
-|                                     | 3840×2160  |    50.17 ms |    19.04 ms |            0.38× |
-| Intel Xeon Platinum 8370C (AVX2)    | 1592×1124  |    23.66 ms |     9.30 ms |            0.39× |
-|                                     | 1920×1080  |    27.01 ms |    10.70 ms |            0.40× |
-|                                     | 3840×2160  |   107.64 ms |    46.47 ms |            0.43× |
+| Host                 | Resolution | ours       | image     | ratio (img/ours) |
+| -------------------- | ---------- | ---------: | --------: | ---------------: |
+| Apple M-series (NEON) | 1592×1124 |   10.55 ms |   4.39 ms |            0.42× |
+|                      | 1920×1080  |   12.16 ms |   4.97 ms |            0.41× |
+|                      | 3840×2160  |   48.30 ms |  19.65 ms |            0.41× |
+| Intel Xeon (AVX2)    | 1592×1124  |   41.56 ms |  18.32 ms |            0.44× |
+|                      | 1920×1080  |   47.61 ms |  20.84 ms |            0.44× |
+|                      | 3840×2160  |  186.20 ms |  97.79 ms |            0.53× |
 
-Decode is currently scalar (libjpeg-turbo's `jidctint` IDCT, integer
-YCbCr→RGB, box upsample). `image`'s decode goes through `zune-jpeg`
-with NEON / AVX2 IDCT and color paths, which is why it leads on
-decode by roughly the same factor our encoder leads on encode.
-Decoder SIMD is the headline 0.4.0 work item; until then, roundtrip
-throughput (encode + decode) is roughly even between the two crates
-on these resolutions.
+Our decoder is still scalar (libjpeg-turbo's `jidctint` IDCT,
+integer YCbCr→RGB, box / fancy upsample). `zune-jpeg` has SIMD IDCT
+and color paths, which is why it leads decode by roughly the same
+factor we lead encode. Decoder SIMD is on the roadmap; for now,
+roundtrip throughput (encode + decode combined) is close to a wash
+between the two crates on these sizes.
 
-### Reproducibility
+---
 
-```sh
-cargo test --release --test comparison_bench -- --nocapture comparison_print
+## Where the SIMD speedup is
+
+A rough per-stage breakdown for 4K 4:2:0 q=80 encode (estimated
+from `cargo flamegraph`, not committed to the repo):
+
+```
+Color/downsample      ~25%   NEON ~3.0× / AVX2 ~3.0× / scalar 1.0×
+Forward DCT           ~20%   NEON ~2.5× / AVX2 ~2.7× / scalar 1.0×
+Quantize+zig-zag      ~10%   NEON ~1.8× / AVX2 ~2.5× / scalar 1.0×
+Huffman (64-bit acc + bitmap)  ~30%   NEON-bitmap ~1.4× / SSE2-bitmap ~1.4×
+Marker writes/IO      ~15%   scalar in both
 ```
 
-Run on both an Apple M-series and a Linux x86_64 host with AVX2 to
-reproduce the per-host columns above. The harness uses
-deterministically generated pixel content (`make_image` in
-`tests/comparison_bench.rs`) so runs on different hosts compare
-apples-to-apples.
+Per-stage SIMD bodies hit close to expected speedups; whole-pipeline
+numbers are bounded by Amdahl on the (still partially scalar)
+Huffman emitter and the unavoidable serial marker/IO sections.
+
+## Out of scope
+
+- AVX-512 versions of the four kernels. The server market is
+  bifurcated (Zen 4 yes, Zen 2/3 no, Alder Lake P-cores bin-disabled);
+  AVX2 stays the floor for x86_64 in this crate.
+- Full SIMD AC-symbol-emission. The bitmap is SIMD; the per-nonzero
+  emission stays scalar — it's tight enough that LLVM autovectorizes
+  the bit-writer drain and table lookups don't reshape cleanly into
+  SIMD.
+- Decoder SIMD. Tracked for a later release; until then the scalar
+  decoder is bit-correct and roundtrip-tested but slower than
+  `zune-jpeg`.
+
+---
+
+## Historical context (cumulative timeline, 4K 4:2:0 q=80)
+
+This crate started as an f32 AAN DCT scalar baseline and has moved
+through four pass-shaped SIMD ports. Numbers below are from the
+Apple M-series column where directly measured; Intel column only has
+entries from the point AVX2 landed (the older Ice Lake host used in
+the 0.3.x measurements is no longer available, so 0.5.0 Intel
+numbers are on Broadwell and not directly comparable to prior
+releases on that axis).
+
+| Configuration                                  | aarch64    | x86_64           |
+| ---------------------------------------------- | ---------: | ---------------: |
+| f32 AAN baseline (scalar)                      |  ~51.44 ms\* |               — |
+| Integer LL&M + NEON kernels                    |    37.92 ms |               — |
+| + 64-bit Huffman accumulator                   |    27.23 ms |               — |
+| + AVX2 + backend-dispatch refactor (0.3.x)     |    28.50 ms |          63.93 ms (Ice Lake) |
+| + Bitmap-driven Huffman (NEON + SSE2)          |    25.04 ms |          53.50 ms (Ice Lake) |
+| **0.5.0 current** (above + threading + optimized Huffman, single-thread baseline) |    25.80 ms |        112.19 ms (Broadwell) |
+| **0.5.0 with `threads=auto`**                  |  **13.90 ms** |      **76.78 ms** (Broadwell) |
+
+\* f32 baseline reproduced from earlier measurements; not re-measured
+for 0.5.0.
+
+The 0.5.0 row on aarch64 is flat vs 0.4.0 single-thread (no encoder
+hot-path changes that release; the work was on the decoder + the
+opt-in `threads`, `restart_interval`, `optimize_huffman`, and custom
+quant-table APIs). The threading speedup is the new headline at 4K.
