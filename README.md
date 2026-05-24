@@ -22,19 +22,25 @@ let rgb = decode::decode(&out, PixelFormat::Rgb)?;
 
 The encoder ships NEON-on-aarch64 and AVX2-on-x86_64 kernels
 translated from libjpeg-turbo; non-SIMD targets fall through to a
-bit-exact scalar reference. The decoder added in 0.3.0 is currently
-scalar (libjpeg-turbo's `jidctint` reference); SIMD decode kernels
-and progressive (SOF2) scan support are on the 0.4.0 roadmap.
+bit-exact scalar reference. The decoder reads baseline (SOF0) and
+progressive (SOF2) Huffman streams with fancy (interpolating) chroma
+upsample on the standard 4:2:0 / 4:2:2 / 4:4:0 layouts; it stays
+scalar by design — the SIMD-encode advantage is the headline win, so
+SIMD decode kernels are the 0.6.0 work item, not 0.4.0's.
 
 ## Why
 
 `image` crate's bundled JPEG support is solid but the encoder is
 purely scalar. Our SIMD encoder lifts whole-pipeline throughput
 roughly **2.5×** on Apple Silicon and **3.9×** on Intel Ice Lake
-versus `image`'s encoder on the same content. The decoder on the
-other hand is a scalar reference today; it sits **~2.5× behind**
-`image`'s SIMD decoder (which goes through `zune-jpeg` under the
-hood). On a roundtrip workload the two crates are roughly even.
+versus `image`'s encoder on the same content. The decoder is a
+scalar `jidctint` reference; it sits **~2.5× behind** `image`'s
+SIMD decoder (which goes through `zune-jpeg`) but matches it on
+coverage — baseline + progressive Huffman with fancy chroma
+upsample, output in any of eight pixel layouts. On a roundtrip
+workload the two crates come out roughly even; the
+"SIMD-encode + cover-everything-on-decode" combination is the
+shape this crate targets.
 
 ## Performance
 
@@ -51,8 +57,9 @@ Apple M-series (NEON) and Intel Xeon Platinum 8370C (Ice Lake-SP).
 
 ### vs `image` crate — decode (JPEG → RGB)
 
-`image` uses `zune-jpeg` (SIMD-accelerated); our decoder is currently
-scalar. Decoder SIMD is the headline 0.4.0 work item.
+`image` uses `zune-jpeg` (SIMD-accelerated); our decoder is scalar
+by design. Decoder SIMD is the 0.6.0 work item; 0.4.0 widened decode
+*coverage* (progressive + fancy upsample) rather than perf.
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Xeon 8370C) | image (Xeon 8370C) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ----------------: | -----------------: | ------: |
@@ -79,7 +86,7 @@ breakdown in [BENCH.md](BENCH.md).
 ```toml
 # Cargo.toml
 [dependencies]
-jpeg-rusturbo = "0.3"
+jpeg-rusturbo = "0.4"
 ```
 
 ### Encode
@@ -125,10 +132,10 @@ println!("{}x{}, {} components", info.width, info.height, info.components);
 let pixels = dec.decode(PixelFormat::Rgba)?;
 ```
 
-Output can be requested in any of the eight pixel layouts. The
-decoder is currently **baseline (SOF0) only** — progressive (SOF2)
-JPEGs return `DecodeError::Unsupported`. Progressive support is on
-the 0.4.0 roadmap.
+Output can be requested in any of the eight pixel layouts. Both
+**baseline (SOF0) and progressive (SOF2)** Huffman streams are
+accepted; arithmetic-coded (SOF9-15), hierarchical, and lossless
+modes return `DecodeError::Unsupported`.
 
 ## Features
 
@@ -152,19 +159,28 @@ the 0.4.0 roadmap.
 - **Bit-exact across backends** — cross-check tests assert that NEON,
   scalar, and AVX2 / SSE2 produce byte-identical JPEG output.
 
-### Decoder (new in 0.3.0)
+### Decoder
 
-- **Baseline Huffman (SOF0)** — DC + AC scan decode, libjpeg-turbo
-  `jidctint`-style scalar IDCT, box-replication chroma upsample, and
-  YCbCr → RGB convert into any of the eight output `PixelFormat`
-  layouts. Restart markers (RSTn) supported.
-- **Cross-decoder validation** — the test suite asserts per-pixel
-  agreement with `image`'s decoder (≤ 3 / channel, ≥ 40 dB PSNR) on
-  our encoder's output.
-- **Self-roundtrip tests** — encode → decode → PSNR floor, run
-  across 4:4:4 / 4:2:2 / 4:2:0 at multiple sizes / edge cases.
-- **0.4.0 roadmap** — progressive (SOF2), fancy (interpolating)
-  upsample, NEON + AVX2 IDCT / YCbCr→RGB / upsample kernels.
+- **Baseline (SOF0) + Progressive (SOF2) Huffman** — full scan loop
+  with DC first / DC refine / AC first / AC refine bands, EOBRUN
+  bookkeeping, multi-SOS streams (per-component baseline scans
+  included), and restart-marker (RSTn) handling.
+- **Fancy (interpolating) chroma upsample** — libjpeg-turbo's
+  `h2v2_fancy` / `h2v1_fancy` 2-tap (3 center, 1 neighbor) filter on
+  the standard 4:2:0 / 4:2:2 / 4:4:0 layouts. Wider sampling factors
+  (4:1:1 etc.) fall back to box replication.
+- **Scalar `jidctint`-style IDCT** — bit-exact against libjpeg-turbo's
+  integer reference. Decoder SIMD kernels are scheduled for 0.6.0.
+- **Eight output pixel layouts** via the same `PixelFormat` enum the
+  encoder accepts.
+- **Cross-decoder validation** — `tests/comparison_progressive.rs`
+  asserts per-channel agreement with `image`'s decoder (≤ 3 / channel,
+  ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,
+  baseline 4:2:0 odd-size, progressive 4:2:0, two progressive 4:4:4
+  sizes).
+- **Known gaps** — arithmetic / hierarchical / lossless are not
+  in scope; baseline non-interleaved scans with chroma vertical
+  subsampling (rare in practice) remain a recorded limitation.
 
 The encoder's Huffman AC scan is bitmap-driven: a `u64` nonzero
 bitmap collapses zero runs into a single `trailing_zeros` jump per
@@ -195,10 +211,14 @@ the kernel modules + add a `cfg` arm in `arch/mod.rs`"; see
 
 Pre-1.0, single-author project. The encoder produces standard
 baseline JPEG that decodes round-trip-equivalent through any
-conforming decoder; the decoder reads any baseline JPEG that
-conforms to ITU-T T.81 (verified against `image`'s decoder in the
-test suite). Public API has settled but `0.x` reserves the right to
-evolve before `1.0`.
+conforming decoder; the decoder reads baseline and progressive
+Huffman JPEGs that conform to ITU-T T.81 (verified against
+`image`'s decoder on a vendored fixture corpus). Public API has
+settled but `0.x` reserves the right to evolve before `1.0`. The
+next two minor releases focus on encoder differentiation (0.5.0 —
+optimized Huffman, trellis quant, multi-thread encode) and
+decoder SIMD (0.6.0 — IDCT / color convert / upsample kernels in
+NEON + AVX2).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
