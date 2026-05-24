@@ -48,31 +48,24 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    pub fn from_std(table: &StdHuffman) -> Self {
-        // Canonical-Huffman expansion (Annex C.2). Walk lengths 1..=16,
-        // assigning the next consecutive code to each value, with a
-        // left-shift between length groups. This is exactly how a JPEG
-        // decoder reconstructs the same table from the DHT segment.
-        //
-        // Pre-check the integrity of the input: `bits.iter().sum() ==
-        // values.len()` is the canonical-Huffman invariant. The standard
-        // tables in `tables.rs` satisfy this; the assert is here so a
-        // future caller building a custom `StdHuffman` gets a clear
-        // error instead of a silent OOB index.
-        let total_codes: usize = table.bits.iter().map(|&b| b as usize).sum();
+    /// Build a packed encoder table directly from a DHT-format
+    /// (bits[16], values) pair. Used by the optimized-Huffman path,
+    /// which constructs its tables at runtime and never materializes a
+    /// `StdHuffman`.
+    pub fn from_bits_values(bits: &[u8; 16], values: &[u8]) -> Self {
+        let total_codes: usize = bits.iter().map(|&b| b as usize).sum();
         debug_assert_eq!(
             total_codes,
-            table.values.len(),
-            "StdHuffman::bits sum must equal values.len()",
+            values.len(),
+            "bits sum must equal values.len()",
         );
-
         let mut packed: [u32; 256] = [0; 256];
         let mut next_code: u32 = 0;
         let mut value_idx: usize = 0;
         for length in 1..=16u32 {
-            let count = table.bits[(length - 1) as usize] as usize;
+            let count = bits[(length - 1) as usize] as usize;
             for _ in 0..count {
-                let sym = table.values[value_idx] as usize;
+                let sym = values[value_idx] as usize;
                 packed[sym] = (length << 16) | next_code;
                 next_code += 1;
                 value_idx += 1;
@@ -80,6 +73,11 @@ impl HuffmanTable {
             next_code <<= 1;
         }
         HuffmanTable { packed }
+    }
+
+    pub fn from_std(table: &StdHuffman) -> Self {
+        // Canonical-Huffman expansion (Annex C.2): see `from_bits_values`.
+        Self::from_bits_values(&table.bits, table.values)
     }
 
     /// Helper for tests: split `packed[sym]` back into `(code, length)`.
@@ -311,7 +309,7 @@ pub fn encode_block<W: io::Write>(
 ///     positive `x`: low `size` bits of `x`;
 ///     negative `x`: low `size` bits of `x - 1` (1's complement).
 #[inline]
-fn magnitude_category(value: i32) -> (u8, u32) {
+pub(crate) fn magnitude_category(value: i32) -> (u8, u32) {
     if value == 0 {
         return (0, 0);
     }

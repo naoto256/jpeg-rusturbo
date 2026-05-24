@@ -115,6 +115,7 @@ mod arch;
 mod color;
 pub mod decode;
 mod huffman;
+mod huffman_optimize;
 mod markers;
 mod quant;
 mod tables;
@@ -231,6 +232,7 @@ pub struct JpegEncoder<W: Write> {
     subsampling: ChromaSubsampling,
     restart_interval: u16,
     custom_quant: Option<QuantPair>,
+    optimize_huffman: bool,
 }
 
 impl<W: Write> JpegEncoder<W> {
@@ -251,6 +253,7 @@ impl<W: Write> JpegEncoder<W> {
             subsampling: ChromaSubsampling::Yuv420,
             restart_interval: 0,
             custom_quant: None,
+            optimize_huffman: false,
         }
     }
 
@@ -301,6 +304,23 @@ impl<W: Write> JpegEncoder<W> {
     /// the end of the scan, effectively a no-op.
     pub fn set_restart_interval(&mut self, interval: u16) {
         self.restart_interval = interval;
+    }
+
+    /// Enable two-pass optimized Huffman tables (libjpeg-turbo
+    /// `-optimize`-style). Pass 1 counts the actual symbol frequencies
+    /// on the quantized coefficients of this image; pass 2 builds the
+    /// per-image optimal canonical Huffman tables (T.81 K.2 algorithm
+    /// with K.3 length limiting) and re-emits the scan using them.
+    ///
+    /// Typical savings on photographic content at q=80 are 4-10% in
+    /// file size at identical reconstructed PSNR; cost is roughly one
+    /// extra entropy-pass worth of CPU plus a buffer holding the
+    /// quantized coefficients between passes.
+    ///
+    /// Default is `false` — when off, the encoder's output is
+    /// byte-identical to a build without this setter.
+    pub fn set_optimize_huffman(&mut self, on: bool) {
+        self.optimize_huffman = on;
     }
 
     /// Encode an RGB pixel buffer (3 bytes/pixel) as a complete JPEG
@@ -405,6 +425,19 @@ impl<W: Write> JpegEncoder<W> {
         };
         let div_luma = quant::build_divisors(&luma_q);
         let div_chroma = quant::build_divisors(&chroma_q);
+
+        // Optimized Huffman: run a separate two-pass entry point.
+        // Returns once it has produced a complete stream (SOI..EOI).
+        if self.optimize_huffman {
+            return self.encode_inner_optimize(
+                pixels,
+                width,
+                height,
+                layout,
+                &div_luma,
+                &div_chroma,
+            );
+        }
 
         // Expand the standard Huffman tables into encoder lookups.
         let dc_luma = HuffmanTable::from_std(&STD_LUMA_DC);
@@ -511,6 +544,219 @@ impl<W: Write> JpegEncoder<W> {
         markers::write_eoi(&mut self.out)?;
         Ok(())
     }
+
+    /// Two-pass optimized-Huffman entry point. Pass 1: DCT + quantize
+    /// every block into per-component buffers and count the symbol
+    /// frequencies the standard encoder would have emitted. Pass 2:
+    /// build optimal canonical Huffman tables from those frequencies,
+    /// write the DHT segments, and entropy-code the buffered blocks.
+    fn encode_inner_optimize(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        div_luma: &quant::Divisors,
+        div_chroma: &quant::Divisors,
+    ) -> io::Result<()> {
+        // Re-derive quant tables for header emission (cheap; matches
+        // exactly what the caller computed).
+        let (luma_q, chroma_q) = match &self.custom_quant {
+            Some((l, c)) => (**l, **c),
+            None => (
+                scale_quant_table(&STD_LUMA_QUANT, self.quality),
+                scale_quant_table(&STD_CHROMA_QUANT, self.quality),
+            ),
+        };
+        match self.subsampling {
+            ChromaSubsampling::Yuv444 => encode_optimized::<Yuv444Scheme, _>(
+                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
+            ),
+            ChromaSubsampling::Yuv422 => encode_optimized::<Yuv422Scheme, _>(
+                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
+            ),
+            ChromaSubsampling::Yuv420 => encode_optimized::<Yuv420Scheme, _>(
+                self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
+            ),
+        }
+    }
+}
+
+/// Shared body of the optimized-Huffman path, parameterized over the
+/// sampling scheme. Kept as a free function so the per-scheme const
+/// `Y_BLOCKS_PER_MCU` is monomorphized into the hot loops.
+#[allow(clippy::too_many_arguments)]
+fn encode_optimized<S: SamplingScheme, W: Write>(
+    enc: &mut JpegEncoder<W>,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    luma_q: &[u8; 64],
+    chroma_q: &[u8; 64],
+    div_luma: &quant::Divisors,
+    div_chroma: &quant::Divisors,
+) -> io::Result<()> {
+    let mcus_x = width.div_ceil(S::MCU_W);
+    let mcus_y = height.div_ceil(S::MCU_H);
+    let total_mcus = (mcus_x as usize) * (mcus_y as usize);
+
+    // ---- Pass 1: DCT + quantize all blocks; collect into per-component
+    // buffers. Frequencies are counted in a second walk that mirrors
+    // pass 2's emit order (matters when restart_interval is non-zero —
+    // DC predictors reset and the count must reflect that).
+    let mut y_blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus * S::Y_BLOCKS_PER_MCU);
+    let mut cb_blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus);
+    let mut cr_blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus);
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            S::quantize_one_mcu(
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
+                div_luma,
+                div_chroma,
+                &mut y_blocks,
+                &mut cb_blocks,
+                &mut cr_blocks,
+            );
+        }
+    }
+
+    // ---- Frequency counting (scan order, with restart-interval-aware
+    // DC predictor reset so pass 2 sees the same DC diffs).
+    let mut dc_luma_freq = [0u32; 257];
+    let mut ac_luma_freq = [0u32; 257];
+    let mut dc_chroma_freq = [0u32; 257];
+    let mut ac_chroma_freq = [0u32; 257];
+    {
+        let restart = enc.restart_interval as u32;
+        let mut prev_dc = DcPredictors::default();
+        let mut mcus_since_rst: u32 = 0;
+        let y_mcus = y_blocks.chunks_exact(S::Y_BLOCKS_PER_MCU);
+        for (y_chunk, (cb, cr)) in y_mcus.zip(cb_blocks.iter().zip(cr_blocks.iter())) {
+            if restart > 0 && mcus_since_rst == restart {
+                prev_dc = DcPredictors::default();
+                mcus_since_rst = 0;
+            }
+            for y in y_chunk {
+                prev_dc.y = huffman_optimize::count_block(
+                    y,
+                    prev_dc.y,
+                    &mut dc_luma_freq,
+                    &mut ac_luma_freq,
+                );
+            }
+            prev_dc.cb = huffman_optimize::count_block(
+                cb,
+                prev_dc.cb,
+                &mut dc_chroma_freq,
+                &mut ac_chroma_freq,
+            );
+            prev_dc.cr = huffman_optimize::count_block(
+                cr,
+                prev_dc.cr,
+                &mut dc_chroma_freq,
+                &mut ac_chroma_freq,
+            );
+            mcus_since_rst += 1;
+        }
+    }
+
+    // ---- Build optimal tables.
+    let opt_dc_luma = huffman_optimize::build_optimal_huffman(
+        &dc_luma_freq,
+        &STD_LUMA_DC.bits,
+        STD_LUMA_DC.values,
+    );
+    let opt_ac_luma = huffman_optimize::build_optimal_huffman(
+        &ac_luma_freq,
+        &STD_LUMA_AC.bits,
+        STD_LUMA_AC.values,
+    );
+    let opt_dc_chroma = huffman_optimize::build_optimal_huffman(
+        &dc_chroma_freq,
+        &STD_CHROMA_DC.bits,
+        STD_CHROMA_DC.values,
+    );
+    let opt_ac_chroma = huffman_optimize::build_optimal_huffman(
+        &ac_chroma_freq,
+        &STD_CHROMA_AC.bits,
+        STD_CHROMA_AC.values,
+    );
+
+    let dc_luma_tab = HuffmanTable::from_bits_values(&opt_dc_luma.bits, &opt_dc_luma.values);
+    let ac_luma_tab = HuffmanTable::from_bits_values(&opt_ac_luma.bits, &opt_ac_luma.values);
+    let dc_chroma_tab = HuffmanTable::from_bits_values(&opt_dc_chroma.bits, &opt_dc_chroma.values);
+    let ac_chroma_tab = HuffmanTable::from_bits_values(&opt_ac_chroma.bits, &opt_ac_chroma.values);
+
+    // ---- Header emission.
+    markers::write_soi(&mut enc.out)?;
+    markers::write_app0_jfif(&mut enc.out)?;
+    markers::write_dqt(&mut enc.out, 0, luma_q)?;
+    markers::write_dqt(&mut enc.out, 1, chroma_q)?;
+    let (h_y, v_y) = S::H_V;
+    markers::write_sof0(
+        &mut enc.out,
+        width as u16,
+        height as u16,
+        &[(1, h_y, v_y, 0), (2, 1, 1, 1), (3, 1, 1, 1)],
+    )?;
+    markers::write_dht_bits_values(&mut enc.out, 0, 0, &opt_dc_luma.bits, &opt_dc_luma.values)?;
+    markers::write_dht_bits_values(&mut enc.out, 1, 0, &opt_ac_luma.bits, &opt_ac_luma.values)?;
+    markers::write_dht_bits_values(
+        &mut enc.out,
+        0,
+        1,
+        &opt_dc_chroma.bits,
+        &opt_dc_chroma.values,
+    )?;
+    markers::write_dht_bits_values(
+        &mut enc.out,
+        1,
+        1,
+        &opt_ac_chroma.bits,
+        &opt_ac_chroma.values,
+    )?;
+    if enc.restart_interval > 0 {
+        markers::write_dri(&mut enc.out, enc.restart_interval)?;
+    }
+    markers::write_sos(&mut enc.out, &[(1, 0, 0), (2, 1, 1), (3, 1, 1)])?;
+
+    // ---- Pass 2: entropy-code from the buffered blocks using the
+    // optimal tables. Mirrors the pass-1 walk exactly so DC predictors
+    // and restart markers line up.
+    let mut bw = BitWriter::new(&mut enc.out);
+    bw.reserve(y_blocks.len() * 32);
+    let restart = enc.restart_interval as u32;
+    let mut prev_dc = DcPredictors::default();
+    let mut mcus_since_rst: u32 = 0;
+    let mut next_rst: u8 = 0;
+    let y_mcus = y_blocks.chunks_exact(S::Y_BLOCKS_PER_MCU);
+    for (mcu_idx, (y_chunk, (cb, cr))) in y_mcus
+        .zip(cb_blocks.iter().zip(cr_blocks.iter()))
+        .enumerate()
+    {
+        if restart > 0 && mcus_since_rst == restart && mcu_idx < total_mcus {
+            bw.write_restart(next_rst)?;
+            next_rst = (next_rst + 1) & 7;
+            mcus_since_rst = 0;
+            prev_dc = DcPredictors::default();
+        }
+        for y in y_chunk {
+            prev_dc.y = encode_block(&mut bw, y, prev_dc.y, &dc_luma_tab, &ac_luma_tab)?;
+        }
+        prev_dc.cb = encode_block(&mut bw, cb, prev_dc.cb, &dc_chroma_tab, &ac_chroma_tab)?;
+        prev_dc.cr = encode_block(&mut bw, cr, prev_dc.cr, &dc_chroma_tab, &ac_chroma_tab)?;
+        mcus_since_rst += 1;
+    }
+    bw.flush_to_byte_boundary()?;
+
+    markers::write_eoi(&mut enc.out)?;
+    Ok(())
 }
 
 /// Per-MCU running DC predictor for the three components. Difference-coded
@@ -535,6 +781,30 @@ trait SamplingScheme {
     /// One MCU's pixel footprint `(width, height)`.
     const MCU_W: u32;
     const MCU_H: u32;
+    /// Y blocks per MCU (= H * V; 4 for 4:2:0, 2 for 4:2:2, 1 for 4:4:4).
+    /// Used by the optimized-Huffman two-pass path to size the per-component
+    /// coefficient buffer.
+    const Y_BLOCKS_PER_MCU: usize;
+
+    /// Two-pass companion to [`encode_one_mcu`]: do the extract + DCT + quantize
+    /// half but append the quantized + zig-zagged blocks into per-component
+    /// buffers instead of entropy-coding them. Pass 1 of the optimized-Huffman
+    /// pipeline uses this; pass 2 then walks the buffers and calls
+    /// `encode_block` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        y_blocks: &mut Vec<[i16; 64]>,
+        cb_blocks: &mut Vec<[i16; 64]>,
+        cr_blocks: &mut Vec<[i16; 64]>,
+    );
 
     #[allow(clippy::too_many_arguments)]
     fn encode_one_mcu<W: Write>(
@@ -560,6 +830,42 @@ impl SamplingScheme for Yuv444Scheme {
     const H_V: (u8, u8) = (1, 1);
     const MCU_W: u32 = 8;
     const MCU_H: u32 = 8;
+    const Y_BLOCKS_PER_MCU: usize = 1;
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        y_blocks: &mut Vec<[i16; 64]>,
+        cb_blocks: &mut Vec<[i16; 64]>,
+        cr_blocks: &mut Vec<[i16; 64]>,
+    ) {
+        let mut y = [0i16; 64];
+        let mut cb = [0i16; 64];
+        let mut cr = [0i16; 64];
+        color::extract_block_ycbcr(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut y,
+            &mut cb,
+            &mut cr,
+        );
+        arch::backend::dct::fdct_islow(&mut y);
+        y_blocks.push(quant::quantize_and_zigzag(&y, div_luma));
+        arch::backend::dct::fdct_islow(&mut cb);
+        cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
+        arch::backend::dct::fdct_islow(&mut cr);
+        cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+    }
 
     fn encode_one_mcu<W: Write>(
         bw: &mut BitWriter<W>,
@@ -617,6 +923,44 @@ impl SamplingScheme for Yuv420Scheme {
     const H_V: (u8, u8) = (2, 2);
     const MCU_W: u32 = 16;
     const MCU_H: u32 = 16;
+    const Y_BLOCKS_PER_MCU: usize = 4;
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        y_blocks: &mut Vec<[i16; 64]>,
+        cb_blocks: &mut Vec<[i16; 64]>,
+        cr_blocks: &mut Vec<[i16; 64]>,
+    ) {
+        let mut ys = [[0i16; 64]; 4];
+        let mut cb = [0i16; 64];
+        let mut cr = [0i16; 64];
+        color::extract_mcu_420(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut ys,
+            &mut cb,
+            &mut cr,
+        );
+        for y in ys.iter_mut() {
+            arch::backend::dct::fdct_islow(y);
+            y_blocks.push(quant::quantize_and_zigzag(y, div_luma));
+        }
+        arch::backend::dct::fdct_islow(&mut cb);
+        cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
+        arch::backend::dct::fdct_islow(&mut cr);
+        cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+    }
 
     fn encode_one_mcu<W: Write>(
         bw: &mut BitWriter<W>,
@@ -676,6 +1020,44 @@ impl SamplingScheme for Yuv422Scheme {
     const H_V: (u8, u8) = (2, 1);
     const MCU_W: u32 = 16;
     const MCU_H: u32 = 8;
+    const Y_BLOCKS_PER_MCU: usize = 2;
+
+    fn quantize_one_mcu(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        mx: u32,
+        my: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        y_blocks: &mut Vec<[i16; 64]>,
+        cb_blocks: &mut Vec<[i16; 64]>,
+        cr_blocks: &mut Vec<[i16; 64]>,
+    ) {
+        let mut ys = [[0i16; 64]; 2];
+        let mut cb = [0i16; 64];
+        let mut cr = [0i16; 64];
+        color::extract_mcu_422(
+            pixels,
+            width,
+            height,
+            layout,
+            mx * Self::MCU_W,
+            my * Self::MCU_H,
+            &mut ys,
+            &mut cb,
+            &mut cr,
+        );
+        for y in ys.iter_mut() {
+            arch::backend::dct::fdct_islow(y);
+            y_blocks.push(quant::quantize_and_zigzag(y, div_luma));
+        }
+        arch::backend::dct::fdct_islow(&mut cb);
+        cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
+        arch::backend::dct::fdct_islow(&mut cr);
+        cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+    }
 
     fn encode_one_mcu<W: Write>(
         bw: &mut BitWriter<W>,
@@ -758,9 +1140,7 @@ fn encode_scan<S: SamplingScheme, W: Write>(
     let total_mcus = mcus_x as u64 * mcus_y as u64;
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
-            if restart_interval > 0
-                && mcus_since_rst == restart_interval
-                && mcu_count < total_mcus
+            if restart_interval > 0 && mcus_since_rst == restart_interval && mcu_count < total_mcus
             {
                 bw.write_restart(next_rst)?;
                 next_rst = (next_rst + 1) & 7;
