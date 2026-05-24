@@ -59,22 +59,24 @@ pub fn decode_progressive(
 
     // ---- Allocate per-component coefficient buffer ----
     //
-    // The block grid is sized as `mcus_{x,y} * comp.{h,v}`, matching
-    // the baseline plane allocation so the two stay in lock-step. The
-    // alternative (sizing by `(W*Hi).div_ceil(Hmax*8)`) can come out
-    // slightly smaller for unusual sampling factors and breaks the
-    // assumption in `finalize_to_planes` that each component fills a
-    // dense `mcus_x * Hi` x `mcus_y * Vi` block grid.
+    // Block count per row / column is `ceil(W*Hi/(Hmax*8))` —
+    // matching what the encoder emits per T.81 (A.2.4). An earlier
+    // attempt used `mcus_x * Hi` which over-counts by one block per
+    // row when `W mod (Hmax*8) != 0` (e.g. a 533-wide 4:2:0 image:
+    // `ceil(533*2/16) = 67` vs. `ceil(533/16)*2 = 68`), causing the
+    // scan loop to over-read entropy and de-sync. Single-component
+    // frames are normalized to H=V=1 in `parse_sof`, so this is also
+    // correct for the grayscale 900x675 H=2 V=2 case.
     let mut comps: Vec<CoeffComponent> = Vec::with_capacity(frame.components.len());
     let h_max = frame.h_max() as usize;
     let v_max = frame.v_max() as usize;
-    let mcu_w_pixels = h_max * 8;
-    let mcu_h_pixels = v_max * 8;
-    let mcus_x = (frame.width as usize).div_ceil(mcu_w_pixels).max(1);
-    let mcus_y = (frame.height as usize).div_ceil(mcu_h_pixels).max(1);
     for comp in &frame.components {
-        let blocks_x = mcus_x * comp.h as usize;
-        let blocks_y = mcus_y * comp.v as usize;
+        let blocks_x = (frame.width as usize * comp.h as usize)
+            .div_ceil(h_max * 8)
+            .max(1);
+        let blocks_y = (frame.height as usize * comp.v as usize)
+            .div_ceil(v_max * 8)
+            .max(1);
         let total = blocks_x.checked_mul(blocks_y).ok_or(DecodeError::Malformed(
             "progressive block count overflow",
         ))?;
