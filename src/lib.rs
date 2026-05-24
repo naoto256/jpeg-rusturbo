@@ -53,13 +53,17 @@
 //! Per-architecture SIMD kernels (NEON on aarch64, AVX2 + SSE2 on
 //! x86_64) are translated from libjpeg-turbo with bit-exact output
 //! guarantees against the scalar reference. Encoder whole-pipeline
-//! speedup vs scalar is ~1.5× on Apple Silicon and ~2.0× on Intel
-//! Ice Lake at 1080p / 4K, q=80. Versus the `image` crate's
-//! scalar encoder, jpeg-rusturbo's encoder is ~2.5× / ~3.9× faster
-//! (Apple M / Ice Lake). The decoder is scalar by design — it lags
-//! `image`'s SIMD decoder by ~2.5× but matches its coverage
-//! (baseline + progressive Huffman, fancy chroma upsample, all eight
-//! pixel layouts). Decoder SIMD is scheduled for 0.6.0. See
+//! speedup vs scalar is ~1.7× on Apple Silicon and ~1.75× on Intel
+//! Broadwell at 1080p / 4K, q=80, 4:2:0. Versus the `image` crate's
+//! scalar encoder, jpeg-rusturbo's encoder is ~2.5× / ~3.2× faster
+//! (Apple M / Broadwell). Opt-in [`JpegEncoder::set_threads`] adds
+//! another 1.4–1.8× on top via MCU-row parallelism; opt-in
+//! [`JpegEncoder::set_optimize_huffman`] trims output size ~5%
+//! across subsampling/quality at ~1.5–1.8× encode cost. The decoder
+//! is scalar by design — it lags `image`'s SIMD decoder
+//! (zune-jpeg-backed) by ~2.4× but matches its coverage (baseline +
+//! progressive Huffman, fancy chroma upsample, all eight pixel
+//! layouts). Decoder SIMD is on the post-0.5 roadmap. See
 //! [`BENCH.md`] in the repository for detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
