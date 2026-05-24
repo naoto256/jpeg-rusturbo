@@ -56,10 +56,11 @@
 //! speedup vs scalar is ~1.5× on Apple Silicon and ~2.0× on Intel
 //! Ice Lake at 1080p / 4K, q=80. Versus the `image` crate's
 //! scalar encoder, jpeg-rusturbo's encoder is ~2.5× / ~3.9× faster
-//! (Apple M / Ice Lake). The decoder added in 0.3.0 is currently
-//! scalar — it lags `image`'s SIMD decoder by ~2.5× until decoder
-//! SIMD lands in 0.4.0. See [`BENCH.md`] in the repository for
-//! detailed numbers.
+//! (Apple M / Ice Lake). The decoder is scalar by design — it lags
+//! `image`'s SIMD decoder by ~2.5× but matches its coverage
+//! (baseline + progressive Huffman, fancy chroma upsample, all eight
+//! pixel layouts). Decoder SIMD is scheduled for 0.6.0. See
+//! [`BENCH.md`] in the repository for detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
