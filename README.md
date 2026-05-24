@@ -179,9 +179,8 @@ modes return `DecodeError::Unsupported`.
   ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,
   baseline 4:2:0 odd-size, progressive 4:2:0, two progressive 4:4:4
   sizes).
-- **Known gaps** — arithmetic / hierarchical / lossless are not
-  in scope; baseline non-interleaved scans with chroma vertical
-  subsampling (rare in practice) remain a recorded limitation.
+- **Known gaps** — arithmetic / hierarchical / lossless decode are
+  not in scope.
 
 The encoder's Huffman AC scan is bitmap-driven: a `u64` nonzero
 bitmap collapses zero runs into a single `trailing_zeros` jump per
