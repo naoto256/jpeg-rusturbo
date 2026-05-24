@@ -1,13 +1,13 @@
 [package]
 name = "jpeg-rusturbo"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"   # edition 2024 stabilized in Rust 1.85.
 license = "MIT OR Apache-2.0"
-description = "Baseline JPEG encoder with integer LL&M DCT and per-arch SIMD kernels (AArch64 NEON, x86_64 AVX2)."
+description = "SIMD-accelerated baseline JPEG encoder and Huffman (baseline + progressive) decoder."
 repository = "https://github.com/naoto256/jpeg-rusturbo"
 readme = "README.md"
-keywords = ["jpeg", "encoder", "simd", "neon", "avx2"]
+keywords = ["jpeg", "encoder", "decoder", "simd", "neon"]
 categories = ["multimedia::images", "encoding"]
 # Slim the published package: consumers don't need CI configs or the
 # integration test crate. `tests/roundtrip.rs` uses the `image` crate
