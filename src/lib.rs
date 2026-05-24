@@ -221,11 +221,16 @@ impl From<PixelFormat> for PixelLayout {
 /// encoder will produce concatenated streams in the sink, which is
 /// almost certainly not what you want — construct a fresh
 /// `JpegEncoder` per image.
+/// One pair of (luma, chroma) quantization tables in natural order.
+/// Boxed so the encoder struct stays cheap to move around.
+type QuantPair = (Box<[u8; 64]>, Box<[u8; 64]>);
+
 pub struct JpegEncoder<W: Write> {
     out: W,
     quality: u8,
     subsampling: ChromaSubsampling,
     restart_interval: u16,
+    custom_quant: Option<QuantPair>,
 }
 
 impl<W: Write> JpegEncoder<W> {
@@ -245,6 +250,7 @@ impl<W: Write> JpegEncoder<W> {
             quality: quality.clamp(1, 100),
             subsampling: ChromaSubsampling::Yuv420,
             restart_interval: 0,
+            custom_quant: None,
         }
     }
 
@@ -253,6 +259,34 @@ impl<W: Write> JpegEncoder<W> {
     /// start of encoding.
     pub fn set_subsampling(&mut self, s: ChromaSubsampling) {
         self.subsampling = s;
+    }
+
+    /// Override the per-component quantization tables. Values are
+    /// `u8` (8-bit precision, the only one we emit) in **natural row-
+    /// major order** — index 0 = DC, index 63 = highest-frequency AC.
+    /// The encoder writes them out in zig-zag order in the DQT segment
+    /// automatically.
+    ///
+    /// When set, `set_quality()` is bypassed entirely — the supplied
+    /// tables go through verbatim. To recover the default behavior
+    /// (Annex K + quality scaling) call [`clear_quant_tables`].
+    ///
+    /// Each entry must be in `1..=255` (a zero quantizer divides DCT
+    /// coefficients by zero and is rejected by every conforming
+    /// decoder). The encoder doesn't validate the range — pass values
+    /// you actually want emitted.
+    ///
+    /// Intended for advanced workflows: ML-driven RDO, mozjpeg /
+    /// libjpeg-turbo table replication, per-image perceptual tuning.
+    pub fn set_quant_tables(&mut self, luma: [u8; 64], chroma: [u8; 64]) {
+        self.custom_quant = Some((Box::new(luma), Box::new(chroma)));
+    }
+
+    /// Clear any custom quantization tables previously installed via
+    /// [`set_quant_tables`]; subsequent encodes use the Annex K +
+    /// quality-scaled defaults again.
+    pub fn clear_quant_tables(&mut self) {
+        self.custom_quant = None;
     }
 
     /// Emit an `RSTn` restart marker every `interval` MCUs. Restart
@@ -360,10 +394,15 @@ impl<W: Write> JpegEncoder<W> {
             ));
         }
 
-        // Quant tables (8-bit, scaled by quality). Index 0 = luma,
-        // 1 = chroma.
-        let luma_q = scale_quant_table(&STD_LUMA_QUANT, self.quality);
-        let chroma_q = scale_quant_table(&STD_CHROMA_QUANT, self.quality);
+        // Quant tables (8-bit, scaled by quality, OR user-supplied via
+        // `set_quant_tables`). Index 0 = luma, 1 = chroma.
+        let (luma_q, chroma_q) = match &self.custom_quant {
+            Some((l, c)) => (**l, **c),
+            None => (
+                scale_quant_table(&STD_LUMA_QUANT, self.quality),
+                scale_quant_table(&STD_CHROMA_QUANT, self.quality),
+            ),
+        };
         let div_luma = quant::build_divisors(&luma_q);
         let div_chroma = quant::build_divisors(&chroma_q);
 

@@ -297,6 +297,51 @@ fn restart_roundtrip_1080p_420_ri120() {
     run_restart_roundtrip(1920, 1080, 120, ChromaSubsampling::Yuv420, 32.0);
 }
 
+/// Verify the encoder honors a caller-supplied quantization table:
+/// build a max-quality (all-1) table, encode → decode, and assert the
+/// reconstruction is exact (PSNR = infinity for a self-roundtrip when
+/// quantization is lossless).
+#[test]
+fn custom_quant_tables_lossless_q1() {
+    let w = 32;
+    let h = 32;
+    let rgb = gradient_rgb(w, h);
+    let mut jpeg = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
+    enc.set_subsampling(ChromaSubsampling::Yuv444);
+    enc.set_quant_tables([1u8; 64], [1u8; 64]);
+    enc.encode_rgb(&rgb, w, h).expect("encode");
+    let decoded = Decoder::new(&jpeg).unwrap().decode(PixelFormat::Rgb).unwrap();
+    let psnr = psnr_rgb(&rgb, &decoded);
+    // With qi=1 quantization is effectively lossless on the DCT path;
+    // residual error comes only from color conversion rounding (~1 LSB).
+    assert!(
+        psnr >= 45.0,
+        "custom-quant (all-1) PSNR {psnr:.2} dB below expected ~lossless floor",
+    );
+}
+
+/// Verify `clear_quant_tables` restores the quality-scaled default.
+#[test]
+fn custom_quant_clear_falls_back_to_quality() {
+    let w = 32;
+    let h = 32;
+    let rgb = gradient_rgb(w, h);
+
+    let mut jpeg_custom = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut jpeg_custom, 80);
+    enc.set_quant_tables([1u8; 64], [1u8; 64]);
+    enc.clear_quant_tables();
+    enc.encode_rgb(&rgb, w, h).unwrap();
+
+    let mut jpeg_default = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg_default, 80)
+        .encode_rgb(&rgb, w, h)
+        .unwrap();
+
+    assert_eq!(jpeg_custom, jpeg_default, "clear should reproduce default output");
+}
+
 #[test]
 fn self_roundtrip_rgba_output() {
     let w = 64;
