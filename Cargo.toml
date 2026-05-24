@@ -31,3 +31,13 @@ rayon = "1"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Tighten the release profile so the SIMD kernels and the entropy-coder
+# inner loop can be cross-inlined across the per-arch backend boundary.
+# Linker-time codegen at codegen-units=1 lets LLVM see the whole kernel
+# call graph in one shot, which is where the meaningful wins for tight
+# per-MCU loops come from. Cost: longer release-build wall-clock; user
+# debug / `cargo test` (= dev profile) are unaffected.
+[profile.release]
+lto = "fat"
+codegen-units = 1
