@@ -27,67 +27,78 @@ bit-exact scalar reference. The decoder reads baseline (SOF0) and
 progressive (SOF2) Huffman streams with fancy (interpolating) chroma
 upsample on the standard 4:2:0 / 4:2:2 / 4:4:0 layouts; it stays
 scalar by design — the SIMD-encode advantage is the headline win, so
-SIMD decode kernels are the 0.6.0 work item, not 0.4.0's.
+SIMD decode kernels are on the post-0.5 roadmap.
 
 ## Why
 
 `image` crate's bundled JPEG support is solid but the encoder is
-purely scalar. Our SIMD encoder lifts whole-pipeline throughput
-roughly **2.5×** on Apple Silicon and **3.9×** on Intel Ice Lake
-versus `image`'s encoder on the same content. The decoder is a
-scalar `jidctint` reference; it sits **~2.5× behind** `image`'s
-SIMD decoder (which goes through `zune-jpeg`) but matches it on
-coverage — baseline + progressive Huffman with fancy chroma
-upsample, output in any of eight pixel layouts. On a roundtrip
-workload the two crates come out roughly even; the
-"SIMD-encode + cover-everything-on-decode" combination is the
-shape this crate targets.
+purely scalar and 4:2:0-only. Our SIMD encoder lifts whole-pipeline
+throughput roughly **2.5×** on Apple Silicon and **3.2×** on Intel
+Broadwell versus `image`'s encoder on the same content, supports
+4:4:4 / 4:2:2 / 4:2:0, and opts in to multi-threaded MCU-row encode,
+optimized (two-pass) Huffman tables, restart markers, and custom
+quantization tables. The decoder is a scalar `jidctint` reference;
+it sits **~2.4× behind** `image`'s SIMD decoder (which goes through
+`zune-jpeg`) but matches it on coverage — baseline + progressive
+Huffman with fancy chroma upsample, output in any of eight pixel
+layouts. On a roundtrip workload the two crates come out roughly
+even; the "SIMD-encode + cover-everything-on-decode" combination is
+the shape this crate targets.
 
 ## Performance
 
-100-iteration medians of 5 repeated runs, q=80, 4:2:0. Two hosts:
-Apple M-series (NEON) and Intel Xeon Platinum 8370C (Ice Lake-SP).
+50-iteration single-batch timings from `src/bin/bench.rs` and
+`tests/comparison_bench.rs`, q=80, 4:2:0. Two hosts: Apple M-series
+(NEON) and Intel Xeon E5-2673 v4 (Broadwell, AVX2). Full per-section
+breakdown in [BENCH.md](BENCH.md).
 
-### vs `image` crate — encode (RGB → JPEG)
+### vs `image` crate — encode (RGB → JPEG, single thread)
 
-| Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Xeon 8370C) | image (Xeon 8370C) | ratio   |
-| --------------------------- | -------------: | --------------: | ------: | ----------------: | -----------------: | ------: |
-| 1592 × 1124 (session size)  |        5.66 ms |        14.49 ms |  2.56×  |          16.03 ms |           62.01 ms |  3.87×  |
-| 1920 × 1080 (1080p)         |        6.20 ms |        15.99 ms |  2.58×  |          18.34 ms |           71.32 ms |  3.89×  |
-| 3840 × 2160 (4K)            |       24.33 ms |        61.75 ms |  2.54×  |          72.09 ms |          276.49 ms |  3.84×  |
+| Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Broadwell) | image (Broadwell) | ratio   |
+| --------------------------- | -------------: | --------------: | ------: | ---------------: | ----------------: | ------: |
+| 1592 × 1124 (session size)  |        5.62 ms |        14.36 ms |  2.56×  |         29.75 ms |          94.71 ms |  3.18×  |
+| 1920 × 1080 (1080p)         |        6.32 ms |        16.22 ms |  2.57×  |         34.16 ms |         108.19 ms |  3.17×  |
+| 3840 × 2160 (4K)            |       24.93 ms |        63.00 ms |  2.53×  |        134.55 ms |         432.59 ms |  3.22×  |
 
 ### vs `image` crate — decode (JPEG → RGB)
 
 `image` uses `zune-jpeg` (SIMD-accelerated); our decoder is scalar
-by design. Decoder SIMD is the 0.6.0 work item; 0.4.0 widened decode
-*coverage* (progressive + fancy upsample) rather than perf.
+by design. Decoder SIMD is on the post-0.5 roadmap; 0.4.0 widened
+decode *coverage* (progressive + fancy upsample) rather than perf.
 
-| Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Xeon 8370C) | image (Xeon 8370C) | ratio   |
-| --------------------------- | -------------: | --------------: | ------: | ----------------: | -----------------: | ------: |
-| 1592 × 1124 (session size)  |       11.11 ms |         4.22 ms |  0.38×  |          23.66 ms |            9.30 ms |  0.39×  |
-| 1920 × 1080 (1080p)         |       12.68 ms |         4.88 ms |  0.38×  |          27.01 ms |           10.70 ms |  0.40×  |
-| 3840 × 2160 (4K)            |       50.17 ms |        19.04 ms |  0.38×  |         107.64 ms |           46.47 ms |  0.43×  |
+| Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Broadwell) | image (Broadwell) | ratio   |
+| --------------------------- | -------------: | --------------: | ------: | ---------------: | ----------------: | ------: |
+| 1592 × 1124 (session size)  |       10.55 ms |         4.39 ms |  0.42×  |         41.56 ms |          18.32 ms |  0.44×  |
+| 1920 × 1080 (1080p)         |       12.16 ms |         4.97 ms |  0.41×  |         47.61 ms |          20.84 ms |  0.44×  |
+| 3840 × 2160 (4K)            |       48.30 ms |        19.65 ms |  0.41×  |        186.20 ms |          97.79 ms |  0.53×  |
 
 (ratio > 1 means jpeg-rusturbo is faster)
 
-### Encoder SIMD vs scalar (same host)
+### Threading and optimized Huffman (0.5.0)
 
-| Resolution                  | scalar (Apple M) | NEON (Apple M) | scalar (Xeon 8370C) | AVX2 (Xeon 8370C) |
-| --------------------------- | ---------------: | -------------: | ------------------: | ----------------: |
-| 1592 × 1124                 |          8.54 ms |        5.49 ms |            24.31 ms |          11.82 ms |
-| 1920 × 1080                 |          9.94 ms |        6.23 ms |            27.93 ms |          13.65 ms |
-| 3840 × 2160                 |         41.96 ms |       25.04 ms |           109.98 ms |          53.50 ms |
+`set_threads(n)` partitions encode across MCU rows; `threads=auto`
+picks `available_parallelism()`. Bit-identical output across thread
+counts.
 
-NEON ~1.5× scalar; AVX2 ~2.0× scalar on the same hardware. Output
-bytes are byte-identical across SIMD and scalar paths. Full
-breakdown in [BENCH.md](BENCH.md).
+| Host                | Resolution | threads=1 | threads=auto | speedup |
+| ------------------- | ---------- | --------: | -----------: | ------: |
+| Apple M (8 cores)   | 1080p      |   6.18 ms |      3.70 ms |   1.67× |
+| Apple M (8 cores)   | 4K         |  25.39 ms |     13.90 ms |   1.83× |
+| Broadwell (4 vCPU)  | 1080p      |  27.32 ms |     20.42 ms |   1.34× |
+| Broadwell (4 vCPU)  | 4K         | 111.39 ms |     76.78 ms |   1.45× |
+
+`set_optimize_huffman(true)` enables a per-image two-pass Huffman
+build (T.81 K.2/K.3). Typical size reduction ~5% across
+subsampling × quality on synthetic content (4–10% on natural
+photos), at roughly 1.5–1.8× encode wall-clock. Opt-in for when
+bandwidth matters more than CPU.
 
 ## Quick start
 
 ```toml
 # Cargo.toml
 [dependencies]
-jpeg-rusturbo = "0.4"
+jpeg-rusturbo = "0.5"
 ```
 
 ### Encode
@@ -154,6 +165,20 @@ modes return `DecodeError::Unsupported`.
   `Argb`, `Abgr`, `Rgbx`, `Bgrx` via the generic
   `JpegEncoder::encode` entry point.
 - **Three chroma modes** — 4:4:4, 4:2:2, 4:2:0.
+- **Multi-threaded MCU-row encode** — `set_threads(n)` (or `0` =
+  `available_parallelism()`) partitions quantize + AC bitmap work
+  across rayon workers. Serial when `n == 1`. Bit-identical output
+  across thread counts.
+- **Optimized (two-pass) Huffman** — `set_optimize_huffman(true)`
+  builds canonical Huffman tables (T.81 K.2/K.3) from per-image
+  symbol frequencies. Typical 5–10% size reduction at ~1.5–1.8×
+  encode cost.
+- **Restart markers** — `set_restart_interval(n)` emits RSTm every
+  `n` MCUs (DRI segment + interleaved RSTm), for error resilience or
+  parallel decode by downstream readers.
+- **Custom quantization tables** — `set_quant_tables(luma, chroma)`
+  accepts two `[u8; 64]` arrays in natural (row-major) order;
+  bypasses the built-in quality-driven Annex K scaling.
 - **Scalar fallback** — on every target, opt-in via the `force-scalar`
   Cargo feature, or used automatically on architectures without a
   SIMD backend.
@@ -171,7 +196,8 @@ modes return `DecodeError::Unsupported`.
   the standard 4:2:0 / 4:2:2 / 4:4:0 layouts. Wider sampling factors
   (4:1:1 etc.) fall back to box replication.
 - **Scalar `jidctint`-style IDCT** — bit-exact against libjpeg-turbo's
-  integer reference. Decoder SIMD kernels are scheduled for 0.6.0.
+  integer reference. Decoder SIMD kernels are on the post-0.5
+  roadmap.
 - **Eight output pixel layouts** via the same `PixelFormat` enum the
   encoder accepts.
 - **Cross-decoder validation** — `tests/comparison_progressive.rs`
@@ -214,11 +240,15 @@ baseline JPEG that decodes round-trip-equivalent through any
 conforming decoder; the decoder reads baseline and progressive
 Huffman JPEGs that conform to ITU-T T.81 (verified against
 `image`'s decoder on a vendored fixture corpus). Public API has
-settled but `0.x` reserves the right to evolve before `1.0`. The
-next two minor releases focus on encoder differentiation (0.5.0 —
-optimized Huffman, trellis quant, multi-thread encode) and
-decoder SIMD (0.6.0 — IDCT / color convert / upsample kernels in
-NEON + AVX2).
+settled but `0.x` reserves the right to evolve before `1.0`.
+
+The 0.5.0 line shipped the encoder differentiation work: optimized
+two-pass Huffman, multi-thread MCU-row encode, restart intervals,
+and custom quantization tables. The next focus is **decoder SIMD**
+(IDCT / color convert / upsample kernels in NEON + AVX2, to close
+the decode-side gap vs `zune-jpeg`). **Trellis quantization** (the
+mozjpeg-style rate-distortion-optimized per-block search) is under
+consideration for 0.6.x or later, depending on demand.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
