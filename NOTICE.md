@@ -69,3 +69,24 @@ implementation; no verbatim source from `image` was copied. JPEG-spec
 elements (ITU-T T.81 Annex K — quantization and Huffman tables,
 zig-zag scan order, canonical Huffman expansion) are reproduced
 directly from the spec.
+
+---
+
+## jpeg-decoder test fixtures
+
+`tests/fixtures/progressive/` vendors five JPEG samples used as
+ground-truth corpus for the progressive / baseline read-direction
+comparison tests against the `image` crate. They are sourced from
+the `image-rs/jpeg-decoder` project
+(<https://github.com/image-rs/jpeg-decoder>, MIT OR Apache-2.0) at
+`tests/reftest/images/` and `tests/reftest/images/mozilla/`:
+
+- `partial_progressive.jpg` (4x4 4:4:4 progressive)
+- `progressive3.jpg` (650x470 4:4:4 progressive)
+- `jpg-progressive.jpg` (32x32 4:2:0 progressive)
+- `jpg-gray.jpg` (32x32 baseline grayscale)
+- `jpg-size-17x17.jpg` (17x17 4:2:0 baseline, odd dimensions)
+
+The Mozilla-prefixed fixtures (`jpg-*.jpg`) originate from
+Mozilla's MJPEG test suite and were re-vendored by the jpeg-decoder
+project under the same MIT OR Apache-2.0 terms.
