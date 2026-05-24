@@ -255,6 +255,48 @@ fn decode_accepts_max_supported_dimension() {
     }
 }
 
+/// Round-trip through a stream that carries restart markers: encoder
+/// emits `RSTn` every N MCUs, decoder follows them via the RST
+/// handling path. Asserts both the high-level pixel fidelity *and*
+/// that the encoded stream actually contains restart markers (so the
+/// next encoder refactor can't silently drop them).
+fn run_restart_roundtrip(w: u32, h: u32, interval: u16, sub: ChromaSubsampling, min_psnr: f64) {
+    let rgb = gradient_rgb(w, h);
+    let mut jpeg = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
+    enc.set_subsampling(sub);
+    enc.set_restart_interval(interval);
+    enc.encode_rgb(&rgb, w, h).expect("encode");
+
+    // Spot-check DRI + at least one RSTn in the byte stream.
+    let has_dri = jpeg.windows(2).any(|p| p == [0xFF, 0xDD]);
+    let has_rst = jpeg.windows(2).any(|p| matches!(p, [0xFF, b] if (0xD0..=0xD7).contains(b)));
+    assert!(has_dri, "encoded stream missing DRI segment");
+    assert!(has_rst, "encoded stream missing RSTn marker");
+
+    let decoded = Decoder::new(&jpeg).unwrap().decode(PixelFormat::Rgb).unwrap();
+    let psnr = psnr_rgb(&rgb, &decoded);
+    assert!(
+        psnr >= min_psnr,
+        "restart roundtrip PSNR {psnr:.2} dB below floor {min_psnr:.2} dB ({w}x{h} ri={interval} {sub:?})",
+    );
+}
+
+#[test]
+fn restart_roundtrip_64x64_420_ri4() {
+    run_restart_roundtrip(64, 64, 4, ChromaSubsampling::Yuv420, 30.0);
+}
+
+#[test]
+fn restart_roundtrip_320x240_422_ri16() {
+    run_restart_roundtrip(320, 240, 16, ChromaSubsampling::Yuv422, 32.0);
+}
+
+#[test]
+fn restart_roundtrip_1080p_420_ri120() {
+    run_restart_roundtrip(1920, 1080, 120, ChromaSubsampling::Yuv420, 32.0);
+}
+
 #[test]
 fn self_roundtrip_rgba_output() {
     let w = 64;

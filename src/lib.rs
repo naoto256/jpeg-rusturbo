@@ -225,6 +225,7 @@ pub struct JpegEncoder<W: Write> {
     out: W,
     quality: u8,
     subsampling: ChromaSubsampling,
+    restart_interval: u16,
 }
 
 impl<W: Write> JpegEncoder<W> {
@@ -243,6 +244,7 @@ impl<W: Write> JpegEncoder<W> {
             out,
             quality: quality.clamp(1, 100),
             subsampling: ChromaSubsampling::Yuv420,
+            restart_interval: 0,
         }
     }
 
@@ -251,6 +253,20 @@ impl<W: Write> JpegEncoder<W> {
     /// start of encoding.
     pub fn set_subsampling(&mut self, s: ChromaSubsampling) {
         self.subsampling = s;
+    }
+
+    /// Emit an `RSTn` restart marker every `interval` MCUs. Restart
+    /// markers let downstream tools resync the entropy stream at known
+    /// byte-aligned positions — they're how parallel JPEG decoders
+    /// partition the work across threads. `0` (the default) disables
+    /// restart markers and skips the DRI segment in the output.
+    ///
+    /// Cost: a 2-byte RSTn marker + DC-predictor reset every `interval`
+    /// MCUs. Typical values are 1-256 (per-row or smaller). Setting
+    /// this higher than the total MCU count produces a single RSTn at
+    /// the end of the scan, effectively a no-op.
+    pub fn set_restart_interval(&mut self, interval: u16) {
+        self.restart_interval = interval;
     }
 
     /// Encode an RGB pixel buffer (3 bytes/pixel) as a complete JPEG
@@ -384,6 +400,10 @@ impl<W: Write> JpegEncoder<W> {
         markers::write_dht(&mut self.out, 0, 1, &STD_CHROMA_DC)?;
         markers::write_dht(&mut self.out, 1, 1, &STD_CHROMA_AC)?;
 
+        if self.restart_interval > 0 {
+            markers::write_dri(&mut self.out, self.restart_interval)?;
+        }
+
         markers::write_sos(
             &mut self.out,
             &[
@@ -401,6 +421,7 @@ impl<W: Write> JpegEncoder<W> {
         // benefit from the same overflow check as the input validation
         // above.
         bw.reserve(needed);
+        let restart_interval = self.restart_interval;
         match self.subsampling {
             ChromaSubsampling::Yuv444 => encode_scan::<Yuv444Scheme, _>(
                 pixels,
@@ -414,6 +435,7 @@ impl<W: Write> JpegEncoder<W> {
                 &ac_luma,
                 &dc_chroma,
                 &ac_chroma,
+                restart_interval,
             )?,
             ChromaSubsampling::Yuv422 => encode_scan::<Yuv422Scheme, _>(
                 pixels,
@@ -427,6 +449,7 @@ impl<W: Write> JpegEncoder<W> {
                 &ac_luma,
                 &dc_chroma,
                 &ac_chroma,
+                restart_interval,
             )?,
             ChromaSubsampling::Yuv420 => encode_scan::<Yuv420Scheme, _>(
                 pixels,
@@ -440,6 +463,7 @@ impl<W: Write> JpegEncoder<W> {
                 &ac_luma,
                 &dc_chroma,
                 &ac_chroma,
+                restart_interval,
             )?,
         }
         bw.flush_to_byte_boundary()?;
@@ -680,12 +704,30 @@ fn encode_scan<S: SamplingScheme, W: Write>(
     ac_luma: &HuffmanTable,
     dc_chroma: &HuffmanTable,
     ac_chroma: &HuffmanTable,
+    restart_interval: u16,
 ) -> io::Result<()> {
     let mcus_x = width.div_ceil(S::MCU_W);
     let mcus_y = height.div_ceil(S::MCU_H);
     let mut prev_dc = DcPredictors::default();
+    // Restart bookkeeping: every `restart_interval` MCUs we flush the
+    // entropy bits to a byte boundary, emit an RSTn (n cycles 0..=7),
+    // and reset the DC predictors. Disabled when `restart_interval == 0`.
+    let restart_interval = restart_interval as u32;
+    let mut mcus_since_rst: u32 = 0;
+    let mut next_rst: u8 = 0;
+    let mut mcu_count: u64 = 0;
+    let total_mcus = mcus_x as u64 * mcus_y as u64;
     for my in 0..mcus_y {
         for mx in 0..mcus_x {
+            if restart_interval > 0
+                && mcus_since_rst == restart_interval
+                && mcu_count < total_mcus
+            {
+                bw.write_restart(next_rst)?;
+                next_rst = (next_rst + 1) & 7;
+                mcus_since_rst = 0;
+                prev_dc = DcPredictors::default();
+            }
             S::encode_one_mcu(
                 bw,
                 pixels,
@@ -702,6 +744,8 @@ fn encode_scan<S: SamplingScheme, W: Write>(
                 dc_chroma,
                 ac_chroma,
             )?;
+            mcus_since_rst += 1;
+            mcu_count += 1;
         }
     }
     Ok(())

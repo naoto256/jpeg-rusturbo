@@ -182,6 +182,16 @@ impl<W: io::Write> BitWriter<W> {
         self.nbits -= 32;
     }
 
+    /// Flush the entropy stream to a byte boundary and emit a restart
+    /// marker (`RSTn`, n in 0..=7) immediately after. Caller must
+    /// reset the DC predictors to zero on the next block (F.1.5.4).
+    /// Used by the encoder when a non-zero restart interval is set.
+    pub fn write_restart(&mut self, n: u8) -> io::Result<()> {
+        debug_assert!(n < 8);
+        self.flush_to_byte_boundary()?;
+        self.inner.write_all(&[0xFF, 0xD0 | (n & 0x07)])
+    }
+
     /// Pad the final partial byte with 1-bits, drain everything, and
     /// flush the internal buffer to the inner writer. Required at the
     /// end of each entropy-coded segment (Annex F.1.5.5).
