@@ -15,6 +15,31 @@
 //! Runtime feature detection: AVX2 is the only target we ever dispatch
 //! to from x86_64. Non-AVX2 CPUs hit the scalar fallback at runtime via
 //! `is_x86_feature_detected!`. The result is cached after first call.
+//!
+//! # Safety
+//!
+//! Every `unsafe { … }` block in this module wraps a `core::arch::x86_64::*`
+//! intrinsic. The module is reached only when both compile-time
+//! `#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]` and
+//! the runtime guard hold:
+//!
+//! - **AVX2 paths** (`color`, `dct`, `quant`) are dispatched only when
+//!   `is_x86_feature_detected!("avx2")` returns true. The check is performed
+//!   once on first call from `arch::backend::*` and cached; non-AVX2 CPUs
+//!   never reach these intrinsics. `__m256i` / AVX2 instructions are
+//!   therefore valid at the CPU level.
+//! - **SSE2 path** (`huffman::nonzero_bitmap`) is unconditional on
+//!   `x86_64` because SSE2 is in the x86_64-v1 baseline and is always
+//!   available.
+//!
+//! On the Rust side, each call takes pointers / slice references whose
+//! lifetimes cover the load/store window and whose element counts match
+//! the intrinsic's vector width (16-lane i16 for SSE2; 32-lane u8 /
+//! 16-lane i16 / 8-lane i32 for AVX2). No call reads past the end of a
+//! borrow or writes to an aliased destination — the cross-check tests at
+//! the bottom of this file (and the equivalent in `tests/`) would have
+//! flagged any such bug by comparing every emitted byte against the
+//! scalar reference.
 
 #![allow(dead_code)]
 
