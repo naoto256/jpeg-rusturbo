@@ -39,42 +39,20 @@ pub struct DecodedPlane {
     pub samples: Vec<u8>,
 }
 
-/// Run a baseline Huffman scan, decoding all interleaved components
-/// in raster MCU order. `entropy_start` is the byte offset where the
-/// entropy-coded data begins (immediately after SOS).
-///
-/// Returns the `DecodedPlanes` and the byte position immediately past
-/// the entropy data (= at the byte after the terminating marker, with
-/// the marker code reachable via the bit-reader's `marker()`).
-#[allow(clippy::too_many_arguments)]
-pub fn decode_baseline_scan<'a>(
-    src: &'a [u8],
-    entropy_start: usize,
-    headers: &DecoderHeaders,
-    scan: &ScanHeader,
-    dc_tables: &[Option<HuffmanDecodeTable>; 4],
-    ac_tables: &[Option<HuffmanDecodeTable>; 4],
-    qt_by_id: &[Option<&QuantTable>; 4],
-) -> Result<(DecodedPlanes, BitReader<'a>)> {
-    let frame = &headers.frame;
+/// Allocate per-component output planes sized for the frame's MCU
+/// grid. The buffers are block-aligned (multiples of 8 in each
+/// direction) so scan-time block writes don't have to special-case
+/// the right / bottom image edge; the `plane_width` / `plane_height`
+/// fields record the true dimensions for the consumer to trim by.
+pub fn allocate_planes(frame: &super::markers::FrameHeader) -> Vec<DecodedPlane> {
     let h_max = frame.h_max();
     let v_max = frame.v_max();
-    let mcu_w_pixels = (h_max as u32) * 8;
-    let mcu_h_pixels = (v_max as u32) * 8;
-    let mcus_x = (frame.width as u32).div_ceil(mcu_w_pixels);
-    let mcus_y = (frame.height as u32).div_ceil(mcu_h_pixels);
-
-    // Allocate per-component planes, sized to a multiple of 8 for
-    // block-aligned writes; we trim back to the true dimensions when
-    // returning.
-    let mut planes: Vec<DecodedPlane> = Vec::with_capacity(frame.components.len());
+    let mcus_x = (frame.width as u32).div_ceil((h_max as u32) * 8);
+    let mcus_y = (frame.height as u32).div_ceil((v_max as u32) * 8);
+    let mut planes = Vec::with_capacity(frame.components.len());
     for comp in &frame.components {
-        // True plane dims (before block-alignment padding).
         let pw = (frame.width as u32 * comp.h as u32).div_ceil(h_max as u32) as usize;
         let ph = (frame.height as u32 * comp.v as u32).div_ceil(v_max as u32) as usize;
-        // Block-aligned dims (used for the actual sample buffer so the
-        // per-block writes don't have to special-case the right/bottom
-        // image edge).
         let stride = (mcus_x as usize) * (comp.h as usize) * 8;
         let padded_height = (mcus_y as usize) * (comp.v as usize) * 8;
         let samples = vec![0u8; stride * padded_height];
@@ -87,82 +65,242 @@ pub fn decode_baseline_scan<'a>(
             samples,
         });
     }
+    planes
+}
+
+/// Run a single baseline Huffman scan, writing decoded pixels into the
+/// pre-allocated `planes`. Returns the byte position immediately past
+/// the marker that terminated entropy data, together with that
+/// marker's code (see [`super::progressive`] for the rationale on
+/// returning both).
+///
+/// Two iteration modes:
+/// - **Interleaved** (`scan.components.len() > 1`): MCU-major raster
+///   walk, decoding `Hi × Vi` blocks per component inside each MCU.
+///   This is the common case for "single SOS contains all components".
+/// - **Non-interleaved** (`scan.components.len() == 1`): walk the one
+///   scanned component's own block grid in raster order. Baseline
+///   JPEGs split across multiple per-component SOS markers route here;
+///   each scan fills its component's plane.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_baseline_scan_into(
+    src: &[u8],
+    entropy_start: usize,
+    headers: &DecoderHeaders,
+    scan: &ScanHeader,
+    dc_tables: &[Option<HuffmanDecodeTable>; 4],
+    ac_tables: &[Option<HuffmanDecodeTable>; 4],
+    qt_by_id: &[Option<&QuantTable>; 4],
+    planes: &mut [DecodedPlane],
+) -> Result<(usize, Option<u8>)> {
+    let frame = &headers.frame;
+    let h_max = frame.h_max();
+    let v_max = frame.v_max();
+    let mcu_w_pixels = (h_max as u32) * 8;
+    let mcu_h_pixels = (v_max as u32) * 8;
+    let mcus_x = (frame.width as u32).div_ceil(mcu_w_pixels);
+    let mcus_y = (frame.height as u32).div_ceil(mcu_h_pixels);
 
     let mut br = BitReader::new(src, entropy_start);
-    // DC predictor per component (zero at scan start, also reset on RST).
     let mut prev_dc = [0i32; 4];
-    // Restart interval bookkeeping.
     let restart_interval = headers.restart_interval as u32;
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = 0;
-
-    // Scratch buffers for one block's worth of work.
     let mut zz_coef = [0i16; 64];
     let mut nat_coef = [0i16; 64];
 
-    for my in 0..mcus_y {
-        for mx in 0..mcus_x {
-            // Restart handling.
-            if restart_interval > 0 && mcus_since_restart == restart_interval {
-                handle_restart(&mut br, &mut prev_dc, &mut expected_rst)?;
-                mcus_since_restart = 0;
+    if scan.components.len() > 1 {
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if restart_interval > 0 && mcus_since_restart == restart_interval {
+                    handle_restart(&mut br, &mut prev_dc, &mut expected_rst)?;
+                    mcus_since_restart = 0;
+                }
+                for (scan_idx, sc) in scan.components.iter().enumerate() {
+                    let (comp_idx, comp) = find_component(frame, sc.component_id)?;
+                    let plane = &mut planes[comp_idx];
+                    let dc_tbl = dc_tables[sc.dc_table as usize].as_ref().ok_or(
+                        DecodeError::Malformed("scan refers to undefined DC table"),
+                    )?;
+                    let ac_tbl = ac_tables[sc.ac_table as usize].as_ref().ok_or(
+                        DecodeError::Malformed("scan refers to undefined AC table"),
+                    )?;
+                    let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
+                        "scan refers to undefined quant table",
+                    ))?;
+                    for v_block in 0..(comp.v as u32) {
+                        for h_block in 0..(comp.h as u32) {
+                            zz_coef.fill(0);
+                            decode_block_baseline(
+                                &mut br,
+                                dc_tbl,
+                                ac_tbl,
+                                &mut prev_dc[scan_idx],
+                                &mut zz_coef,
+                            )?;
+                            for k in 0..64 {
+                                nat_coef[ZIGZAG[k]] =
+                                    zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
+                            }
+                            let mut block = [0u8; 64];
+                            arch::backend::dct::idct_islow(&nat_coef, &mut block);
+                            let base_x = (mx * comp.h as u32 + h_block) as usize * 8;
+                            let base_y = (my * comp.v as u32 + v_block) as usize * 8;
+                            place_block(plane, base_x, base_y, &block);
+                        }
+                    }
+                }
+                mcus_since_restart += 1;
             }
-
-            for (scan_idx, sc) in scan.components.iter().enumerate() {
-                let (comp_idx, comp) = find_component(frame, sc.component_id)?;
-                let plane = &mut planes[comp_idx];
-                let dc_tbl = dc_tables[sc.dc_table as usize]
-                    .as_ref()
-                    .ok_or(DecodeError::Malformed("scan refers to undefined DC table"))?;
-                let ac_tbl = ac_tables[sc.ac_table as usize]
-                    .as_ref()
-                    .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
-                let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
-                    "scan refers to undefined quant table",
-                ))?;
-
+        }
+    } else {
+        // Non-interleaved: still iterate MCU-major (libjpeg-turbo
+        // jdcoefct convention — within each frame MCU, decode the
+        // scanned component's `Hi × Vi` blocks in MCU-relative raster
+        // order). Pure per-component raster aligns with MCU-major only
+        // when `Vi == 1`; for `Vi > 1` (e.g. 4:2:0 Y), the two orders
+        // diverge and pure raster mis-pairs blocks with the encoder's
+        // emission order.
+        let sc = &scan.components[0];
+        let (comp_idx, comp) = find_component(frame, sc.component_id)?;
+        let dc_tbl = dc_tables[sc.dc_table as usize]
+            .as_ref()
+            .ok_or(DecodeError::Malformed("scan refers to undefined DC table"))?;
+        let ac_tbl = ac_tables[sc.ac_table as usize]
+            .as_ref()
+            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
+        let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
+            "scan refers to undefined quant table",
+        ))?;
+        let plane = &mut planes[comp_idx];
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if restart_interval > 0 && mcus_since_restart == restart_interval {
+                    handle_restart(&mut br, &mut prev_dc, &mut expected_rst)?;
+                    mcus_since_restart = 0;
+                }
                 for v_block in 0..(comp.v as u32) {
                     for h_block in 0..(comp.h as u32) {
-                        // Decode this 8x8 block.
                         zz_coef.fill(0);
                         decode_block_baseline(
                             &mut br,
                             dc_tbl,
                             ac_tbl,
-                            &mut prev_dc[scan_idx],
+                            &mut prev_dc[0],
                             &mut zz_coef,
                         )?;
-
-                        // De-zig-zag + dequantize into nat_coef.
                         for k in 0..64 {
                             nat_coef[ZIGZAG[k]] =
                                 zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
                         }
-
-                        // IDCT → 8x8 u8 block.
                         let mut block = [0u8; 64];
                         arch::backend::dct::idct_islow(&nat_coef, &mut block);
-
-                        // Place into the plane.
                         let base_x = (mx * comp.h as u32 + h_block) as usize * 8;
                         let base_y = (my * comp.v as u32 + v_block) as usize * 8;
                         place_block(plane, base_x, base_y, &block);
                     }
                 }
+                mcus_since_restart += 1;
             }
-
-            mcus_since_restart += 1;
         }
     }
 
+    Ok((br.pos(), br.marker()))
+}
+
+/// Convenience wrapper around [`decode_baseline_scan_into`]: allocates
+/// planes, runs one scan, returns the bit reader at the marker that
+/// terminated entropy data. Single-SOS interleaved baseline streams
+/// can use this in a single call; multi-SOS streams should call
+/// [`decode_baseline_multi`] instead.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy single-scan entry kept for symmetry
+pub fn decode_baseline_scan<'a>(
+    src: &'a [u8],
+    entropy_start: usize,
+    headers: &DecoderHeaders,
+    scan: &ScanHeader,
+    dc_tables: &[Option<HuffmanDecodeTable>; 4],
+    ac_tables: &[Option<HuffmanDecodeTable>; 4],
+    qt_by_id: &[Option<&QuantTable>; 4],
+) -> Result<(DecodedPlanes, BitReader<'a>)> {
+    let mut planes = allocate_planes(&headers.frame);
+    let (pos, _marker) = decode_baseline_scan_into(
+        src,
+        entropy_start,
+        headers,
+        scan,
+        dc_tables,
+        ac_tables,
+        qt_by_id,
+        &mut planes,
+    )?;
+    // Re-create a BitReader anchored at the post-entropy position so
+    // legacy callers can introspect the marker. The reader is empty.
+    let br = BitReader::new(src, pos);
     Ok((
         DecodedPlanes {
-            width: frame.width as u32,
-            height: frame.height as u32,
+            width: headers.frame.width as u32,
+            height: headers.frame.height as u32,
             components: planes,
         },
         br,
     ))
+}
+
+/// Decode a (possibly multi-scan) baseline JPEG by looping over SOS
+/// markers, threading any intervening DHT / DQT / DRI segments back
+/// into the working header tables, and dispatching each scan into the
+/// shared `planes` buffer via [`decode_baseline_scan_into`]. Handles
+/// both the common single-SOS case and the rarer
+/// multi-SOS-per-component split that some encoders emit.
+pub fn decode_baseline_multi(
+    src: &[u8],
+    entropy_start: usize,
+    headers: &DecoderHeaders,
+    first_scan: ScanHeader,
+) -> Result<DecodedPlanes> {
+    let frame = &headers.frame;
+    let mut planes = allocate_planes(frame);
+    let mut huffman_specs = headers.huffman.clone();
+    let mut quant_tables = headers.quant.clone();
+    let mut restart_interval = headers.restart_interval;
+
+    let mut scan: Option<ScanHeader> = Some(first_scan);
+    let mut pos = entropy_start;
+    let mut headers_working = headers.clone();
+    while let Some(s) = scan {
+        let (dc_tables, ac_tables) = build_huffman_tables(&huffman_specs)?;
+        let qt_by_id = index_quant_tables(&quant_tables);
+        headers_working.restart_interval = restart_interval;
+        let (after_pos, pending_marker) = decode_baseline_scan_into(
+            src,
+            pos,
+            &headers_working,
+            &s,
+            &dc_tables,
+            &ac_tables,
+            &qt_by_id,
+            &mut planes,
+        )?;
+        pos = after_pos;
+
+        let mut mr = super::markers::MarkerReader::resume_at(src, pos);
+        scan = mr.next_scan_or_end(
+            frame,
+            &mut huffman_specs,
+            &mut quant_tables,
+            &mut restart_interval,
+            pending_marker,
+        )?;
+        pos = mr.pos();
+    }
+
+    Ok(DecodedPlanes {
+        width: frame.width as u32,
+        height: frame.height as u32,
+        components: planes,
+    })
 }
 
 /// Decode the next 8x8 block in zig-zag order into `zz`. `prev_dc` is

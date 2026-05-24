@@ -79,18 +79,12 @@ impl<'a> Decoder<'a> {
                 self.first_scan,
             )?
         } else {
-            let (dc_tables, ac_tables) = baseline::build_huffman_tables(&self.headers.huffman)?;
-            let qt_by_id = baseline::index_quant_tables(&self.headers.quant);
-            let (planes, _br) = baseline::decode_baseline_scan(
+            baseline::decode_baseline_multi(
                 self.src,
                 self.entropy_start,
                 &self.headers,
-                &self.first_scan,
-                &dc_tables,
-                &ac_tables,
-                &qt_by_id,
-            )?;
-            planes
+                self.first_scan,
+            )?
         };
 
         compose_output(&planes, &self.headers, layout)
