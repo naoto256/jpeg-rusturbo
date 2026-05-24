@@ -86,6 +86,16 @@ pub fn write_dht<W: Write>(w: &mut W, tc: u8, th: u8, table: &StdHuffman) -> io:
     Ok(())
 }
 
+/// DRI — Define Restart Interval. Sets the number of MCUs between
+/// RSTn markers in the entropy data. `interval == 0` disables restart
+/// markers (this segment is then unnecessary; the encoder skips it).
+pub fn write_dri<W: Write>(w: &mut W, interval: u16) -> io::Result<()> {
+    w.write_all(&[0xFF, 0xDD])?;
+    write_be_u16(w, 4)?; // length
+    write_be_u16(w, interval)?;
+    Ok(())
+}
+
 /// SOS — Start Of Scan. Identifies the components in this scan and
 /// their DC/AC table assignments. We always write a single
 /// interleaved scan over all components (baseline sequential).
