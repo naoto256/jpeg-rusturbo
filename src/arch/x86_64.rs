@@ -608,12 +608,34 @@ pub mod dct {
     static PW_1_NEG1: Aligned16<[i16; 16]> =
         Aligned16([1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1]);
 
-    /// 8x8 forward integer DCT (LL&M "islow"), in-place. Bit-exact
-    /// equivalent to `arch::scalar::dct::fdct_islow`.
-    /// Inverse 8x8 DCT — currently the scalar reference; an AVX2 port
-    /// is on the decoder roadmap.
+    // IDCT-only constants — translated from jidctint-avx2.asm.
+
+    // PW_MF089_F060_MF256_F050:
+    //   times 4 dw -F_0_899, (F_1_501 - F_0_899)
+    //   times 4 dw -F_2_562, (F_3_072 - F_2_562)
+    static PW_MF089_F060_MF256_F050: Aligned16<[i16; 16]> = Aligned16([
+        -7373, 4926, -7373, 4926, -7373, 4926, -7373, 4926, -20995, 4177, -20995, 4177, -20995,
+        4177, -20995, 4177,
+    ]);
+
+    // IDCT's DESCALE_P2 = CONST_BITS + PASS1_BITS + 3 = 18, so the
+    // pre-shift round bias is 1 << 17 = 131072. (The FDCT uses 15 / 1<<14;
+    // the IDCT's "+3" absorbs the *8 factor that pass-1 didn't undo.)
+    static IDCT_PD_DESCALE_P2: Aligned16<[i32; 8]> = Aligned16([131072; 8]);
+
+    // PB_CENTERJSAMP: 32 bytes of 0x80, added byte-wise after the final
+    // i16→i8 saturating pack to realize the +128 level shift via wrap.
+    static PB_CENTERJSAMP: Aligned16<[u8; 32]> = Aligned16([128; 32]);
+
+    /// 8x8 inverse integer DCT (LL&M "islow"). Bit-exact equivalent to
+    /// `arch::scalar::dct::idct_islow`. Dispatches to AVX2 when
+    /// available; otherwise falls back to the scalar reference.
     pub fn idct_islow(coef: &[i16; 64], output: &mut [u8; 64]) {
-        crate::arch::scalar::dct::idct_islow(coef, output)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { idct_avx2(coef, output) }
+        } else {
+            crate::arch::scalar::dct::idct_islow(coef, output)
+        }
     }
 
     pub fn fdct_islow(data: &mut [i16; 64]) {
@@ -857,6 +879,283 @@ pub mod dct {
             _mm256_storeu_si256(p.add(1), s1);
             _mm256_storeu_si256(p.add(2), s2);
             _mm256_storeu_si256(p.add(3), s3);
+
+            _mm256_zeroupper();
+        }
+    }
+
+    // ===========================================================================
+    // IDCT — translated from jidctint-avx2.asm
+    // ===========================================================================
+
+    /// 8x8 i16 transpose used between the IDCT's pass 1 and pass 2,
+    /// translated directly from the asm DOTRANSPOSE macro:
+    /// `vpermq → vpunpcklwd/vpunpckhwd → vpunpcklwd/vpunpckhwd →
+    ///  vpunpcklqdq/vpunpckhqdq`.
+    ///
+    /// Inputs: `(data0_1, data3_2, data4_5, data7_6)` packed as rows.
+    /// Outputs: `(data0_4, data1_5, data2_6, data3_7)` — the transposed
+    /// view, each ymm holding a row pair k / k+4 of the transposed matrix.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled (relies on inlining into a
+    /// `#[target_feature(enable = "avx2")]` function).
+    #[inline(always)]
+    unsafe fn idct_dotranspose(
+        m1: __m256i,
+        m2: __m256i,
+        m3: __m256i,
+        m4: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        unsafe {
+            // qword shuffle with imm 0xD8 / 0x72 / 0xD8 / 0x72
+            let t5 = _mm256_permute4x64_epi64::<0xD8>(m1);
+            let t6 = _mm256_permute4x64_epi64::<0x72>(m2);
+            let t7 = _mm256_permute4x64_epi64::<0xD8>(m3);
+            let t8 = _mm256_permute4x64_epi64::<0x72>(m4);
+
+            // 16-bit lane interleave (pairs)
+            let r1 = _mm256_unpacklo_epi16(t5, t6);
+            let r2 = _mm256_unpackhi_epi16(t5, t6);
+            let r3 = _mm256_unpacklo_epi16(t7, t8);
+            let r4 = _mm256_unpackhi_epi16(t7, t8);
+
+            // 16-bit lane interleave (quads)
+            let t5 = _mm256_unpacklo_epi16(r1, r2);
+            let t6 = _mm256_unpacklo_epi16(r3, r4);
+            let t7 = _mm256_unpackhi_epi16(r1, r2);
+            let t8 = _mm256_unpackhi_epi16(r3, r4);
+
+            // 64-bit lane interleave (final row pairs)
+            let o1 = _mm256_unpacklo_epi64(t5, t6);
+            let o2 = _mm256_unpackhi_epi64(t5, t6);
+            let o3 = _mm256_unpacklo_epi64(t7, t8);
+            let o4 = _mm256_unpackhi_epi64(t7, t8);
+
+            (o1, o2, o3, o4)
+        }
+    }
+
+    /// One 1-D IDCT pass over 16 packed columns (held across 4 ymm).
+    /// Const-generic on pass id (1 or 2) selects the descale shift
+    /// (DESCALE_P1 = 11 vs DESCALE_P2 = 18) and the matching round bias.
+    /// Translated from the IDCT asm DODCT macro.
+    ///
+    /// Inputs encode rows as: `(in0_4, in3_1, in2_6, in7_5)` —
+    /// each ymm's lo/hi 128 hold a row of the input.
+    /// Outputs: `(data0_1, data3_2, data4_5, data7_6)`, i16-packed.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled (relies on inlining; see
+    /// `idct_dotranspose`).
+    #[inline(always)]
+    unsafe fn idct_dodct<const PASS: i32>(
+        in0_4: __m256i,
+        in3_1: __m256i,
+        in2_6: __m256i,
+        in7_5: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        unsafe {
+            // -- Even part: tmp3_2 from cols 2, 6 ----------------------
+            // pair (in2[k], in6[k]) madd (F_0_541+F_0_765, F_0_541) = tmp3
+            // pair (in6[k], in2[k]) madd (F_0_541-F_1_847, F_0_541) = tmp2
+            let in6_2 = _mm256_permute2x128_si256::<0x01>(in2_6, in2_6);
+            let l = _mm256_unpacklo_epi16(in2_6, in6_2);
+            let h = _mm256_unpackhi_epi16(in2_6, in6_2);
+            let pw_f130 = load(PW_F130_F054_MF130_F054.0.as_ptr());
+            let tmp3_2_l = _mm256_madd_epi16(l, pw_f130);
+            let tmp3_2_h = _mm256_madd_epi16(h, pw_f130);
+
+            // tmp0/1 = (in0 ± in4) << CONST_BITS, computed via the
+            // (zero, x) unpack + arithmetic-right-shift trick: an i16
+            // value placed in the high 16 bits of an i32 is value * 2^16
+            // with sign preserved; shifting right by (16 - CONST_BITS)
+            // yields value << CONST_BITS, sign-preserved.
+            let in4_0 = _mm256_permute2x128_si256::<0x01>(in0_4, in0_4);
+            let pw_1_neg1 = load(PW_1_NEG1.0.as_ptr());
+            let in0_neg4 = _mm256_sign_epi16(in0_4, pw_1_neg1);
+            let sum_diff = _mm256_add_epi16(in4_0, in0_neg4);
+            // (in0+in4) in lo 128, (in0-in4) in hi 128
+
+            let zero = _mm256_setzero_si256();
+            let lo = _mm256_unpacklo_epi16(zero, sum_diff);
+            let hi = _mm256_unpackhi_epi16(zero, sum_diff);
+            // 16 - CONST_BITS = 3
+            let tmp0_1_l = _mm256_srai_epi32::<3>(lo);
+            let tmp0_1_h = _mm256_srai_epi32::<3>(hi);
+
+            let tmp13_12_l = _mm256_sub_epi32(tmp0_1_l, tmp3_2_l);
+            let tmp10_11_l = _mm256_add_epi32(tmp0_1_l, tmp3_2_l);
+            let tmp13_12_h = _mm256_sub_epi32(tmp0_1_h, tmp3_2_h);
+            let tmp10_11_h = _mm256_add_epi32(tmp0_1_h, tmp3_2_h);
+
+            // -- Odd part --------------------------------------------------
+            // z3 = in7+in3 (lo 128); z4 = in5+in1 (hi 128)
+            let z3_4 = _mm256_add_epi16(in7_5, in3_1);
+            let z4_3 = _mm256_permute2x128_si256::<0x01>(z3_4, z3_4);
+
+            let zl = _mm256_unpacklo_epi16(z3_4, z4_3);
+            let zh = _mm256_unpackhi_epi16(z3_4, z4_3);
+            let pw_mf078 = load(PW_MF078_F117_F078_F117.0.as_ptr());
+            // After madd: lo 128 = z3 = z5 - z3_in * F_1_961
+            //             hi 128 = z4 = z5 - z4_in * F_0_390
+            let z3_4_l = _mm256_madd_epi16(zl, pw_mf078);
+            let z3_4_h = _mm256_madd_epi16(zh, pw_mf078);
+
+            // in71_53 = interleave in7_5 with swapped in3_1 (= in1_3)
+            let in1_3 = _mm256_permute2x128_si256::<0x01>(in3_1, in3_1);
+            let in71_53_l = _mm256_unpacklo_epi16(in7_5, in1_3);
+            let in71_53_h = _mm256_unpackhi_epi16(in7_5, in1_3);
+
+            // tmp0/1 partial:
+            //   lo 128 from (in7, in1) × (F_0_298-F_0_899, -F_0_899)
+            //   hi 128 from (in5, in3) × (F_2_053-F_2_562, -F_2_562)
+            let pw_mf060 = load(PW_MF060_MF089_MF050_MF256.0.as_ptr());
+            let part_l = _mm256_madd_epi16(in71_53_l, pw_mf060);
+            let part_h = _mm256_madd_epi16(in71_53_h, pw_mf060);
+            let tmp0_1_lo = _mm256_add_epi32(part_l, z3_4_l);
+            let tmp0_1_hi = _mm256_add_epi32(part_h, z3_4_h);
+
+            // tmp3/2 partial:
+            //   lo 128 from (in7, in1) × (-F_0_899, F_1_501-F_0_899)
+            //   hi 128 from (in5, in3) × (-F_2_562, F_3_072-F_2_562)
+            let pw_mf089 = load(PW_MF089_F060_MF256_F050.0.as_ptr());
+            let part_l = _mm256_madd_epi16(in71_53_l, pw_mf089);
+            let part_h = _mm256_madd_epi16(in71_53_h, pw_mf089);
+            // z4_3 swap of z3_4 (so we add z4 to tmp3, z3 to tmp2)
+            let z4_3_l = _mm256_permute2x128_si256::<0x01>(z3_4_l, z3_4_l);
+            let z4_3_h = _mm256_permute2x128_si256::<0x01>(z3_4_h, z3_4_h);
+            let tmp3_2_lo = _mm256_add_epi32(part_l, z4_3_l);
+            let tmp3_2_hi = _mm256_add_epi32(part_h, z4_3_h);
+
+            // -- Final output stage: descale + saturating i32→i16 pack
+            // (bias, shift) selected by PASS at codegen time.
+            let bias = if PASS == 1 {
+                _mm256_loadu_si256(PD_DESCALE_P1.0.as_ptr() as *const __m256i)
+            } else {
+                _mm256_loadu_si256(IDCT_PD_DESCALE_P2.0.as_ptr() as *const __m256i)
+            };
+
+            // data0_1 = pack((tmp10_11 + tmp3_2) descaled)
+            let a = _mm256_add_epi32(tmp10_11_l, tmp3_2_lo);
+            let b = _mm256_add_epi32(tmp10_11_h, tmp3_2_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
+            let data0_1 = _mm256_packs_epi32(a, b);
+
+            // data7_6 = pack((tmp10_11 - tmp3_2) descaled)
+            let a = _mm256_sub_epi32(tmp10_11_l, tmp3_2_lo);
+            let b = _mm256_sub_epi32(tmp10_11_h, tmp3_2_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
+            let data7_6 = _mm256_packs_epi32(a, b);
+
+            // data3_2 = pack((tmp13_12 + tmp0_1) descaled)
+            let a = _mm256_add_epi32(tmp13_12_l, tmp0_1_lo);
+            let b = _mm256_add_epi32(tmp13_12_h, tmp0_1_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
+            let data3_2 = _mm256_packs_epi32(a, b);
+
+            // data4_5 = pack((tmp13_12 - tmp0_1) descaled)
+            let a = _mm256_sub_epi32(tmp13_12_l, tmp0_1_lo);
+            let b = _mm256_sub_epi32(tmp13_12_h, tmp0_1_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
+            let data4_5 = _mm256_packs_epi32(a, b);
+
+            (data0_1, data3_2, data4_5, data7_6)
+        }
+    }
+
+    /// AVX2 implementation of `idct_islow`. Bit-exact equivalent of the
+    /// scalar reference, modulo the asm-style late saturation that
+    /// composes safely with the +128 level-shift for any input.
+    ///
+    /// # Safety
+    /// AVX2 must be available (the runtime gate in `idct_islow`
+    /// checks). Inputs are fixed-size references.
+    #[target_feature(enable = "avx2")]
+    unsafe fn idct_avx2(coef: &[i16; 64], output: &mut [u8; 64]) {
+        unsafe {
+            let p = coef.as_ptr() as *const __m256i;
+            // 4 ymm, each holding 2 contiguous rows of the dequantized
+            // coefficient block.
+            let in0_1 = _mm256_loadu_si256(p);
+            let in2_3 = _mm256_loadu_si256(p.add(1));
+            let in4_5 = _mm256_loadu_si256(p.add(2));
+            let in6_7 = _mm256_loadu_si256(p.add(3));
+
+            // Repack so each ymm pairs the rows the DODCT macro wants:
+            //   (R0, R4), (R3, R1), (R2, R6), (R7, R5)
+            let in0_4 = _mm256_permute2x128_si256::<0x20>(in0_1, in4_5);
+            let in3_1 = _mm256_permute2x128_si256::<0x31>(in2_3, in0_1);
+            let in2_6 = _mm256_permute2x128_si256::<0x20>(in2_3, in6_7);
+            let in7_5 = _mm256_permute2x128_si256::<0x31>(in6_7, in4_5);
+
+            // Pass 1 (columns).
+            let (m1, m2, m3, m4) = idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5);
+            //   m1 = data0_1, m2 = data3_2, m3 = data4_5, m4 = data7_6
+            let (t0, t1, t2, t3) = idct_dotranspose(m1, m2, m3, m4);
+            //   t0 = data0_4, t1 = data1_5, t2 = data2_6, t3 = data3_7
+
+            // Between-passes repack: pass 2 wants (in0_4, in3_1, in2_6, in7_5)
+            // with the new "rows", which are the transposed pass-1 columns.
+            //   in0_4 = t0   (data0_4)
+            //   in2_6 = t2   (data2_6)
+            //   in3_1 from t3 (data3_7) + t1 (data1_5): pick (data3_lo, data1_lo)
+            //   in7_5 from t3 + t1: pick (data7_hi, data5_hi)
+            let in7_5_p2 = _mm256_permute2x128_si256::<0x31>(t3, t1);
+            let in3_1_p2 = _mm256_permute2x128_si256::<0x20>(t3, t1);
+
+            // Pass 2 (rows). Output values are i16 in [-128, 127]-ish; the
+            // saturating pack + 0x80 byte-add below handles the level shift.
+            let (m1, m2, m3, m4) = idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2);
+            let (t0, t1, t2, t3) = idct_dotranspose(m1, m2, m3, m4);
+            //   t0 = data0_4, t1 = data1_5, t2 = data2_6, t3 = data3_7
+
+            // i16 → i8 saturating pack, two ymm at a time:
+            //   pack01_45 lo128 = row0|row1,  hi128 = row4|row5
+            //   pack23_67 lo128 = row2|row3,  hi128 = row6|row7
+            let pack01_45 = _mm256_packs_epi16(t0, t1);
+            let pack23_67 = _mm256_packs_epi16(t2, t3);
+
+            // +128 level shift via wrap-around byte add. After this the
+            // i8 lanes are reinterpreted as u8 in [0, 255], matching the
+            // scalar reference's clamp(0, 255).
+            let center = _mm256_loadu_si256(PB_CENTERJSAMP.0.as_ptr() as *const __m256i);
+            let pack01_45 = _mm256_add_epi8(pack01_45, center);
+            let pack23_67 = _mm256_add_epi8(pack23_67, center);
+
+            // Reorder so output is contiguous row 0..7:
+            //   first  = (row0|row1|row2|row3)
+            //   second = (row4|row5|row6|row7)
+            let first = _mm256_permute2x128_si256::<0x20>(pack01_45, pack23_67);
+            let second = _mm256_permute2x128_si256::<0x31>(pack01_45, pack23_67);
+
+            let outp = output.as_mut_ptr() as *mut __m256i;
+            _mm256_storeu_si256(outp, first);
+            _mm256_storeu_si256(outp.add(1), second);
 
             _mm256_zeroupper();
         }
