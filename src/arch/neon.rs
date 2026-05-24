@@ -571,6 +571,160 @@ pub mod dct {
         }
     }
 
+    /// jidctint pass-1 sparse, 4x8 half — assumes rows 4-7 are all
+    /// zero. Same output contract as `idct_pass1_regular`.
+    ///
+    /// # Safety
+    /// NEON enabled; `ws1`/`ws2` must each be writable for 16 i16.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn idct_pass1_sparse(
+        row0: int16x4_t,
+        row1: int16x4_t,
+        row2: int16x4_t,
+        row3: int16x4_t,
+        ws1: *mut i16,
+        ws2: *mut i16,
+    ) {
+        unsafe {
+            let consts1 = vld1_s16(I_CONSTS.as_ptr());
+            let consts2 = vld1_s16(I_CONSTS.as_ptr().add(4));
+            let consts3 = vld1_s16(I_CONSTS.as_ptr().add(8));
+
+            // Even part — row6 == 0 so z3 drops out.
+            let z2 = row2;
+            let tmp2 = vmull_lane_s16::<1>(z2, consts1);
+            let tmp3 = vmull_lane_s16::<2>(z2, consts2);
+
+            // row4 == 0 so tmp0 == tmp1 == row0 << CONST_BITS.
+            let z2 = row0;
+            let tmp0 = vshll_n_s16::<I_CONST_BITS>(z2);
+            let tmp1 = tmp0;
+
+            let tmp10 = vaddq_s32(tmp0, tmp3);
+            let tmp13 = vsubq_s32(tmp0, tmp3);
+            let tmp11 = vaddq_s32(tmp1, tmp2);
+            let tmp12 = vsubq_s32(tmp1, tmp2);
+
+            // Odd part — t0 = row7 = 0, t1 = row5 = 0. So:
+            //   z3 = t2 (= row3)
+            //   z4 = t3 (= row1)
+            let t2_s16 = row3;
+            let t3_s16 = row1;
+
+            let z3_s16 = t2_s16;
+            let z4_s16 = t3_s16;
+
+            let mut z3 = vmull_lane_s16::<3>(z3_s16, consts3);
+            z3 = vmlal_lane_s16::<3>(z3, z4_s16, consts2);
+            let mut z4 = vmull_lane_s16::<3>(z3_s16, consts2);
+            z4 = vmlal_lane_s16::<0>(z4, z4_s16, consts3);
+
+            let tmp0 = vmlsl_lane_s16::<0>(z3, t3_s16, consts1);
+            let tmp1 = vmlsl_lane_s16::<2>(z4, t2_s16, consts1);
+            let tmp2 = vmlal_lane_s16::<2>(z3, t2_s16, consts3);
+            let tmp3 = vmlal_lane_s16::<0>(z4, t3_s16, consts2);
+
+            let rows_0123 = int16x4x4_t(
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp10, tmp3)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp11, tmp2)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp12, tmp1)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vaddq_s32(tmp13, tmp0)),
+            );
+            let rows_4567 = int16x4x4_t(
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp13, tmp0)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp12, tmp1)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp11, tmp2)),
+                vrshrn_n_s32::<I_DESCALE_P1>(vsubq_s32(tmp10, tmp3)),
+            );
+            vst4_s16(ws1, rows_0123);
+            vst4_s16(ws2, rows_4567);
+        }
+    }
+
+    /// jidctint pass-2 sparse — assumes workspace "rows" 4-7
+    /// (= cols 4-7 of original ws after the pass-1 transpose) are
+    /// all zero. Same output contract as `idct_pass2_regular`.
+    ///
+    /// # Safety
+    /// NEON enabled; `workspace` readable for 32 i16 (only the
+    /// first 16 are accessed); `output_base` writable for
+    /// `(buf_offset + 4) * 8` bytes.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn idct_pass2_sparse(workspace: *const i16, output_base: *mut u8, buf_offset: usize) {
+        unsafe {
+            let consts1 = vld1_s16(I_CONSTS.as_ptr());
+            let consts2 = vld1_s16(I_CONSTS.as_ptr().add(4));
+            let consts3 = vld1_s16(I_CONSTS.as_ptr().add(8));
+
+            // Even part — index 6 (col 6 of original ws) is zero.
+            let z2 = vld1_s16(workspace.add(2 * 4));
+            let tmp2 = vmull_lane_s16::<1>(z2, consts1);
+            let tmp3 = vmull_lane_s16::<2>(z2, consts2);
+
+            let z2 = vld1_s16(workspace);
+            let tmp0 = vshll_n_s16::<I_CONST_BITS>(z2);
+            let tmp1 = tmp0;
+
+            let tmp10 = vaddq_s32(tmp0, tmp3);
+            let tmp13 = vsubq_s32(tmp0, tmp3);
+            let tmp11 = vaddq_s32(tmp1, tmp2);
+            let tmp12 = vsubq_s32(tmp1, tmp2);
+
+            // Odd part — index 7 and 5 are zero.
+            let t2_s16 = vld1_s16(workspace.add(3 * 4));
+            let t3_s16 = vld1_s16(workspace.add(4));
+
+            let z3_s16 = t2_s16;
+            let z4_s16 = t3_s16;
+
+            let mut z3 = vmull_lane_s16::<3>(z3_s16, consts3);
+            z3 = vmlal_lane_s16::<3>(z3, z4_s16, consts2);
+            let mut z4 = vmull_lane_s16::<3>(z3_s16, consts2);
+            z4 = vmlal_lane_s16::<0>(z4, z4_s16, consts3);
+
+            let tmp0 = vmlsl_lane_s16::<0>(z3, t3_s16, consts1);
+            let tmp1 = vmlsl_lane_s16::<2>(z4, t2_s16, consts1);
+            let tmp2 = vmlal_lane_s16::<2>(z3, t2_s16, consts3);
+            let tmp3 = vmlal_lane_s16::<0>(z4, t3_s16, consts2);
+
+            let cols_02_s16 = vcombine_s16(vaddhn_s32(tmp10, tmp3), vaddhn_s32(tmp12, tmp1));
+            let cols_13_s16 = vcombine_s16(vaddhn_s32(tmp11, tmp2), vaddhn_s32(tmp13, tmp0));
+            let cols_46_s16 = vcombine_s16(vsubhn_s32(tmp13, tmp0), vsubhn_s32(tmp11, tmp2));
+            let cols_57_s16 = vcombine_s16(vsubhn_s32(tmp12, tmp1), vsubhn_s32(tmp10, tmp3));
+
+            let cols_02_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_02_s16);
+            let cols_13_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_13_s16);
+            let cols_46_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_46_s16);
+            let cols_57_s8 = vqrshrn_n_s16::<I_DESCALE_P2_LATE>(cols_57_s16);
+
+            let center = vdup_n_u8(128);
+            let cols_02_u8 = vadd_u8(vreinterpret_u8_s8(cols_02_s8), center);
+            let cols_13_u8 = vadd_u8(vreinterpret_u8_s8(cols_13_s8), center);
+            let cols_46_u8 = vadd_u8(vreinterpret_u8_s8(cols_46_s8), center);
+            let cols_57_u8 = vadd_u8(vreinterpret_u8_s8(cols_57_s8), center);
+
+            let cols_01_23 = vzip_u8(cols_02_u8, cols_13_u8);
+            let cols_45_67 = vzip_u8(cols_46_u8, cols_57_u8);
+            let quad = uint16x4x4_t(
+                vreinterpret_u16_u8(cols_01_23.0),
+                vreinterpret_u16_u8(cols_01_23.1),
+                vreinterpret_u16_u8(cols_45_67.0),
+                vreinterpret_u16_u8(cols_45_67.1),
+            );
+
+            let row0 = output_base.add(buf_offset * 8).cast::<u16>();
+            let row1 = output_base.add((buf_offset + 1) * 8).cast::<u16>();
+            let row2 = output_base.add((buf_offset + 2) * 8).cast::<u16>();
+            let row3 = output_base.add((buf_offset + 3) * 8).cast::<u16>();
+            vst4_lane_u16::<0>(row0, quad);
+            vst4_lane_u16::<1>(row1, quad);
+            vst4_lane_u16::<2>(row2, quad);
+            vst4_lane_u16::<3>(row3, quad);
+        }
+    }
+
     /// # Safety
     /// `target_arch = "aarch64"` guarantees NEON. `coef` / `output` are
     /// fixed-size references; no caller-side invariants beyond the
@@ -600,32 +754,40 @@ pub mod dct {
             let r7l = vld1_s16(p.add(56));
             let r7r = vld1_s16(p.add(60));
 
-            // DC-only fast path: detect blocks whose only nonzero
-            // coefficient is `coef[0]` (the DC term). For natural
-            // images this is a common case — large smooth regions of
-            // the image compress to DC-only blocks after quantization.
+            // Sparse-path detection. We classify each 4x8 half by its
+            // nonzero structure and pick the cheapest IDCT variant:
             //
-            // For such a block, the IDCT output is a constant value:
-            //   output[r][c] = clamp((dc + 4) >> 3 + 128, 0, 255)
-            // (derived from the scalar pipeline: ws[r][0] = dc * 4,
-            // ws[*][1..] = 0, pass-2 final descale-and-narrow with the
-            // +128 level shift collapses to (dc + 4) >> 3 + 128.)
+            //   left_4567 / right_4567 — rows 4-7 of the half. Zero
+            //     ⇒ pass-1 can use the "sparse" variant (rows 4-7
+            //     drop out of the butterfly).
+            //   right_full — every coefficient in the right 4x8 half.
+            //     Zero ⇒ workspace cols 4-7 stay zero after pass-1,
+            //     so pass-2 can use its sparse variant on both halves.
+            //   bm (full AC bitmap) — every coefficient except `coef[0]`.
+            //     Zero ⇒ DC-only fast path: output is a constant
+            //     `clamp((dc + 4) >> 3 + 128, 0, 255)` and we skip
+            //     both passes entirely.
             //
-            // Detection: OR-reduce row 0 AC lanes (cols 1-3 of left
-            // half, all of right half) and all of rows 1-7. Zero
-            // result ⇒ DC-only.
-            let r0l_ac = vset_lane_s16::<0>(0, r0l);
-            let mut bm = vorr_s16(r0l_ac, r0r);
-            bm = vorr_s16(bm, vorr_s16(r1l, r1r));
-            bm = vorr_s16(bm, vorr_s16(r2l, r2r));
-            bm = vorr_s16(bm, vorr_s16(r3l, r3r));
-            bm = vorr_s16(bm, vorr_s16(r4l, r4r));
-            bm = vorr_s16(bm, vorr_s16(r5l, r5r));
-            bm = vorr_s16(bm, vorr_s16(r6l, r6r));
-            bm = vorr_s16(bm, vorr_s16(r7l, r7r));
-            let bm_u64 = vget_lane_u64::<0>(vreinterpret_u64_s16(bm));
+            // Reduction is a `vget_lane_u64` on the i16x4 OR-reduction
+            // — one scalar test per category.
+            let left_4567 = vorr_s16(vorr_s16(r4l, r5l), vorr_s16(r6l, r7l));
+            let right_4567 = vorr_s16(vorr_s16(r4r, r5r), vorr_s16(r6r, r7r));
+            let left_0123_ac = vorr_s16(
+                vorr_s16(vset_lane_s16::<0>(0, r0l), r1l),
+                vorr_s16(r2l, r3l),
+            );
+            let right_0123 = vorr_s16(vorr_s16(r0r, r1r), vorr_s16(r2r, r3r));
+            let right_full = vorr_s16(right_0123, right_4567);
 
-            if bm_u64 == 0 {
+            let left_4567_zero = vget_lane_u64::<0>(vreinterpret_u64_s16(left_4567)) == 0;
+            let right_4567_zero = vget_lane_u64::<0>(vreinterpret_u64_s16(right_4567)) == 0;
+            let right_full_zero = vget_lane_u64::<0>(vreinterpret_u64_s16(right_full)) == 0;
+
+            // DC-only requires: rows 1-7 (both halves) zero AND right
+            // half row 0 zero AND left row 0 AC lanes zero. Equivalent:
+            // `left_0123_ac | left_4567 | right_full == 0`.
+            let dc_only_bm = vorr_s16(left_0123_ac, vorr_s16(left_4567, right_full));
+            if vget_lane_u64::<0>(vreinterpret_u64_s16(dc_only_bm)) == 0 {
                 let dc = vget_lane_s16::<0>(r0l) as i32;
                 let val = (((dc + 4) >> 3) + 128).clamp(0, 255) as u8;
                 let dup = vdupq_n_u8(val);
@@ -637,47 +799,67 @@ pub mod dct {
                 return;
             }
 
-            // Regular path.
             let mut ws_l = [0i16; 32];
             let mut ws_r = [0i16; 32];
 
-            // Pass 1, left 4x8 half (columns 0-3). Writes ws_l[0..16]
-            // and ws_r[0..16] in transposed 4x4 quadrants.
-            idct_pass1_regular(
-                r0l,
-                r1l,
-                r2l,
-                r3l,
-                r4l,
-                r5l,
-                r6l,
-                r7l,
-                ws_l.as_mut_ptr(),
-                ws_r.as_mut_ptr(),
-            );
+            // Pass 1, left 4x8 half — sparse if rows 4-7 zero.
+            if left_4567_zero {
+                idct_pass1_sparse(r0l, r1l, r2l, r3l, ws_l.as_mut_ptr(), ws_r.as_mut_ptr());
+            } else {
+                idct_pass1_regular(
+                    r0l,
+                    r1l,
+                    r2l,
+                    r3l,
+                    r4l,
+                    r5l,
+                    r6l,
+                    r7l,
+                    ws_l.as_mut_ptr(),
+                    ws_r.as_mut_ptr(),
+                );
+            }
 
-            // Pass 1, right 4x8 half (columns 4-7). Writes
-            // ws_l[16..32] and ws_r[16..32].
-            idct_pass1_regular(
-                r0r,
-                r1r,
-                r2r,
-                r3r,
-                r4r,
-                r5r,
-                r6r,
-                r7r,
-                ws_l.as_mut_ptr().add(16),
-                ws_r.as_mut_ptr().add(16),
-            );
+            // Pass 1, right 4x8 half — sparse if rows 4-7 zero. (If the
+            // entire half is zero, the sparse path produces all-zero
+            // workspace, which is also what pass-2 sparse expects.)
+            if right_4567_zero {
+                idct_pass1_sparse(
+                    r0r,
+                    r1r,
+                    r2r,
+                    r3r,
+                    ws_l.as_mut_ptr().add(16),
+                    ws_r.as_mut_ptr().add(16),
+                );
+            } else {
+                idct_pass1_regular(
+                    r0r,
+                    r1r,
+                    r2r,
+                    r3r,
+                    r4r,
+                    r5r,
+                    r6r,
+                    r7r,
+                    ws_l.as_mut_ptr().add(16),
+                    ws_r.as_mut_ptr().add(16),
+                );
+            }
 
-            // Pass 2: ws_l → output rows 0-3, ws_r → output rows 4-7.
-            // The pass-1 transposed layout means pass 2's "row N" inputs
-            // are actually column N of the original ws — that's our
-            // implicit transpose between passes.
+            // Pass 2 — sparse for both halves if the right input half
+            // was fully zero (workspace cols 4-7 are then zero, which
+            // is what pass-2 sparse requires). The pass-1 transposed
+            // layout means pass 2's "row N" inputs are actually
+            // column N of the original ws.
             let out = output.as_mut_ptr();
-            idct_pass2_regular(ws_l.as_ptr(), out, 0);
-            idct_pass2_regular(ws_r.as_ptr(), out, 4);
+            if right_full_zero {
+                idct_pass2_sparse(ws_l.as_ptr(), out, 0);
+                idct_pass2_sparse(ws_r.as_ptr(), out, 4);
+            } else {
+                idct_pass2_regular(ws_l.as_ptr(), out, 0);
+                idct_pass2_regular(ws_r.as_ptr(), out, 4);
+            }
         }
     }
 
@@ -1317,6 +1499,42 @@ mod tests {
     #[test]
     fn idct_neon_matches_scalar_zeros() {
         idct_xcheck(&[0i16; 64], "zeros");
+    }
+
+    #[test]
+    fn idct_neon_sparse_path_top_only() {
+        // Blocks whose rows 4-7 are zero exercise `idct_pass1_sparse`
+        // on both 4x8 halves. Use a panel of low-frequency AC values
+        // covering all (row 0-3, col 0-7) positions in turn.
+        for k in 0..32 {
+            for &m in &[1i16, -1, 17, 256, -256, 1024] {
+                let mut coef = [0i16; 64];
+                coef[k] = m;
+                idct_xcheck(&coef, &format!("top-only k={k} m={m}"));
+            }
+        }
+    }
+
+    #[test]
+    fn idct_neon_sparse_path_right_half_zero() {
+        // Blocks whose right 4x8 half (cols 4-7) is fully zero
+        // exercise `idct_pass2_sparse`. Combine non-trivial left-half
+        // content with zero right-half.
+        for seed in 0..40u64 {
+            let mut block = random_block(seed);
+            for v in block.iter_mut() {
+                *v /= 8;
+            }
+            // Run FDCT to get a coef-shaped distribution, then zero
+            // cols 4-7.
+            scalar::dct::fdct_islow(&mut block);
+            for r in 0..8 {
+                for c in 4..8 {
+                    block[r * 8 + c] = 0;
+                }
+            }
+            idct_xcheck(&block, &format!("right-zero seed={seed}"));
+        }
     }
 
     #[test]
