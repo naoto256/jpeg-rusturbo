@@ -98,7 +98,8 @@ pub fn decode(src: &[u8], format: PixelFormat) -> Result<Vec<u8>> {
 
 /// Convert the per-component sample planes into an interleaved
 /// `PixelFormat` buffer. Handles 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 /
-/// 4:4:0 chroma layouts via per-row upsample replication.
+/// 4:4:0 chroma layouts via the separable fancy upsample helper, with
+/// box-replication fallback for wider sampling factors.
 fn compose_output(
     planes: &DecodedPlanes,
     headers: &DecoderHeaders,
