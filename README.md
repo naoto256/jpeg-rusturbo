@@ -4,9 +4,10 @@
 [![Release](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Baseline JPEG encode + decode with libjpeg-turbo-derived SIMD
-kernels.** Drop-in for `image::codecs::jpeg::JpegEncoder` on the
-encode side; standalone decoder under `jpeg_rusturbo::decode`.
+**SIMD-accelerated baseline JPEG encoder + Huffman (baseline +
+progressive) decoder with libjpeg-turbo-derived kernels.** Drop-in
+for `image::codecs::jpeg::JpegEncoder` on the encode side; standalone
+decoder under `jpeg_rusturbo::decode`.
 
 ```rust
 use jpeg_rusturbo::{JpegEncoder, PixelFormat, decode};
