@@ -154,11 +154,33 @@ fn compose_output(
             let mut y_row = vec![0u8; width];
             let mut cb_row = vec![0u8; width];
             let mut cr_row = vec![0u8; width];
+            // Scratch buffers for the vertically-blended chroma plane
+            // row that feeds the horizontal upsample step. Sized to
+            // the chroma plane's `plane_width` (one sample per chroma
+            // column, not per output column).
+            let mut cb_vblend = vec![0u8; cb_plane.plane_width];
+            let mut cr_vblend = vec![0u8; cr_plane.plane_width];
 
             for j in 0..height {
                 copy_plane_row(y_plane, j, &mut y_row, width);
-                expand_chroma_row(cb_plane, j / cb_v_step, &mut cb_row, width, cb_h_step);
-                expand_chroma_row(cr_plane, j / cr_v_step, &mut cr_row, width, cr_h_step);
+                upsample_chroma_row(
+                    cb_plane,
+                    j,
+                    cb_v_step,
+                    cb_h_step,
+                    &mut cb_vblend,
+                    &mut cb_row,
+                    width,
+                );
+                upsample_chroma_row(
+                    cr_plane,
+                    j,
+                    cr_v_step,
+                    cr_h_step,
+                    &mut cr_vblend,
+                    &mut cr_row,
+                    width,
+                );
                 let dst_off = j * width * bpp;
                 crate::arch::backend::color::ycc_row_to_rgb(
                     &y_row,
@@ -199,28 +221,114 @@ fn copy_plane_row(plane: &DecodedPlane, j: usize, dst: &mut [u8], width: usize) 
     }
 }
 
-/// Expand chroma plane row `j` into `dst` at output width `width`, with
-/// each chroma sample replicated `h_step` times (box upsample). This
-/// covers 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 / 4:4:0 just by varying h_step.
-fn expand_chroma_row(plane: &DecodedPlane, j: usize, dst: &mut [u8], width: usize, h_step: usize) {
-    let j = j.min(plane.plane_height.saturating_sub(1));
-    let off = j * plane.stride;
-    if h_step == 1 {
-        let take = width.min(plane.plane_width);
-        dst[..take].copy_from_slice(&plane.samples[off..off + take]);
+/// Upsample one row of chroma into `dst` (output width = `width`),
+/// using a separable fancy 2-tap filter for the common `h_step ∈ {1,
+/// 2}` × `v_step ∈ {1, 2}` cases and falling back to box replication
+/// for the rarer wider sampling factors.
+///
+/// The vertical-blend buffer `vblend` is the chroma-plane-width scratch
+/// where row blending happens before horizontal interpolation; the
+/// caller owns it (allocated once per decode) to keep this fn
+/// allocation-free in the hot loop.
+fn upsample_chroma_row(
+    plane: &DecodedPlane,
+    j_out: usize,
+    v_step: usize,
+    h_step: usize,
+    vblend: &mut [u8],
+    dst: &mut [u8],
+    width: usize,
+) {
+    let plane_w = plane.plane_width;
+    let plane_h = plane.plane_height;
+
+    // ---- 1. Vertical blend → vblend (chroma-plane-width row) ----
+    if v_step <= 1 {
+        // No vertical interpolation needed. Just read the single row.
+        let j = j_out.min(plane_h.saturating_sub(1));
+        let off = j * plane.stride;
+        vblend[..plane_w].copy_from_slice(&plane.samples[off..off + plane_w]);
+    } else if v_step == 2 {
+        // libjpeg-turbo `h2v2_fancy` vertical pass: for each chroma
+        // row `cy`, the two output rows it covers are blended with
+        // the row above (upper output) and the row below (lower
+        // output) using weights (3 cur, 1 neighbor).
+        //
+        // Output row `j_out`:
+        //   - cur = j_out / 2 (the chroma row this output sits inside)
+        //   - phase = j_out & 1 → 0 = upper of pair, neighbor is cur-1
+        //                       → 1 = lower of pair, neighbor is cur+1
+        let cur = (j_out / 2).min(plane_h.saturating_sub(1));
+        let phase = j_out & 1;
+        let neighbor = if phase == 0 {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(plane_h.saturating_sub(1))
+        };
+        let cur_row = &plane.samples[cur * plane.stride..cur * plane.stride + plane_w];
+        let nbr_row = &plane.samples[neighbor * plane.stride..neighbor * plane.stride + plane_w];
+        for (dst, (&c, &n)) in vblend
+            .iter_mut()
+            .take(plane_w)
+            .zip(cur_row.iter().zip(nbr_row.iter()))
+        {
+            *dst = (((c as u16) * 3 + n as u16 + 2) >> 2) as u8;
+        }
+    } else {
+        // v_step > 2 (4:1:1 / 4:4:0 / unusual): box-replicate verbatim.
+        let cy = (j_out / v_step).min(plane_h.saturating_sub(1));
+        let off = cy * plane.stride;
+        vblend[..plane_w].copy_from_slice(&plane.samples[off..off + plane_w]);
+    }
+
+    // ---- 2. Horizontal upsample of vblend → dst ----
+    if h_step <= 1 {
+        let take = width.min(plane_w);
+        dst[..take].copy_from_slice(&vblend[..take]);
         if take < width {
-            let last = dst[take - 1];
+            let last = if take == 0 { 0 } else { dst[take - 1] };
             dst[take..width].fill(last);
         }
         return;
     }
-    // Box-replicate each chroma sample `h_step` times. The plane width
-    // is `ceil(width / h_step)` in samples; replication regenerates
-    // the per-pixel chroma signal.
+    if h_step == 2 {
+        // libjpeg-turbo `h2_fancy` horizontal pass: for each chroma
+        // column `cx`, the two output columns are blended with the
+        // adjacent chroma column:
+        //   out[2*cx]   = (3*in[cx] + in[cx-1] + 2) >> 2
+        //   out[2*cx+1] = (3*in[cx] + in[cx+1] + 2) >> 2
+        // With edge clamping at cx=0 / cx=plane_w-1.
+        let mut x_out = 0usize;
+        for cx in 0..plane_w {
+            let cur = vblend[cx] as u16;
+            let prev = if cx == 0 { cur } else { vblend[cx - 1] as u16 };
+            let next = if cx + 1 >= plane_w {
+                cur
+            } else {
+                vblend[cx + 1] as u16
+            };
+            let out_even = ((cur * 3 + prev + 2) >> 2) as u8;
+            let out_odd = ((cur * 3 + next + 2) >> 2) as u8;
+            if x_out >= width {
+                break;
+            }
+            dst[x_out] = out_even;
+            x_out += 1;
+            if x_out >= width {
+                break;
+            }
+            dst[x_out] = out_odd;
+            x_out += 1;
+        }
+        while x_out < width {
+            dst[x_out] = dst[x_out - 1];
+            x_out += 1;
+        }
+        return;
+    }
+    // h_step > 2: box-replicate each chroma sample `h_step` times.
     let mut x_out = 0usize;
-    let plane_w = plane.plane_width;
-    for xi in 0..plane_w {
-        let s = plane.samples[off + xi];
+    for &s in vblend.iter().take(plane_w) {
         for _ in 0..h_step {
             if x_out >= width {
                 break;
@@ -232,7 +340,6 @@ fn expand_chroma_row(plane: &DecodedPlane, j: usize, dst: &mut [u8], width: usiz
             break;
         }
     }
-    // Pad trailing (e.g. width not a multiple of h_step).
     while x_out < width {
         dst[x_out] = dst[x_out - 1];
         x_out += 1;
