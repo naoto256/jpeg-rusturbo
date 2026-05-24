@@ -8,15 +8,17 @@
 //!   A — encode pipeline      : 3 resolutions × 3 subsampling × q=80, default knobs
 //!   B — threads scaling      : 2 resolutions × threads {1,2,4,8,auto} × q=80, 4:2:0
 //!   C — optimize-huffman size: 3 resolutions × 3 subsampling × q {70,80,90} × {off,on}
-//!   all (default)            : run A then B then C
+//!   D — decode pipeline      : 3 resolutions × 3 subsampling × q=80 (decode of A's output)
+//!   all (default)            : run A then B then C then D
 //!
-//! Decode timing and image-crate comparison live in `tests/bench_vs_image.rs`
-//! (run with `cargo test --release --test bench_vs_image -- --ignored --nocapture`).
+//! Decode timing vs the `image` crate (cross-crate comparison) lives in
+//! `tests/comparison_bench.rs` (run with
+//! `cargo test --release --test comparison_bench -- --ignored --nocapture`).
 
 use std::env;
 use std::time::Instant;
 
-use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder};
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat, decode};
 
 const WARMUP: usize = 3;
 const ITERATIONS: usize = 50;
@@ -45,10 +47,12 @@ fn main() {
         Section::A => bench_a(),
         Section::B => bench_b(),
         Section::C => bench_c(),
+        Section::D => bench_d(),
         Section::All => {
             bench_a();
             bench_b();
             bench_c();
+            bench_d();
         }
     }
 }
@@ -58,6 +62,7 @@ enum Section {
     A,
     B,
     C,
+    D,
     All,
 }
 
@@ -70,6 +75,7 @@ fn parse_section() -> Section {
                 "A" | "a" => Section::A,
                 "B" | "b" => Section::B,
                 "C" | "c" => Section::C,
+                "D" | "d" => Section::D,
                 "all" | "All" => Section::All,
                 _ => usage_and_exit(),
             };
@@ -81,7 +87,7 @@ fn parse_section() -> Section {
 }
 
 fn usage_and_exit() -> ! {
-    eprintln!("usage: bench [--section A|B|C|all]");
+    eprintln!("usage: bench [--section A|B|C|D|all]");
     std::process::exit(2);
 }
 
@@ -106,6 +112,7 @@ fn print_header(section: Section) {
         Section::A => "A (encode pipeline)",
         Section::B => "B (threads scaling)",
         Section::C => "C (optimize-huffman size)",
+        Section::D => "D (decode pipeline)",
         Section::All => "all",
     };
     println!("jpeg-rusturbo bench — section: {sec}");
@@ -186,6 +193,64 @@ fn bench_c() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section D — decode pipeline
+// ---------------------------------------------------------------------------
+
+fn bench_d() {
+    println!("\n=== D. decode pipeline (q=80, JPEG -> RGB, default knobs) ===");
+    for &(sub_label, sub) in SUBSAMP_ALL {
+        println!("\n  subsampling: {sub_label}");
+        for &(label, w, h) in RES_ALL {
+            let pixels = make_image(w, h);
+
+            // Encode once outside the timed loop; the JPEG bytes are
+            // deterministic, so we can reuse them across all iterations.
+            let mut jpeg = Vec::with_capacity((w as usize * h as usize * 3) / 2);
+            {
+                let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
+                enc.set_subsampling(sub);
+                enc.encode_rgba(&pixels, w, h).unwrap();
+            }
+
+            let r = time_decode(&jpeg, w, h);
+            let mp = (w as f64) * (h as f64) / 1_000_000.0;
+            let ms_per_mp = r.ms_per_iter / mp;
+            println!(
+                "    {label:<28}  {ms:>7.2} ms/iter   {ms_per_mp:>5.2} ms/MPx   (JPEG {size} B → RGB {rgb_size} B)",
+                ms = r.ms_per_iter,
+                size = jpeg.len(),
+                rgb_size = r.size,
+            );
+        }
+    }
+}
+
+fn time_decode(jpeg: &[u8], w: u32, h: u32) -> Result {
+    let rgb_size = (w as usize) * (h as usize) * 3;
+    let mut rgb = Vec::with_capacity(rgb_size);
+
+    // Warm-up.
+    for _ in 0..WARMUP {
+        rgb = decode::decode(jpeg, PixelFormat::Rgb).unwrap();
+        std::hint::black_box(&rgb);
+    }
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        rgb = decode::decode(jpeg, PixelFormat::Rgb).unwrap();
+        std::hint::black_box(&rgb);
+    }
+    let elapsed = start.elapsed();
+    let per_iter = elapsed / ITERATIONS as u32;
+    let mp = (w as f64) * (h as f64) / 1_000_000.0;
+    Result {
+        ms_per_iter: per_iter.as_secs_f64() * 1000.0,
+        ms_per_mp: per_iter.as_secs_f64() * 1000.0 / mp,
+        size: rgb.len(),
     }
 }
 
