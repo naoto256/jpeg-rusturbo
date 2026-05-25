@@ -71,9 +71,12 @@
 //! color convert, and fancy chroma upsample in NEON + AVX2); it now
 //! sits at ~0.77× of `image`'s SIMD decoder while matching its
 //! coverage (baseline + progressive Huffman, fancy chroma upsample,
-//! all eight pixel layouts). The remaining gap is the scalar Huffman
-//! entropy decoder, slated for 0.7.0. See [`BENCH.md`] in the
-//! repository for detailed numbers.
+//! all eight pixel layouts). The IDCT additionally carries DC-only
+//! and sparse-row fast paths that fire on smooth regions in natural
+//! photographs (+11–19% of total decode time on natural content,
+//! noise-level on synthetic input). The remaining gap is the scalar
+//! Huffman entropy decoder, slated for 0.7.0. See [`BENCH.md`] in
+//! the repository for detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
