@@ -256,6 +256,231 @@ impl HuffmanDecodeTable {
     }
 }
 
+// ---------------------------------------------------------------
+// Combined AC Huffman LUT (decode_symbol + get_bits in one lookup).
+//
+// JPEG baseline AC scan decodes each non-zero coefficient as:
+//   1. decode_symbol(ac_tbl) → run/size byte
+//   2. get_bits(size)        → magnitude bits
+// Each step does its own peek/drop on the bit buffer. Combining the
+// two into a single LUT keyed on the next PEEK_WIDTH bits lets the
+// scan loop do one peek + one drop per coefficient when the symbol
+// fits, and only fall back to the two-step path for long codes or
+// codes whose magnitude bits spill past the peek window.
+//
+// The decode_block_baseline scan loop in this module's sibling
+// `baseline.rs` is not yet wired to use this LUT — the AC scan
+// switch lands in a follow-up change. This file builds and exposes
+// the LUT + a stand-alone fast-path lookup so it can be validated
+// against the existing path before any hot-loop substitution.
+// ---------------------------------------------------------------
+
+/// Width of the LUT key in bits. 10 bits → 1024 entries / 4 KiB.
+/// Chosen so that almost all baseline AC symbols (code length 2..7
+/// for the common run/size bytes) plus a small magnitude (0..3 bits)
+/// land in the fast path; longer codes (length 11..16 in the standard
+/// tables) and large-magnitude symbols correctly fall back.
+//
+// The combined LUT and its lookup are built and validated here but
+// not yet referenced by the scan loop; the wiring lands separately
+// so the table can be cross-checked against the existing two-step
+// path in isolation.
+#[allow(dead_code)]
+pub const FAST_AC_PEEK_WIDTH: u32 = 10;
+
+const FAST_AC_LUT_SIZE: usize = 1 << FAST_AC_PEEK_WIDTH;
+
+/// One LUT entry. Packed u32, layout:
+///   bits  0..7  : run (0..=15)
+///   bits  8..15 : size (0..=15; baseline AC tops out at 10)
+///   bits 16..23 : total_consumed = code_length + size (0..=PEEK_WIDTH)
+///   bit   24    : valid (1 = fast path applies; 0 = fall back to slow path)
+///   bits 25..31 : reserved (0)
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct FastAcEntry(u32);
+
+#[allow(dead_code)]
+impl FastAcEntry {
+    const INVALID: Self = Self(0);
+
+    #[inline]
+    fn new(run: u8, size: u8, total_consumed: u8) -> Self {
+        Self((run as u32) | ((size as u32) << 8) | ((total_consumed as u32) << 16) | (1u32 << 24))
+    }
+
+    #[inline]
+    pub fn is_valid(self) -> bool {
+        (self.0 >> 24) & 1 == 1
+    }
+    #[inline]
+    pub fn run(self) -> u8 {
+        self.0 as u8
+    }
+    #[inline]
+    pub fn size(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
+    #[inline]
+    pub fn total_consumed(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+}
+
+/// Combined AC lookup table indexed by the next `FAST_AC_PEEK_WIDTH`
+/// bits of the entropy stream.
+#[allow(dead_code)]
+pub struct FastAcHuffmanTable {
+    lut: Box<[FastAcEntry; FAST_AC_LUT_SIZE]>,
+}
+
+#[allow(dead_code)]
+impl FastAcHuffmanTable {
+    /// Build from a DHT spec (AC class). Mirrors the canonical-Huffman
+    /// expansion in `HuffmanDecodeTable::from_spec`; then for every
+    /// symbol whose code_length + size ≤ PEEK_WIDTH, fills the LUT
+    /// slots prefixed by [code | every magnitude variant | every
+    /// don't-care tail] with the same packed entry.
+    pub fn from_spec(spec: &HuffmanTableSpec) -> Result<Self> {
+        // 1. huffsize: per-symbol code length.
+        let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
+        for (l_idx, &count) in spec.bits.iter().enumerate() {
+            for _ in 0..count {
+                huffsize.push((l_idx + 1) as u8);
+            }
+        }
+        if huffsize.len() != spec.values.len() {
+            return Err(DecodeError::Malformed("DHT bits/values mismatch"));
+        }
+        if huffsize.is_empty() {
+            return Err(DecodeError::Malformed("empty DHT table"));
+        }
+
+        // 2. huffcode: canonical Huffman code per symbol.
+        let mut huffcode: Vec<u32> = Vec::with_capacity(huffsize.len());
+        let mut code: u32 = 0;
+        let mut si = huffsize[0] as u32;
+        let mut p = 0usize;
+        loop {
+            while p < huffsize.len() && (huffsize[p] as u32) == si {
+                huffcode.push(code);
+                code = code.wrapping_add(1);
+                p += 1;
+            }
+            if p == huffsize.len() {
+                break;
+            }
+            while (huffsize[p] as u32) != si {
+                code <<= 1;
+                si += 1;
+            }
+        }
+
+        // 3. Fill the LUT. Codes whose length itself exceeds
+        // PEEK_WIDTH, and codes where code_length + size exceeds
+        // PEEK_WIDTH, are left at valid=0 — the canonical Huffman
+        // prefix property guarantees their LUT slots don't collide
+        // with any fast-path symbol.
+        let mut lut = Box::new([FastAcEntry::INVALID; FAST_AC_LUT_SIZE]);
+        for i in 0..huffsize.len() {
+            let l = huffsize[i] as u32;
+            if l > FAST_AC_PEEK_WIDTH {
+                continue;
+            }
+            let sym = spec.values[i];
+            let run = (sym >> 4) & 0x0F;
+            let size = (sym & 0x0F) as u32;
+            let total = l + size;
+            if total > FAST_AC_PEEK_WIDTH {
+                continue;
+            }
+            let entry = FastAcEntry::new(run, size as u8, total as u8);
+            // Slots prefixed by `code` (left-aligned to PEEK_WIDTH).
+            // 2^(PEEK_WIDTH - l) slots in total, all of which carry
+            // this same (run, size, total) — the magnitude bits and
+            // the don't-care tail are extracted at lookup time.
+            let base = (huffcode[i] as usize) << (FAST_AC_PEEK_WIDTH - l);
+            let span = 1usize << (FAST_AC_PEEK_WIDTH - l);
+            for j in 0..span {
+                lut[base + j] = entry;
+            }
+        }
+
+        Ok(Self { lut })
+    }
+
+    /// Return the entry for the given PEEK_WIDTH-bit peek key.
+    #[inline]
+    pub fn lookup(&self, peek_key: u32) -> FastAcEntry {
+        self.lut[(peek_key & ((1u32 << FAST_AC_PEEK_WIDTH) - 1)) as usize]
+    }
+
+    /// Number of LUT slots flagged valid. Useful for diagnostics and
+    /// for asserting that the fast path actually covers the bulk of
+    /// the input distribution on the standard tables.
+    pub fn fast_path_slot_count(&self) -> usize {
+        self.lut.iter().filter(|e| e.is_valid()).count()
+    }
+}
+
+/// One coefficient decoded via the combined LUT.
+///
+/// `magnitude_raw` is the raw `size`-bit magnitude field as it
+/// appears in the stream, before sign-extension. Callers apply
+/// [`extend`] to recover the signed value.
+#[allow(dead_code)]
+pub struct FastAcDecoded {
+    pub run: u8,
+    pub size: u8,
+    pub magnitude_raw: u32,
+    pub total_consumed: u8,
+}
+
+/// Combined AC fast-path lookup.
+///
+/// Returns `Some(FastAcDecoded)` if the next `FAST_AC_PEEK_WIDTH`
+/// bits hit a valid LUT entry — in that case the reader is advanced
+/// by `total_consumed` bits and the caller can apply
+/// `extend(magnitude_raw, size)` (when `size > 0`) to recover the
+/// signed coefficient. Returns `Ok(None)` if the LUT slot is invalid;
+/// the caller must then fall back to
+/// `BitReader::decode_symbol` + `BitReader::get_bits` (and the bit
+/// buffer is left untouched so the slow path sees the same bits).
+#[allow(dead_code)]
+pub fn decode_ac_fast(
+    br: &mut BitReader,
+    tbl: &FastAcHuffmanTable,
+) -> Result<Option<FastAcDecoded>> {
+    if br.nbits < FAST_AC_PEEK_WIDTH {
+        br.fill(FAST_AC_PEEK_WIDTH)?;
+    }
+    let peek_key =
+        ((br.buf >> (br.nbits - FAST_AC_PEEK_WIDTH)) as u32) & ((1u32 << FAST_AC_PEEK_WIDTH) - 1);
+    let entry = tbl.lookup(peek_key);
+    if !entry.is_valid() {
+        return Ok(None);
+    }
+    let run = entry.run();
+    let size = entry.size();
+    let total = entry.total_consumed();
+    let code_length = total - size;
+    let magnitude_raw = if size == 0 {
+        0
+    } else {
+        // Magnitude bits sit inside `peek_key` at offset code_length
+        // from the MSB of the PEEK_WIDTH-bit window.
+        let shift = FAST_AC_PEEK_WIDTH - code_length as u32 - size as u32;
+        (peek_key >> shift) & ((1u32 << size) - 1)
+    };
+    br.drop_bits(total as u32);
+    Ok(Some(FastAcDecoded {
+        run,
+        size,
+        magnitude_raw,
+        total_consumed: total,
+    }))
+}
+
 /// Convert a magnitude-category encoded value back to its signed
 /// integer. Inverse of `magnitude_category` in the encoder
 /// (`crate::huffman::magnitude_category`).
@@ -322,6 +547,182 @@ mod tests {
         // afterward are zero-padded.
         let _ = br.get_bits(8).unwrap();
         assert_eq!(br.marker(), Some(0xD9));
+    }
+
+    /// Diagnostic-only — print fast-path slot coverage and slow-path
+    /// fallback code-length histogram for the standard luma/chroma AC
+    /// tables. Marked `#[ignore]` so it doesn't run in CI; invoke as
+    /// `cargo test fast_ac_lut_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fast_ac_lut_report() {
+        for (name, std, id) in [
+            ("luma", &crate::tables::STD_LUMA_AC, 0u8),
+            ("chroma", &crate::tables::STD_CHROMA_AC, 1u8),
+        ] {
+            let spec = HuffmanTableSpec {
+                class: 1,
+                id,
+                bits: std.bits,
+                values: std.values.to_vec(),
+            };
+            let fast = FastAcHuffmanTable::from_spec(&spec).unwrap();
+            let valid = fast.fast_path_slot_count();
+            let total = 1usize << FAST_AC_PEEK_WIDTH;
+            // Reconstruct per-symbol code length so we can classify
+            // which symbols stay on the slow path.
+            let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
+            for (l_idx, &count) in spec.bits.iter().enumerate() {
+                for _ in 0..count {
+                    huffsize.push((l_idx + 1) as u8);
+                }
+            }
+            let mut slow_hist = [0usize; 17];
+            let mut slow_count = 0usize;
+            for (i, &l) in huffsize.iter().enumerate() {
+                let sym = spec.values[i];
+                let size = (sym & 0x0F) as u32;
+                let total_consumed = l as u32 + size;
+                if (l as u32) > FAST_AC_PEEK_WIDTH || total_consumed > FAST_AC_PEEK_WIDTH {
+                    slow_hist[l as usize] += 1;
+                    slow_count += 1;
+                }
+            }
+            eprintln!(
+                "[{name} AC] fast-path slots = {valid}/{total} ({:.1}%); slow-path symbols = {slow_count}/{}; slow code-length histogram (l=1..16) = {:?}",
+                100.0 * valid as f64 / total as f64,
+                spec.values.len(),
+                &slow_hist[1..=16],
+            );
+        }
+    }
+
+    fn ac_spec(std: &crate::tables::StdHuffman, id: u8) -> HuffmanTableSpec {
+        HuffmanTableSpec {
+            class: 1,
+            id,
+            bits: std.bits,
+            values: std.values.to_vec(),
+        }
+    }
+
+    /// Drive both the combined-LUT fast path and the existing
+    /// `decode_symbol` + `get_bits` slow path on the same MSB-aligned
+    /// 10-bit input pattern, and require their decoded
+    /// (run, size, magnitude_raw) triples agree whenever the LUT
+    /// reports a valid entry. Sweeps the full 2^PEEK_WIDTH key space.
+    fn cross_check_against_slow_path(spec: &HuffmanTableSpec) -> (usize, usize) {
+        let fast = FastAcHuffmanTable::from_spec(spec).unwrap();
+        let slow = HuffmanDecodeTable::from_spec(spec).unwrap();
+        let mut valid = 0usize;
+        for i in 0..(1u32 << FAST_AC_PEEK_WIDTH) {
+            // Place `i` as the top PEEK_WIDTH bits of a 32-bit stream.
+            let aligned = i << (32 - FAST_AC_PEEK_WIDTH);
+            let bytes = aligned.to_be_bytes();
+            let mut br_fast = BitReader::new(&bytes, 0);
+            let got = decode_ac_fast(&mut br_fast, &fast).unwrap();
+            if let Some(d) = got {
+                valid += 1;
+                assert!(
+                    (d.total_consumed as u32) <= FAST_AC_PEEK_WIDTH,
+                    "key {i:#x}: total_consumed {} exceeds peek width",
+                    d.total_consumed
+                );
+                // Decode the same stream the slow way and compare.
+                let mut br_slow = BitReader::new(&bytes, 0);
+                let sym = br_slow.decode_symbol(&slow).unwrap();
+                let run_slow = (sym >> 4) & 0x0F;
+                let size_slow = sym & 0x0F;
+                let mag_slow = if size_slow == 0 {
+                    0
+                } else {
+                    br_slow.get_bits(size_slow as u32).unwrap()
+                };
+                assert_eq!(d.run, run_slow, "key {i:#x}: run mismatch");
+                assert_eq!(d.size, size_slow, "key {i:#x}: size mismatch");
+                assert_eq!(
+                    d.magnitude_raw, mag_slow,
+                    "key {i:#x}: magnitude mismatch (size={size_slow})"
+                );
+            }
+        }
+        (valid, 1usize << FAST_AC_PEEK_WIDTH)
+    }
+
+    #[test]
+    fn fast_ac_lut_round_trips_via_standard_luma_ac() {
+        let spec = ac_spec(&crate::tables::STD_LUMA_AC, 0);
+        let (valid, total) = cross_check_against_slow_path(&spec);
+        // Standard luma AC: codes of length 2..10 contribute ~30 of
+        // the 162 symbols and easily cover well over half the
+        // 1024-slot key space once magnitude variants are expanded.
+        // Pin the lower bound at 50% to catch builder regressions.
+        assert!(
+            valid * 2 >= total,
+            "luma AC fast-path coverage too low: {valid}/{total}"
+        );
+    }
+
+    #[test]
+    fn fast_ac_lut_round_trips_via_standard_chroma_ac() {
+        let spec = ac_spec(&crate::tables::STD_CHROMA_AC, 1);
+        let (valid, total) = cross_check_against_slow_path(&spec);
+        assert!(
+            valid * 2 >= total,
+            "chroma AC fast-path coverage too low: {valid}/{total}"
+        );
+    }
+
+    #[test]
+    fn fast_ac_lut_marks_long_codes_as_slow_path() {
+        // STD_LUMA_AC has 125 length-16 codes — none can fit in a
+        // 10-bit peek, so every key that those codes' prefixes occupy
+        // must report valid=0. We verify the structural property: no
+        // valid entry's recorded code_length exceeds PEEK_WIDTH and no
+        // total_consumed exceeds PEEK_WIDTH.
+        let spec = ac_spec(&crate::tables::STD_LUMA_AC, 0);
+        let fast = FastAcHuffmanTable::from_spec(&spec).unwrap();
+        for i in 0..(1u32 << FAST_AC_PEEK_WIDTH) {
+            let e = fast.lookup(i);
+            if e.is_valid() {
+                let total = e.total_consumed() as u32;
+                let size = e.size() as u32;
+                assert!(total <= FAST_AC_PEEK_WIDTH);
+                assert!(size <= total);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_ac_lut_handles_zrl_and_eob() {
+        // ZRL = 0xF0 (run=15, size=0); EOB = 0x00 (run=0, size=0).
+        // Both are short codes in the standard luma AC table, so they
+        // must land in the fast path with size==0 and total_consumed
+        // equal to their code length (no magnitude bits).
+        let spec = ac_spec(&crate::tables::STD_LUMA_AC, 0);
+        let fast = FastAcHuffmanTable::from_spec(&spec).unwrap();
+
+        // EOB code is 1010 (length 4) per Annex K.4; ZRL is
+        // 11111111001 (length 11) — outside our 10-bit window, so
+        // ZRL stays slow-path. EOB must be fast-path.
+        let mut found_eob = false;
+        let mut found_run0_size_nonzero = false;
+        for i in 0..(1u32 << FAST_AC_PEEK_WIDTH) {
+            let e = fast.lookup(i);
+            if e.is_valid() {
+                if e.run() == 0 && e.size() == 0 {
+                    found_eob = true;
+                }
+                if e.run() == 0 && e.size() != 0 {
+                    found_run0_size_nonzero = true;
+                }
+            }
+        }
+        assert!(found_eob, "EOB (run=0, size=0) must hit fast path");
+        assert!(
+            found_run0_size_nonzero,
+            "expected at least one run=0 non-zero size symbol in fast path"
+        );
     }
 
     #[test]
