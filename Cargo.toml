@@ -41,3 +41,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Inherits release but keeps debug-line tables so sampling profilers
+# (samply, perf, Instruments) resolve symbols against the optimized
+# binary. Build with `cargo build --profile profiling` then sample the
+# resulting `target/profiling/<bin>`; production release builds (= the
+# `release` profile above) keep the default `debug = false` to stay
+# small and stripped.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
