@@ -209,6 +209,11 @@ modes return `DecodeError::Unsupported`.
 - **`jidctint`-style IDCT** — bit-exact against libjpeg-turbo's
   integer reference, with NEON and AVX2 ported kernels. Scalar
   fallback retained for `force-scalar` and non-SIMD targets.
+  Includes **DC-only and sparse-row fast paths** that detect blocks
+  with rows 4–7 (or all AC) zero — common on smooth regions in
+  natural photographs — and skip the corresponding butterflies. Worth
+  +11–19% of total decode time on natural content; see
+  [BENCH.md](BENCH.md) Section D-natural.
 - **NEON / AVX2 YCC → RGB color convert** — per-row converter ported
   from libjpeg-turbo, runtime-dispatched alongside IDCT and upsample.
 - **Scalar Huffman entropy decoder** — bit-reader + canonical-table

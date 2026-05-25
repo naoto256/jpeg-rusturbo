@@ -177,6 +177,73 @@ AVX2 decode speedup vs `force-scalar`: 1.43× (4:4:4 4K) → **1.78×**
 
 ---
 
+## Section D-natural — decode pipeline, natural-like content
+
+The synthetic XOR-pattern image used everywhere above keeps the AC
+histogram non-degenerate, but it has *no* smooth regions — so the
+IDCT sparse fast paths (DC-only, rows-4-7-zero, cols-4-7-zero) which
+fire on flat sky / wall / out-of-focus background blocks in real
+photographs never trigger. Section D-natural runs the same decode
+harness against `make_natural_image` — a procedural mix of smooth
+gradients, low-amplitude noise, and sharp edges that approximates
+the AC distribution of camera content.
+
+Same JPEGs are produced by the same encoder at q=80; the natural-like
+input simply produces JPEGs that are 8–12× smaller and decode 3×
+faster because most blocks have only a few low-frequency coefficients
+to invert.
+
+### Apple M-series (aarch64)
+
+| Resolution                  | 4:4:4 NEON | 4:2:2 NEON | 4:2:0 NEON |
+| --------------------------- | ---------: | ---------: | ---------: |
+| 1592 × 1124 (session size)  |    3.39 ms |    2.43 ms |    2.07 ms |
+| 1920 × 1080 (1080p)         |    3.71 ms |    2.78 ms |    2.38 ms |
+| 3840 × 2160 (4K)            |   14.43 ms |   10.80 ms |    9.10 ms |
+
+### Intel Xeon (Cascade Lake) x86_64
+
+| Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
+| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
+| 1592 × 1124 (session size)  |   14.15 ms |     31.02 ms |   11.21 ms |     29.80 ms |   10.08 ms |     26.80 ms |
+| 1920 × 1080 (1080p)         |   15.99 ms |     34.95 ms |   12.59 ms |     34.27 ms |   11.26 ms |     31.12 ms |
+| 3840 × 2160 (4K)            |   64.28 ms |    137.42 ms |   51.79 ms |    136.43 ms |   44.42 ms |    122.88 ms |
+
+AVX2 speedup vs `force-scalar` on natural content: 2.14× (4:4:4 4K) →
+**2.77×** (4:2:0 4K) — wider than on synthetic XOR because both the
+SIMD kernels *and* the sparse fast paths contribute.
+
+### IDCT sparse path — on / off comparison
+
+Toggled by forcing the sparse-detection flags in `arch::backend::dct`
+to `false` at build time (revert pattern, not a runtime knob), so the
+on/off pair is two binaries with otherwise-identical code.
+
+| Subsampling × size | Apple M NEON on | NEON off | NEON gain | Cascade Lake AVX2 on | AVX2 off | AVX2 gain |
+| ------------------ | --------------: | -------: | --------: | -------------------: | -------: | --------: |
+| 4:4:4  1592×1124   |         3.39 ms |  4.00 ms |    +15.3% |             14.15 ms | 16.96 ms |    +16.6% |
+| 4:4:4  1080p       |         3.71 ms |  4.44 ms |    +16.4% |             15.99 ms | 19.05 ms |    +16.1% |
+| 4:4:4  4K          |        14.43 ms | 17.79 ms |    +18.9% |             64.28 ms | 75.69 ms |    +15.1% |
+| 4:2:2  1592×1124   |         2.43 ms |  2.86 ms |    +15.0% |             11.21 ms | 12.86 ms |    +12.8% |
+| 4:2:2  1080p       |         2.78 ms |  3.27 ms |    +15.0% |             12.59 ms | 14.53 ms |    +13.4% |
+| 4:2:2  4K          |        10.80 ms | 13.19 ms |    +18.1% |             51.79 ms | 58.46 ms |    +11.4% |
+| 4:2:0  1592×1124   |         2.07 ms |  2.33 ms |    +11.2% |             10.08 ms | 10.71 ms |     +5.9% |
+| 4:2:0  1080p       |         2.38 ms |  2.68 ms |    +11.2% |             11.26 ms | 12.04 ms |     +6.5% |
+| 4:2:0  4K          |         9.10 ms | 10.55 ms |    +13.7% |             44.42 ms | 49.16 ms |     +9.6% |
+
+The pattern is consistent across both backends: sparse contributes
+~11–19% of decode time on natural content, more at 4:4:4 (no chroma
+upsample diluting IDCT share) and less at 4:2:0 (chroma upsample
+absorbs a larger fraction of the cycle budget so the IDCT
+optimization moves a smaller slice of the total). On the synthetic
+XOR corpus the same on/off swap shows ≤ 2% drift — entirely noise —
+which is why this measurement lives in Section D-natural and not in
+Section D. The sparse paths are bit-exact with the regular kernels;
+cross-check tests in `tests/decode_x86_64.rs` and
+`tests/decode_neon.rs` assert that.
+
+---
+
 ## vs `image` crate
 
 `image` (`v0.25`) is the de-facto Rust image library. It bundles a
@@ -236,6 +303,11 @@ Encode side:
 Decode side (new in 0.6.0):
   Entropy decode        ~35%   scalar in both (post-0.6 roadmap)
   IDCT                  ~25%   NEON ~2.0× / AVX2 ~2.5× / scalar 1.0×
+                                + DC-only / sparse-row fast paths
+                                  (NEON 0.6.0, AVX2 0.7.0; +11–19% of
+                                   total decode on natural content,
+                                   ≈ 0% on synthetic — see Section
+                                   D-natural)
   Color convert (YCC→RGB) ~20%   NEON ~6.7× / AVX2 ~3.5× / scalar 1.0×
   Chroma upsample fancy ~15%   NEON ~1.3-14× (kernel-dep) / AVX2 sim.
   Marker walk / IO      ~5%    scalar in both
