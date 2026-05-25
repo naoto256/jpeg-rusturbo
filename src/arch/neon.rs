@@ -1380,7 +1380,77 @@ pub mod sample {
     }
 
     pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
-        crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n)
+        debug_assert!(n >= 1);
+        debug_assert!(src.len() >= n);
+        debug_assert!(dst.len() >= 2 * n);
+        // The vector main loop needs i in [1, n - 17] inclusive, so it
+        // only triggers for n >= 18. Smaller inputs fall back to scalar.
+        if n < 18 {
+            crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n);
+            return;
+        }
+        unsafe { h2_fancy_upsample_inner(src, dst, n) }
+    }
+
+    /// # Safety
+    /// Caller must ensure `n >= 18`, `src.len() >= n`, `dst.len() >= 2*n`.
+    /// `target_arch = "aarch64"` guarantees NEON.
+    #[target_feature(enable = "neon")]
+    unsafe fn h2_fancy_upsample_inner(src: &[u8], dst: &mut [u8], n: usize) {
+        unsafe {
+            let sp = src.as_ptr();
+            let dp = dst.as_mut_ptr();
+
+            // i = 0 edge: src[-1] is clamped to src[0], so the even
+            // output collapses to src[0] = (4*s0 + 2) >> 2.
+            let s0 = *sp as u16;
+            let s1 = *sp.add(1) as u16;
+            *dp = s0 as u8;
+            *dp.add(1) = ((s0 * 3 + s1 + 2) >> 2) as u8;
+
+            // Vectorize i in [1, n - 17]. Each iteration reads
+            // src[i-1 .. i+16] and writes dst[2i .. 2i+32].
+            let last_vec_i = n - 17;
+            let mut i = 1usize;
+            while i <= last_vec_i {
+                let cur = vld1q_u8(sp.add(i));
+                let prev = vld1q_u8(sp.add(i - 1));
+                let next = vld1q_u8(sp.add(i + 1));
+                let cur_lo = vmovl_u8(vget_low_u8(cur));
+                let cur_hi = vmovl_u8(vget_high_u8(cur));
+                let prev_lo = vmovl_u8(vget_low_u8(prev));
+                let prev_hi = vmovl_u8(vget_high_u8(prev));
+                let next_lo = vmovl_u8(vget_low_u8(next));
+                let next_hi = vmovl_u8(vget_high_u8(next));
+                let cur3_lo = vmulq_n_u16(cur_lo, 3);
+                let cur3_hi = vmulq_n_u16(cur_hi, 3);
+                let even = vcombine_u8(
+                    vrshrn_n_u16::<2>(vaddq_u16(cur3_lo, prev_lo)),
+                    vrshrn_n_u16::<2>(vaddq_u16(cur3_hi, prev_hi)),
+                );
+                let odd = vcombine_u8(
+                    vrshrn_n_u16::<2>(vaddq_u16(cur3_lo, next_lo)),
+                    vrshrn_n_u16::<2>(vaddq_u16(cur3_hi, next_hi)),
+                );
+                vst2q_u8(dp.add(2 * i), uint8x16x2_t(even, odd));
+                i += 16;
+            }
+
+            // Scalar tail covers the remainder and the i = n-1 edge
+            // (next clamped to cur).
+            while i < n {
+                let cur = *sp.add(i) as u16;
+                let prev = *sp.add(i - 1) as u16;
+                let next = if i + 1 >= n {
+                    cur
+                } else {
+                    *sp.add(i + 1) as u16
+                };
+                *dp.add(2 * i) = ((cur * 3 + prev + 2) >> 2) as u8;
+                *dp.add(2 * i + 1) = ((cur * 3 + next + 2) >> 2) as u8;
+                i += 1;
+            }
+        }
     }
 }
 
@@ -2013,5 +2083,96 @@ mod tests {
             sample::h2v2_fancy_vblend(&max, &max, &mut b, n);
             assert_eq!(a, b, "cur=255,nbr=255 n={n}");
         }
+    }
+
+    #[test]
+    fn sample_neon_h2_fancy_upsample_matches_scalar() {
+        for &n in &[
+            1usize, 2, 3, 7, 15, 16, 17, 18, 19, 31, 32, 33, 34, 47, 48, 49, 64, 65, 128, 257, 1024,
+        ] {
+            for seed in 0..3u64 {
+                let src = lcg_bytes(seed.wrapping_add(0x42), n);
+                let mut a = vec![0u8; 2 * n];
+                let mut b = vec![0u8; 2 * n];
+                scalar::sample::h2_fancy_upsample(&src, &mut a, n);
+                sample::h2_fancy_upsample(&src, &mut b, n);
+                assert_eq!(a, b, "n={n} seed={seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn sample_neon_h2_fancy_upsample_extremes() {
+        for &n in &[18usize, 19, 32, 33, 48] {
+            let zeros = vec![0u8; n];
+            let max = vec![255u8; n];
+            let mut a = vec![0u8; 2 * n];
+            let mut b = vec![0u8; 2 * n];
+            scalar::sample::h2_fancy_upsample(&zeros, &mut a, n);
+            sample::h2_fancy_upsample(&zeros, &mut b, n);
+            assert_eq!(a, b, "zeros n={n}");
+            scalar::sample::h2_fancy_upsample(&max, &mut a, n);
+            sample::h2_fancy_upsample(&max, &mut b, n);
+            assert_eq!(a, b, "max n={n}");
+            // Edge-clamp stressor: a single spike at index 0 and n-1.
+            let mut spike = vec![0u8; n];
+            spike[0] = 255;
+            spike[n - 1] = 255;
+            scalar::sample::h2_fancy_upsample(&spike, &mut a, n);
+            sample::h2_fancy_upsample(&spike, &mut b, n);
+            assert_eq!(a, b, "edge spike n={n}");
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel micro-bench, run with --ignored --nocapture"]
+    fn sample_neon_micro_bench() {
+        use std::time::Instant;
+        let n = 4096;
+        let iters = 50_000;
+        let src = lcg_bytes(0xA5A5_A5A5, n);
+        let nbr = lcg_bytes(0x5A5A_5A5A, n);
+        let mut out = vec![0u8; n];
+
+        // h2v2_fancy_vblend
+        let t = Instant::now();
+        for _ in 0..iters {
+            scalar::sample::h2v2_fancy_vblend(&src, &nbr, &mut out, n);
+            std::hint::black_box(&out);
+        }
+        let s = t.elapsed().as_nanos() as f64 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            sample::h2v2_fancy_vblend(&src, &nbr, &mut out, n);
+            std::hint::black_box(&out);
+        }
+        let nv = t.elapsed().as_nanos() as f64 / iters as f64;
+        println!(
+            "  h2v2_fancy_vblend n={n}: scalar={:.2}us neon={:.2}us speedup={:.2}x",
+            s / 1000.0,
+            nv / 1000.0,
+            s / nv
+        );
+
+        // h2_fancy_upsample
+        let mut up = vec![0u8; 2 * n];
+        let t = Instant::now();
+        for _ in 0..iters {
+            scalar::sample::h2_fancy_upsample(&src, &mut up, n);
+            std::hint::black_box(&up);
+        }
+        let s = t.elapsed().as_nanos() as f64 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            sample::h2_fancy_upsample(&src, &mut up, n);
+            std::hint::black_box(&up);
+        }
+        let nv = t.elapsed().as_nanos() as f64 / iters as f64;
+        println!(
+            "  h2_fancy_upsample n={n}: scalar={:.2}us neon={:.2}us speedup={:.2}x",
+            s / 1000.0,
+            nv / 1000.0,
+            s / nv
+        );
     }
 }
