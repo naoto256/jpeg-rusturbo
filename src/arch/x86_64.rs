@@ -816,6 +816,22 @@ pub mod quant {
 }
 
 // ===========================================================================
+// sample: decoder-side fancy chroma upsample (AVX2 kernel slot)
+// ===========================================================================
+//
+// Currently delegates to the scalar reference; the AVX2 port lands as
+// part of the cycle 2 / pair C decoder-SIMD work (see DS6 brief).
+pub mod sample {
+    pub fn h2v2_fancy_vblend(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
+        crate::arch::scalar::sample::h2v2_fancy_vblend(cur, nbr, out, n)
+    }
+
+    pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
+        crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n)
+    }
+}
+
+// ===========================================================================
 // dct: AVX2 forward 8x8 integer LL&M DCT, in-place.
 // Translated from `simd/x86_64/jfdctint-avx2.asm::jsimd_fdct_islow_avx2`.
 // ===========================================================================
