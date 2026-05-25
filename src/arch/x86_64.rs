@@ -1547,6 +1547,55 @@ pub mod dct {
             let in4_5 = _mm256_loadu_si256(p.add(2));
             let in6_7 = _mm256_loadu_si256(p.add(3));
 
+            // -----------------------------------------------------------
+            // Sparse detection.
+            //
+            // Row-major OR-reduction over the 4 input ymm registers, then
+            // pick out the bits the dispatch needs. Mirrors the NEON
+            // detection in `src/arch/neon.rs::idct_islow_inner`, adapted
+            // to AVX2's row-pair packing (each ymm = 2 contiguous rows).
+            //
+            //   rows_4567_zero — rows 4..7 are all zero. Pass-1 columns
+            //     only see frequencies 0..3, so a sparse pass-1 kernel
+            //     can skip the upper butterflies.
+            //   dc_only        — rows 1..7 are all zero AND row 0's AC
+            //     lanes (cols 1..7) are zero. Output collapses to a
+            //     constant `clamp((dc + 4) >> 3 + 128, 0, 255)` byte and
+            //     we skip both passes entirely.
+            // -----------------------------------------------------------
+            let r4567_or = _mm256_or_si256(in4_5, in6_7);
+            let rows_4567_zero = _mm256_testz_si256(r4567_or, r4567_or) != 0;
+
+            // rows 2,3 sit in `in2_3`. Row 1 is the high 128 of `in0_1`;
+            // splat it into both halves so the testz covers all 16 i16.
+            let row1_dup = _mm256_permute2x128_si256::<0x11>(in0_1, in0_1);
+            let r123_or = _mm256_or_si256(row1_dup, in2_3);
+            let rows_123_zero = _mm256_testz_si256(r123_or, r123_or) != 0;
+
+            // Row 0 (lo 128 of in0_1), AC lanes = i16 lanes 1..7.
+            // Mask lane 0 with -1 (DC) and lanes 1..7 with 0, then
+            // ANDNOT to keep only AC.
+            let row0 = _mm256_castsi256_si128(in0_1);
+            let mask_dc = _mm_set_epi16(0, 0, 0, 0, 0, 0, 0, -1);
+            let row0_ac = _mm_andnot_si128(mask_dc, row0);
+            let row0_ac_zero = _mm_testz_si128(row0_ac, row0_ac) != 0;
+
+            let dc_only = rows_4567_zero && rows_123_zero && row0_ac_zero;
+
+            // -----------------------------------------------------------
+            // DC-only fast path: every output sample is the same constant.
+            // -----------------------------------------------------------
+            if dc_only {
+                let dc = coef[0] as i32;
+                let val = ((((dc + 4) >> 3) + 128).clamp(0, 255)) as u8;
+                let dup = _mm256_set1_epi8(val as i8);
+                let outp = output.as_mut_ptr() as *mut __m256i;
+                _mm256_storeu_si256(outp, dup);
+                _mm256_storeu_si256(outp.add(1), dup);
+                _mm256_zeroupper();
+                return;
+            }
+
             // Repack so each ymm pairs the rows the DODCT macro wants:
             //   (R0, R4), (R3, R1), (R2, R6), (R7, R5)
             let in0_4 = _mm256_permute2x128_si256::<0x20>(in0_1, in4_5);
@@ -1555,7 +1604,20 @@ pub mod dct {
             let in7_5 = _mm256_permute2x128_si256::<0x31>(in6_7, in4_5);
 
             // Pass 1 (columns).
-            let (m1, m2, m3, m4) = idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5);
+            //
+            // Dispatch scaffold for a future sparse pass-1 kernel. When
+            // `rows_4567_zero`, frequencies 4..7 do not contribute to the
+            // column butterflies and a reduced kernel will be a win. The
+            // sparse kernel itself is not implemented yet — both arms
+            // call the regular `idct_dodct::<1>` so that the runtime
+            // behavior is unchanged. Replacing the `rows_4567_zero` arm
+            // with the sparse variant is the next step in this port.
+            let (m1, m2, m3, m4) = if rows_4567_zero {
+                // TODO: replace with sparse pass-1 kernel (idct_dodct_sparse_p1).
+                idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5)
+            } else {
+                idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5)
+            };
             //   m1 = data0_1, m2 = data3_2, m3 = data4_5, m4 = data7_6
             let (t0, t1, t2, t3) = idct_dotranspose(m1, m2, m3, m4);
             //   t0 = data0_4, t1 = data1_5, t2 = data2_6, t3 = data3_7
@@ -1571,7 +1633,20 @@ pub mod dct {
 
             // Pass 2 (rows). Output values are i16 in [-128, 127]-ish; the
             // saturating pack + 0x80 byte-add below handles the level shift.
-            let (m1, m2, m3, m4) = idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2);
+            //
+            // Dispatch scaffold for a future sparse pass-2 kernel,
+            // analogous to the pass-1 stub above. The flag would be
+            // derived from the pass-1 outputs `t0..t3` (whether the
+            // post-transpose "columns" 4..7 are zero); computing that
+            // flag is deferred along with the sparse kernel itself. The
+            // scaffold is wired with `false` so behavior is unchanged.
+            let cols_4567_zero_after_p1 = false; // TODO: compute from t0..t3.
+            let (m1, m2, m3, m4) = if cols_4567_zero_after_p1 {
+                // TODO: replace with sparse pass-2 kernel (idct_dodct_sparse_p2).
+                idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2)
+            } else {
+                idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2)
+            };
             let (t0, t1, t2, t3) = idct_dotranspose(m1, m2, m3, m4);
             //   t0 = data0_4, t1 = data1_5, t2 = data2_6, t3 = data3_7
 
@@ -1754,6 +1829,28 @@ mod tests {
             let mut block = [0i16; 64];
             block[0] = dc;
             run_idct_cross(&block);
+        }
+    }
+
+    #[test]
+    fn idct_avx2_dc_only_fast_path() {
+        // Direct verification of the DC-only fast path: dense DC sweep
+        // including saturation extremes and zero. Every input here has
+        // all-AC == 0, so the sparse detection must trigger and the
+        // fast path must produce a flat block equal to
+        // `clamp((dc + 4) >> 3 + 128, 0, 255)`.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for dc in -2048i16..=2047i16 {
+            let mut coef = [0i16; 64];
+            coef[0] = dc;
+            let expected = ((((dc as i32) + 4) >> 3) + 128).clamp(0, 255) as u8;
+            let mut avx_out = [0u8; 64];
+            dct::idct_islow(&coef, &mut avx_out);
+            for (i, &v) in avx_out.iter().enumerate() {
+                assert_eq!(v, expected, "dc={dc} pos={i}");
+            }
         }
     }
 
