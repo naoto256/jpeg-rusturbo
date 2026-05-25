@@ -280,12 +280,6 @@ impl HuffmanDecodeTable {
 /// for the common run/size bytes) plus a small magnitude (0..3 bits)
 /// land in the fast path; longer codes (length 11..16 in the standard
 /// tables) and large-magnitude symbols correctly fall back.
-//
-// The combined LUT and its lookup are built and validated here but
-// not yet referenced by the scan loop; the wiring lands separately
-// so the table can be cross-checked against the existing two-step
-// path in isolation.
-#[allow(dead_code)]
 pub const FAST_AC_PEEK_WIDTH: u32 = 10;
 
 const FAST_AC_LUT_SIZE: usize = 1 << FAST_AC_PEEK_WIDTH;
@@ -296,11 +290,9 @@ const FAST_AC_LUT_SIZE: usize = 1 << FAST_AC_PEEK_WIDTH;
 ///   bits 16..23 : total_consumed = code_length + size (0..=PEEK_WIDTH)
 ///   bit   24    : valid (1 = fast path applies; 0 = fall back to slow path)
 ///   bits 25..31 : reserved (0)
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct FastAcEntry(u32);
 
-#[allow(dead_code)]
 impl FastAcEntry {
     const INVALID: Self = Self(0);
 
@@ -329,12 +321,10 @@ impl FastAcEntry {
 
 /// Combined AC lookup table indexed by the next `FAST_AC_PEEK_WIDTH`
 /// bits of the entropy stream.
-#[allow(dead_code)]
 pub struct FastAcHuffmanTable {
     lut: Box<[FastAcEntry; FAST_AC_LUT_SIZE]>,
 }
 
-#[allow(dead_code)]
 impl FastAcHuffmanTable {
     /// Build from a DHT spec (AC class). Mirrors the canonical-Huffman
     /// expansion in `HuffmanDecodeTable::from_spec`; then for every
@@ -418,6 +408,7 @@ impl FastAcHuffmanTable {
     /// Number of LUT slots flagged valid. Useful for diagnostics and
     /// for asserting that the fast path actually covers the bulk of
     /// the input distribution on the standard tables.
+    #[allow(dead_code)] // diagnostic-only: consumed by the lut-report and coverage tests
     pub fn fast_path_slot_count(&self) -> usize {
         self.lut.iter().filter(|e| e.is_valid()).count()
     }
@@ -428,11 +419,14 @@ impl FastAcHuffmanTable {
 /// `magnitude_raw` is the raw `size`-bit magnitude field as it
 /// appears in the stream, before sign-extension. Callers apply
 /// [`extend`] to recover the signed value.
-#[allow(dead_code)]
 pub struct FastAcDecoded {
     pub run: u8,
     pub size: u8,
     pub magnitude_raw: u32,
+    /// Bits consumed from the stream on this hit. The scan loop doesn't
+    /// read it (`decode_ac_fast` already advanced the reader), but it's
+    /// kept for cross-checking against the slow path in tests.
+    #[allow(dead_code)]
     pub total_consumed: u8,
 }
 
@@ -446,7 +440,6 @@ pub struct FastAcDecoded {
 /// the caller must then fall back to
 /// `BitReader::decode_symbol` + `BitReader::get_bits` (and the bit
 /// buffer is left untouched so the slow path sees the same bits).
-#[allow(dead_code)]
 pub fn decode_ac_fast(
     br: &mut BitReader,
     tbl: &FastAcHuffmanTable,
