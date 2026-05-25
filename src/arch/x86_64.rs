@@ -816,18 +816,177 @@ pub mod quant {
 }
 
 // ===========================================================================
-// sample: decoder-side fancy chroma upsample (AVX2 kernel slot)
+// sample: AVX2 fancy chroma upsample (decoder), translated from
+// `simd/x86_64/jdsample-avx2.asm`.
 // ===========================================================================
-//
-// Currently delegates to the scalar reference; the AVX2 port lands as
-// part of the cycle 2 / pair C decoder-SIMD work (see DS6 brief).
 pub mod sample {
+    use core::arch::x86_64::*;
+
+    /// Vertical pass of libjpeg-turbo's `h2v2_fancy` upsample: per chroma
+    /// column, blend the current row with one of its neighbors
+    /// (`out[i] = (3*cur[i] + nbr[i] + 2) >> 2`). Bit-exact equivalent to
+    /// `arch::scalar::sample::h2v2_fancy_vblend`.
     pub fn h2v2_fancy_vblend(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
-        crate::arch::scalar::sample::h2v2_fancy_vblend(cur, nbr, out, n)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { h2v2_fancy_vblend_avx2(cur, nbr, out, n) }
+        } else {
+            crate::arch::scalar::sample::h2v2_fancy_vblend(cur, nbr, out, n)
+        }
     }
 
+    /// Horizontal pass of libjpeg-turbo's `h2_fancy` upsample: produce
+    /// `2 * n` output samples from `n` chroma samples using the symmetric
+    /// 3:1 weighted blend with `src[-1] = src[0]` / `src[n] = src[n-1]`
+    /// edge clamping. Bit-exact equivalent to
+    /// `arch::scalar::sample::h2_fancy_upsample`.
     pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
-        crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n)
+        // The AVX2 path needs at least one interior chunk plus the i=0
+        // head sample; below 34 src lanes the scalar reference is faster
+        // and avoids any edge-case bookkeeping.
+        if n >= 34 && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { h2_fancy_upsample_avx2(src, dst, n) }
+        } else {
+            crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n)
+        }
+    }
+
+    /// # Safety
+    /// - AVX2 must be available (caller is gated by
+    ///   `is_x86_feature_detected`).
+    /// - `cur`, `nbr`, `out` must each be readable / writable for `n`
+    ///   bytes.
+    #[target_feature(enable = "avx2")]
+    unsafe fn h2v2_fancy_vblend_avx2(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
+        unsafe {
+            // `_mm256_maddubs_epi16(pairs, w)` computes, for each adjacent
+            // (cur, nbr) byte pair: `cur*3 + nbr*1` (u8 × i8 → i16).
+            // Encoding 0x0103 as i16 = bytes [0x03, 0x01] in
+            // little-endian, so the first byte of every pair (cur)
+            // multiplies by 3 and the second (nbr) by 1.
+            let w = _mm256_set1_epi16(0x0103);
+            let two = _mm256_set1_epi16(2);
+
+            let mut i = 0usize;
+            while i + 32 <= n {
+                let c = _mm256_loadu_si256(cur.as_ptr().add(i) as *const __m256i);
+                let nb = _mm256_loadu_si256(nbr.as_ptr().add(i) as *const __m256i);
+                // unpack[lo|hi]_epi8 interleaves cur/nbr bytes per
+                // 128-bit lane:
+                //   lo lane: [c0,n0,c1,n1,...,c7,n7] (and bytes 16..23
+                //   in the upper 128-bit lane); hi covers 8..15 / 24..31.
+                let pairs_lo = _mm256_unpacklo_epi8(c, nb);
+                let pairs_hi = _mm256_unpackhi_epi8(c, nb);
+                let s_lo = _mm256_srli_epi16::<2>(_mm256_add_epi16(
+                    _mm256_maddubs_epi16(pairs_lo, w),
+                    two,
+                ));
+                let s_hi = _mm256_srli_epi16::<2>(_mm256_add_epi16(
+                    _mm256_maddubs_epi16(pairs_hi, w),
+                    two,
+                ));
+                // packus_epi16 per-lane: lo result lane = [s_lo.lo8,
+                // s_hi.lo8] = bytes 0..15; hi lane = [s_lo.hi8, s_hi.hi8]
+                // = bytes 16..31. Saturation is a no-op since each lane
+                // already fits in u8.
+                let r = _mm256_packus_epi16(s_lo, s_hi);
+                _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, r);
+                i += 32;
+            }
+            _mm256_zeroupper();
+            // Scalar tail handles n % 32 lanes.
+            if i < n {
+                crate::arch::scalar::sample::h2v2_fancy_vblend(
+                    &cur[i..],
+                    &nbr[i..],
+                    &mut out[i..],
+                    n - i,
+                );
+            }
+        }
+    }
+
+    /// # Safety
+    /// - AVX2 must be available (caller is gated by
+    ///   `is_x86_feature_detected`).
+    /// - `n >= 34` (caller-enforced).
+    /// - `src` must be readable for `n` bytes; `dst` writable for `2 * n`
+    ///   bytes.
+    #[target_feature(enable = "avx2")]
+    unsafe fn h2_fancy_upsample_avx2(src: &[u8], dst: &mut [u8], n: usize) {
+        unsafe {
+            debug_assert!(n >= 34);
+            debug_assert!(src.len() >= n);
+            debug_assert!(dst.len() >= 2 * n);
+
+            // Head sample (i = 0): prev is clamped to cur, so
+            // dst[0] = (3*cur + cur + 2) >> 2 = cur.
+            let cur0 = src[0];
+            let next0 = src[1] as u16;
+            dst[0] = cur0;
+            dst[1] = ((cur0 as u16 * 3 + next0 + 2) >> 2) as u8;
+
+            let w = _mm256_set1_epi16(0x0103);
+            let two = _mm256_set1_epi16(2);
+
+            // Interior: i in [1, n-1). Each chunk reads src[i-1..i+33]
+            // (unaligned loads of cur / prev / next) and writes
+            // dst[2i..2i+64]. Loop bound `i + 33 <= n` ensures the
+            // `next` load and the i+31 sample's true next neighbor are
+            // both in range.
+            let mut i = 1usize;
+            while i + 33 <= n {
+                let cur = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let prev = _mm256_loadu_si256(src.as_ptr().add(i - 1) as *const __m256i);
+                let next = _mm256_loadu_si256(src.as_ptr().add(i + 1) as *const __m256i);
+
+                let pe_lo = _mm256_unpacklo_epi8(cur, prev);
+                let pe_hi = _mm256_unpackhi_epi8(cur, prev);
+                let po_lo = _mm256_unpacklo_epi8(cur, next);
+                let po_hi = _mm256_unpackhi_epi8(cur, next);
+
+                let e_lo =
+                    _mm256_srli_epi16::<2>(_mm256_add_epi16(_mm256_maddubs_epi16(pe_lo, w), two));
+                let e_hi =
+                    _mm256_srli_epi16::<2>(_mm256_add_epi16(_mm256_maddubs_epi16(pe_hi, w), two));
+                let o_lo =
+                    _mm256_srli_epi16::<2>(_mm256_add_epi16(_mm256_maddubs_epi16(po_lo, w), two));
+                let o_hi =
+                    _mm256_srli_epi16::<2>(_mm256_add_epi16(_mm256_maddubs_epi16(po_hi, w), two));
+
+                // Pack i16→u8 per lane: even_b lane0 = even outputs for
+                // src indices i..i+15, lane1 = i+16..i+31. Same for odd.
+                let even_b = _mm256_packus_epi16(e_lo, e_hi);
+                let odd_b = _mm256_packus_epi16(o_lo, o_hi);
+
+                // Interleave even/odd bytes to produce final output.
+                // unpacklo/hi_epi8 work per-lane, so the lo-of-lane and
+                // hi-of-lane halves end up split across the two ymm.
+                // permute2x128 reassembles them into linear order:
+                //   out0 = [lo.lane0, hi.lane0] = bytes [e0,o0,...,e15,o15]
+                //   out1 = [lo.lane1, hi.lane1] = bytes [e16,o16,...,e31,o31]
+                let lo = _mm256_unpacklo_epi8(even_b, odd_b);
+                let hi = _mm256_unpackhi_epi8(even_b, odd_b);
+                let out0 = _mm256_permute2x128_si256::<0x20>(lo, hi);
+                let out1 = _mm256_permute2x128_si256::<0x31>(lo, hi);
+
+                _mm256_storeu_si256(dst.as_mut_ptr().add(2 * i) as *mut __m256i, out0);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(2 * i + 32) as *mut __m256i, out1);
+
+                i += 32;
+            }
+            _mm256_zeroupper();
+
+            // Tail scalar: i in [i, n). For i < n-1 both neighbors are
+            // in-bounds; the i = n-1 case clamps next to cur.
+            while i < n {
+                let cur = src[i] as u16;
+                let prev = src[i - 1] as u16;
+                let next = if i + 1 >= n { cur } else { src[i + 1] as u16 };
+                dst[2 * i] = ((cur * 3 + prev + 2) >> 2) as u8;
+                dst[2 * i + 1] = ((cur * 3 + next + 2) >> 2) as u8;
+                i += 1;
+            }
+        }
     }
 }
 
@@ -2085,5 +2244,107 @@ mod tests {
             scalar::huffman::nonzero_bitmap(&block),
             huffman::nonzero_bitmap(&block),
         );
+    }
+
+    // -----------------------------------------------------------------
+    // sample (fancy chroma upsample) cross-checks
+    // -----------------------------------------------------------------
+
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut v = vec![0u8; n];
+        for b in v.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 56) as u8;
+        }
+        v
+    }
+
+    #[test]
+    fn h2v2_fancy_vblend_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Cover the head edge (n < 32), exact-chunk boundaries, and
+        // misaligned tails to exercise both the AVX2 body and the
+        // scalar tail.
+        for &n in &[1usize, 7, 16, 31, 32, 33, 47, 64, 65, 96, 127, 200, 257] {
+            let cur = lcg_bytes(0xA1B2_C3D4_E5F6_0718, n);
+            let nbr = lcg_bytes(0x1234_5678_9ABC_DEF0, n);
+            let mut a = vec![0u8; n];
+            let mut b = vec![0u8; n];
+            scalar::sample::h2v2_fancy_vblend(&cur, &nbr, &mut a, n);
+            sample::h2v2_fancy_vblend(&cur, &nbr, &mut b, n);
+            assert_eq!(a, b, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn h2v2_fancy_vblend_avx2_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n = 128;
+        let cur = vec![255u8; n];
+        let nbr = vec![255u8; n];
+        let mut a = vec![0u8; n];
+        let mut b = vec![0u8; n];
+        scalar::sample::h2v2_fancy_vblend(&cur, &nbr, &mut a, n);
+        sample::h2v2_fancy_vblend(&cur, &nbr, &mut b, n);
+        assert_eq!(a, b);
+
+        let cur = vec![0u8; n];
+        let nbr = vec![255u8; n];
+        scalar::sample::h2v2_fancy_vblend(&cur, &nbr, &mut a, n);
+        sample::h2v2_fancy_vblend(&cur, &nbr, &mut b, n);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn h2_fancy_upsample_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Cover n below the AVX2 threshold (scalar fallback), the
+        // first AVX2-eligible size, exact-chunk multiples, and various
+        // tails that touch both the i = n-1 next-clamp and the head
+        // prev-clamp.
+        for &n in &[
+            1usize, 2, 7, 16, 32, 33, 34, 35, 48, 63, 64, 65, 96, 127, 200, 257,
+        ] {
+            let src = lcg_bytes(0x0F1E_2D3C_4B5A_6978, n);
+            let mut a = vec![0u8; 2 * n];
+            let mut b = vec![0u8; 2 * n];
+            scalar::sample::h2_fancy_upsample(&src, &mut a, n);
+            sample::h2_fancy_upsample(&src, &mut b, n);
+            assert_eq!(a, b, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn h2_fancy_upsample_avx2_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n = 96;
+        // All-max — verifies saturation does not over-clip.
+        let src = vec![255u8; n];
+        let mut a = vec![0u8; 2 * n];
+        let mut b = vec![0u8; 2 * n];
+        scalar::sample::h2_fancy_upsample(&src, &mut a, n);
+        sample::h2_fancy_upsample(&src, &mut b, n);
+        assert_eq!(a, b, "all-max");
+
+        // Sharp step at the chunk boundary (i = 32) to exercise the
+        // prev/next loads across the AVX2 chunk seam.
+        let mut src = vec![0u8; n];
+        for (k, v) in src.iter_mut().enumerate() {
+            *v = if k < 32 { 0 } else { 255 };
+        }
+        scalar::sample::h2_fancy_upsample(&src, &mut a, n);
+        sample::h2_fancy_upsample(&src, &mut b, n);
+        assert_eq!(a, b, "step at 32");
     }
 }
