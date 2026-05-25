@@ -58,9 +58,8 @@ fn assert_decode_agrees(path: &str, thresholds: Thresholds) {
         .decode(PixelFormat::Rgb)
         .unwrap_or_else(|e| panic!("our decode {path}: {e:?}"));
 
-    // `image` as ground truth (note: `image` uses zune-jpeg under the
-    // hood for the actual decode; this is a "two independent
-    // implementations agree" check, not an absolute spec audit).
+    // `image` as ground truth: this is a "two independent
+    // implementations agree" check, not an absolute spec audit.
     let theirs = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Jpeg)
         .decode()
         .unwrap_or_else(|e| panic!("image decode {path}: {e:?}"))
