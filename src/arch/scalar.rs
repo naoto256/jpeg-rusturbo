@@ -479,6 +479,55 @@ pub mod dct {
 }
 
 // ===========================================================================
+// sample: decoder-side fancy chroma upsample (h2v2 / h2 / v2)
+// ===========================================================================
+pub mod sample {
+    /// Vertical pass of libjpeg-turbo's `h2v2_fancy` upsample: for each
+    /// output sample, blend the current chroma row with the chosen
+    /// neighbor row (above for the upper output of a pair, below for the
+    /// lower) using weights `(3 * cur + nbr + 2) >> 2`.
+    ///
+    /// The caller selects which neighbor row to pass — `prev` (cur - 1)
+    /// for `phase == 0`, `next` (cur + 1) for `phase == 1` — and is
+    /// responsible for clamping the neighbor index to the plane height
+    /// at the top / bottom edges (= passing the same row as `cur` when
+    /// the neighbor would be out of bounds). This keeps the kernel
+    /// branch-free in the hot loop.
+    ///
+    /// `cur`, `nbr`, and `out` are all length `n` (= chroma plane width).
+    pub fn h2v2_fancy_vblend(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
+        for (dst, (&c, &nb)) in out.iter_mut().take(n).zip(cur.iter().zip(nbr.iter())) {
+            *dst = (((c as u16) * 3 + nb as u16 + 2) >> 2) as u8;
+        }
+    }
+
+    /// Horizontal pass of libjpeg-turbo's `h2_fancy` upsample: produce
+    /// `2 * n` output samples from `n` chroma samples using the symmetric
+    /// 3:1 weighted blend.
+    ///
+    ///   dst[2*i]   = (3 * src[i] + src[i - 1] + 2) >> 2
+    ///   dst[2*i+1] = (3 * src[i] + src[i + 1] + 2) >> 2
+    ///
+    /// The edges clamp: `src[-1]` is treated as `src[0]` and `src[n]` as
+    /// `src[n - 1]`. The caller passes `n >= 1` and `dst` of length
+    /// `>= 2 * n`. This kernel does not pad / fill any output beyond
+    /// `dst[..2 * n]`; the outer per-row upsample wraps it and replicates
+    /// the last value if the requested output width exceeds `2 * n`.
+    pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
+        debug_assert!(n >= 1);
+        debug_assert!(dst.len() >= 2 * n);
+        debug_assert!(src.len() >= n);
+        for i in 0..n {
+            let cur = src[i] as u16;
+            let prev = if i == 0 { cur } else { src[i - 1] as u16 };
+            let next = if i + 1 >= n { cur } else { src[i + 1] as u16 };
+            dst[2 * i] = ((cur * 3 + prev + 2) >> 2) as u8;
+            dst[2 * i + 1] = ((cur * 3 + next + 2) >> 2) as u8;
+        }
+    }
+}
+
+// ===========================================================================
 // quant: reciprocal-multiply quantize, natural-order output
 // ===========================================================================
 pub mod quant {
