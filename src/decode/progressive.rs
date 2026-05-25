@@ -24,9 +24,9 @@
 use crate::arch;
 use crate::tables::ZIGZAG;
 
-use super::baseline::{DecodedPlane, DecodedPlanes};
+use super::baseline::{AcTablePair, DcTablePair, DecodedPlane, DecodedPlanes};
 use super::error::{DecodeError, Result};
-use super::huffman::{BitReader, HuffmanDecodeTable, extend};
+use super::huffman::{BitReader, decode_ac_fast, decode_dc_fast, extend};
 use super::markers::{
     Component, DecoderHeaders, FrameHeader, HuffmanTableSpec, MarkerReader, QuantTable, ScanHeader,
 };
@@ -144,8 +144,8 @@ fn run_progressive_scan(
     entropy_start: usize,
     frame: &FrameHeader,
     scan: &ScanHeader,
-    dc_tables: &[Option<super::baseline::DcTablePair>; 4],
-    ac_tables: &[Option<super::baseline::AcTablePair>; 4],
+    dc_tables: &[Option<DcTablePair>; 4],
+    ac_tables: &[Option<AcTablePair>; 4],
     restart_interval: u16,
     comps: &mut [CoeffComponent],
 ) -> Result<(usize, Option<u8>)> {
@@ -185,12 +185,11 @@ fn run_progressive_scan(
                                 if scan.ah == 0 {
                                     decode_dc_first_block(
                                         &mut br,
-                                        &dc_tables[entry.dc_table as usize]
-                                            .as_ref()
-                                            .ok_or(DecodeError::Malformed(
+                                        dc_tables[entry.dc_table as usize].as_ref().ok_or(
+                                            DecodeError::Malformed(
                                                 "scan refers to undefined DC table",
-                                            ))?
-                                            .slow,
+                                            ),
+                                        )?,
                                         &mut prev_dc[entry.comp_idx],
                                         scan.al,
                                         &mut dummy,
@@ -204,12 +203,9 @@ fn run_progressive_scan(
                             if scan.ah == 0 {
                                 decode_dc_first_block(
                                     &mut br,
-                                    &dc_tables[entry.dc_table as usize]
-                                        .as_ref()
-                                        .ok_or(DecodeError::Malformed(
-                                            "scan refers to undefined DC table",
-                                        ))?
-                                        .slow,
+                                    dc_tables[entry.dc_table as usize].as_ref().ok_or(
+                                        DecodeError::Malformed("scan refers to undefined DC table"),
+                                    )?,
                                     &mut prev_dc[entry.comp_idx],
                                     scan.al,
                                     coef,
@@ -227,13 +223,13 @@ fn run_progressive_scan(
         // ---- AC scan: always non-interleaved (Ns == 1, enforced) ----
         let sc = &scan.components[0];
         let comp_idx = find_component_idx(frame, sc.component_id)?;
-        // Progressive scans still go through the canonical decode_symbol
-        // + get_bits path; the combined-LUT fast path is wired only for
-        // baseline AC (progressive AC-refine zero-skip semantics differ).
-        let ac_tbl = &ac_tables[sc.ac_table as usize]
+        // AC first scan uses the combined-LUT fast path (same single-peek
+        // pattern as baseline AC). AC refinement keeps the canonical
+        // decode_symbol path — its correction-bit interleaving doesn't
+        // map onto the fast LUT's drop semantics.
+        let ac_tbl = ac_tables[sc.ac_table as usize]
             .as_ref()
-            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?
-            .slow;
+            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
         let blocks_x = comps[comp_idx].blocks_x;
         let blocks_y = comps[comp_idx].blocks_y;
         for by in 0..blocks_y {
@@ -363,19 +359,24 @@ fn find_component_idx(frame: &FrameHeader, id: u8) -> Result<usize> {
 
 fn decode_dc_first_block(
     br: &mut BitReader,
-    dc_tbl: &HuffmanDecodeTable,
+    dc_tbl: &DcTablePair,
     prev_dc: &mut i32,
     al: u8,
     coef: &mut [i16; 64],
 ) -> Result<()> {
-    let t = br.decode_symbol(dc_tbl)?;
-    let size = t as u32;
-    let diff = if size == 0 {
-        0
-    } else {
-        let bits = br.get_bits(size)?;
-        extend(bits, size)
+    // Try the combined DC LUT first; on a miss the bit buffer is
+    // untouched and we fall back to the canonical decode_symbol +
+    // get_bits path. Mirrors the baseline scan loop's DC term.
+    let (size, mag_raw) = match decode_dc_fast(br, &dc_tbl.fast)? {
+        Some(fast) => (fast.size as u32, fast.magnitude_raw),
+        None => {
+            let t = br.decode_symbol(&dc_tbl.slow)?;
+            let size = t as u32;
+            let bits = if size > 0 { br.get_bits(size)? } else { 0 };
+            (size, bits)
+        }
     };
+    let diff = if size == 0 { 0 } else { extend(mag_raw, size) };
     *prev_dc = prev_dc.wrapping_add(diff);
     coef[0] = ((*prev_dc) << al) as i16;
     Ok(())
@@ -395,7 +396,7 @@ fn decode_dc_refine_block(br: &mut BitReader, al: u8, coef: &mut [i16; 64]) -> R
 
 fn decode_ac_first_block(
     br: &mut BitReader,
-    ac_tbl: &HuffmanDecodeTable,
+    ac_tbl: &AcTablePair,
     ss: u8,
     se: u8,
     al: u8,
@@ -409,9 +410,22 @@ fn decode_ac_first_block(
     let mut k = ss as usize;
     let se = se as usize;
     while k <= se {
-        let rs = br.decode_symbol(ac_tbl)?;
-        let run = (rs >> 4) as usize;
-        let size = (rs & 0x0F) as u32;
+        // Try the combined AC LUT (run/size + magnitude bits in one
+        // peek/drop); fall back to decode_symbol + get_bits when the
+        // 10-bit peek window can't cover code_length + size. For an
+        // EOBn entry (size == 0, run != 15) the LUT drops the code bits
+        // but its magnitude_raw is unused — the EOBn extra bits are
+        // read separately below.
+        let (run, size, mag_raw) = match decode_ac_fast(br, &ac_tbl.fast)? {
+            Some(fast) => (fast.run as usize, fast.size as u32, fast.magnitude_raw),
+            None => {
+                let rs = br.decode_symbol(&ac_tbl.slow)?;
+                let run = (rs >> 4) as usize;
+                let size = (rs & 0x0F) as u32;
+                let mag = if size > 0 { br.get_bits(size)? } else { 0 };
+                (run, size, mag)
+            }
+        };
         if size == 0 {
             if run != 15 {
                 // EOBn: run-length encoded "end of band run" of
@@ -432,8 +446,7 @@ fn decode_ac_first_block(
         if k > se {
             return Err(DecodeError::Malformed("AC first scan run exceeded band"));
         }
-        let bits = br.get_bits(size)?;
-        let v = extend(bits, size);
+        let v = extend(mag_raw, size);
         coef[k] = (v << al) as i16;
         k += 1;
     }
@@ -458,7 +471,7 @@ fn decode_ac_first_block(
 #[allow(clippy::too_many_arguments)]
 fn decode_ac_refine_block(
     br: &mut BitReader,
-    ac_tbl: &HuffmanDecodeTable,
+    ac_tbl: &AcTablePair,
     ss: u8,
     se: u8,
     _ah: u8,
@@ -482,7 +495,7 @@ fn decode_ac_refine_block(
 
     let mut k = ss;
     while k <= se {
-        let rs = br.decode_symbol(ac_tbl)?;
+        let rs = br.decode_symbol(&ac_tbl.slow)?;
         let run = (rs >> 4) as usize;
         let size = (rs & 0x0F) as u32;
         if size != 0 && size != 1 {
