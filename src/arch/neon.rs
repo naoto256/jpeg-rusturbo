@@ -1328,6 +1328,22 @@ pub mod dct {
 }
 
 // ===========================================================================
+// sample: decoder-side fancy chroma upsample (NEON kernel slot)
+// ===========================================================================
+//
+// Currently delegates to the scalar reference; the NEON port lands as
+// part of the cycle 2 / pair C decoder-SIMD work (see DS5 brief).
+pub mod sample {
+    pub fn h2v2_fancy_vblend(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
+        crate::arch::scalar::sample::h2v2_fancy_vblend(cur, nbr, out, n)
+    }
+
+    pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
+        crate::arch::scalar::sample::h2_fancy_upsample(src, dst, n)
+    }
+}
+
+// ===========================================================================
 // quant: NEON quantize, natural-order output
 // ===========================================================================
 pub mod quant {
