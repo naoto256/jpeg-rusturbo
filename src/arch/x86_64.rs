@@ -1529,23 +1529,32 @@ pub mod dct {
         }
     }
 
-    /// Pass-1 IDCT specialized to inputs whose rows 4..7 are all zero.
-    /// Same packing contract as `idct_dodct::<1>` so the dispatch site
-    /// only swaps the call:
-    ///   `in0_4`: lo = row 0, hi = 0    (row 4 zero)
-    ///   `in3_1`: lo = row 3, hi = row 1
-    ///   `in2_6`: lo = row 2, hi = 0    (row 6 zero)
-    ///   `in7_5`: all zero               (rows 7, 5 zero)
-    /// Returns `(data0_1, data3_2, data4_5, data7_6)` in pass-1 i16
-    /// packing, identical to what `idct_dodct::<1>` would return on
-    /// the same inputs. Mirrors `idct_pass1_sparse` in `arch::neon`.
+    /// IDCT pass specialized to inputs whose "rows" 4..7 are all zero.
+    /// Const-generic on pass id (1 or 2) selects the descale shift and
+    /// matching round bias, matching `idct_dodct`.
+    ///
+    /// For PASS = 1 the precondition is that the column-direction
+    /// inputs' rows 4..7 are zero (= original block rows 4..7 are
+    /// zero). For PASS = 2 the same packing comes from `idct_dotranspose`
+    /// applied to a pass-1 output whose columns 4..7 are zero — which
+    /// happens whenever the original block columns 4..7 are zero, since
+    /// pass-1 transforms each column in isolation.
+    ///
+    /// Packing matches `idct_dodct`:
+    ///   `in0_4`: lo = "row 0", hi = 0     ("row 4" zero)
+    ///   `in3_1`: lo = "row 3", hi = "row 1"
+    ///   `in2_6`: lo = "row 2", hi = 0     ("row 6" zero)
+    ///   `in7_5`: all zero                  ("rows 7, 5" zero)
+    /// Returns `(data0_1, data3_2, data4_5, data7_6)` identical to what
+    /// `idct_dodct::<PASS>` would return on the same inputs. Mirrors
+    /// `idct_pass1_sparse` / `idct_pass2_sparse` in `arch::neon`.
     ///
     /// # Safety
     /// Caller must have AVX2 enabled and must hold the sparse
-    /// pre-condition above; passing non-zero rows 4..7 produces
+    /// pre-condition above; passing non-zero "rows" 4..7 produces
     /// incorrect output.
     #[inline(always)]
-    unsafe fn idct_dodct_sparse_p1(
+    unsafe fn idct_dodct_sparse<const PASS: i32>(
         in0_4: __m256i,
         in3_1: __m256i,
         in2_6: __m256i,
@@ -1616,39 +1625,57 @@ pub mod dct {
             let tmp3_2_lo = _mm256_add_epi32(part_l, z4_3_l);
             let tmp3_2_hi = _mm256_add_epi32(part_h, z4_3_h);
 
-            // -- Final output stage (PASS = 1 hard-coded) --------------
-            let bias = _mm256_loadu_si256(PD_DESCALE_P1.0.as_ptr() as *const __m256i);
+            // -- Final output stage: descale + saturating i32→i16 pack.
+            // (bias, shift) selected by PASS at codegen time, matching
+            // the regular kernel.
+            let bias = if PASS == 1 {
+                _mm256_loadu_si256(PD_DESCALE_P1.0.as_ptr() as *const __m256i)
+            } else {
+                _mm256_loadu_si256(IDCT_PD_DESCALE_P2.0.as_ptr() as *const __m256i)
+            };
 
             let a = _mm256_add_epi32(tmp10_11_l, tmp3_2_lo);
             let b = _mm256_add_epi32(tmp10_11_h, tmp3_2_hi);
             let a = _mm256_add_epi32(a, bias);
             let b = _mm256_add_epi32(b, bias);
-            let a = _mm256_srai_epi32::<11>(a);
-            let b = _mm256_srai_epi32::<11>(b);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
             let data0_1 = _mm256_packs_epi32(a, b);
 
             let a = _mm256_sub_epi32(tmp10_11_l, tmp3_2_lo);
             let b = _mm256_sub_epi32(tmp10_11_h, tmp3_2_hi);
             let a = _mm256_add_epi32(a, bias);
             let b = _mm256_add_epi32(b, bias);
-            let a = _mm256_srai_epi32::<11>(a);
-            let b = _mm256_srai_epi32::<11>(b);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
             let data7_6 = _mm256_packs_epi32(a, b);
 
             let a = _mm256_add_epi32(tmp13_12_l, tmp0_1_lo);
             let b = _mm256_add_epi32(tmp13_12_h, tmp0_1_hi);
             let a = _mm256_add_epi32(a, bias);
             let b = _mm256_add_epi32(b, bias);
-            let a = _mm256_srai_epi32::<11>(a);
-            let b = _mm256_srai_epi32::<11>(b);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
             let data3_2 = _mm256_packs_epi32(a, b);
 
             let a = _mm256_sub_epi32(tmp13_12_l, tmp0_1_lo);
             let b = _mm256_sub_epi32(tmp13_12_h, tmp0_1_hi);
             let a = _mm256_add_epi32(a, bias);
             let b = _mm256_add_epi32(b, bias);
-            let a = _mm256_srai_epi32::<11>(a);
-            let b = _mm256_srai_epi32::<11>(b);
+            let (a, b) = if PASS == 1 {
+                (_mm256_srai_epi32::<11>(a), _mm256_srai_epi32::<11>(b))
+            } else {
+                (_mm256_srai_epi32::<18>(a), _mm256_srai_epi32::<18>(b))
+            };
             let data4_5 = _mm256_packs_epi32(a, b);
 
             (data0_1, data3_2, data4_5, data7_6)
@@ -1736,7 +1763,7 @@ pub mod dct {
             // would multiply by zero. Bit-exact with the regular kernel
             // under that pre-condition.
             let (m1, m2, m3, m4) = if rows_4567_zero {
-                idct_dodct_sparse_p1(in0_4, in3_1, in2_6, in7_5)
+                idct_dodct_sparse::<1>(in0_4, in3_1, in2_6, in7_5)
             } else {
                 idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5)
             };
@@ -1756,16 +1783,30 @@ pub mod dct {
             // Pass 2 (rows). Output values are i16 in [-128, 127]-ish; the
             // saturating pack + 0x80 byte-add below handles the level shift.
             //
-            // Dispatch scaffold for a future sparse pass-2 kernel,
-            // analogous to the pass-1 stub above. The flag would be
-            // derived from the pass-1 outputs `t0..t3` (whether the
-            // post-transpose "columns" 4..7 are zero); computing that
-            // flag is deferred along with the sparse kernel itself. The
-            // scaffold is wired with `false` so behavior is unchanged.
-            let cols_4567_zero_after_p1 = false; // TODO: compute from t0..t3.
+            // Sparse dispatch: when the original block's columns 4..7
+            // are zero, pass-1 leaves the workspace columns 4..7 zero
+            // (each column transforms in isolation), and after the
+            // pass-1 transpose those zero columns land in the high
+            // 128-bit lane of every `tN`. OR-reduce the four hi lanes
+            // and test for zero. `_mm256_permute2x128_si256::<0x11>`
+            // pulls the hi 128 of each operand into both 128-bit
+            // halves; the testz then covers all eight i16 lanes that
+            // matter without a separate extract.
+            // Sparse dispatch: when the original block's columns 4..7
+            // are zero, pass-1 leaves the workspace columns 4..7 zero
+            // (each column transforms in isolation), and after the
+            // pass-1 transpose those zero columns land in the high
+            // 128-bit lane of every `tN`. OR-reduce the four hi lanes
+            // and test for zero. `_mm256_permute2x128_si256::<0x31>`
+            // pulls a[1] into the dest low and b[1] into the dest high,
+            // so a single permute carries both hi 128 lanes for the
+            // testz that follows.
+            let t01_hi = _mm256_permute2x128_si256::<0x31>(t0, t1);
+            let t23_hi = _mm256_permute2x128_si256::<0x31>(t2, t3);
+            let hi_or = _mm256_or_si256(t01_hi, t23_hi);
+            let cols_4567_zero_after_p1 = _mm256_testz_si256(hi_or, hi_or) != 0;
             let (m1, m2, m3, m4) = if cols_4567_zero_after_p1 {
-                // TODO: replace with sparse pass-2 kernel (idct_dodct_sparse_p2).
-                idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2)
+                idct_dodct_sparse::<2>(t0, in3_1_p2, t2, in7_5_p2)
             } else {
                 idct_dodct::<2>(t0, in3_1_p2, t2, in7_5_p2)
             };
@@ -2017,6 +2058,70 @@ mod tests {
                 coef[k] = mag;
                 run_idct_cross(&coef);
             }
+        }
+    }
+
+    #[test]
+    fn idct_avx2_sparse_p2_matches_scalar_cols_4567_zero_workspace() {
+        // Exercises the sparse pass-2 kernel: blocks with cols 4..7
+        // all zero, which leaves the workspace columns 4..7 zero after
+        // pass-1 (each column transforms in isolation), tripping the
+        // post-transpose detection on `t0..t3`. Magnitude distribution
+        // mirrors `idct_avx2_sparse_p1_matches_scalar_rows_4567_zero`
+        // (per-row dropoff inside the i16-workspace contract).
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for seed in 0..200u64 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut coef = [0i16; 64];
+            for row in 0..8 {
+                for col in 0..4 {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let r = (s >> 32) as i32;
+                    let scale = (1024i32 >> row).clamp(1, 2047);
+                    let span = scale * 2 + 1;
+                    let centered = r.rem_euclid(span) - scale;
+                    coef[row * 8 + col] = centered.clamp(-2047, 2047) as i16;
+                }
+            }
+            run_idct_cross(&coef);
+        }
+        // Per-position impulses across the kept columns (cols 0..3) of
+        // every row, exercising the sparse pass-2 kernel for each input
+        // lane that the precondition leaves nonzero.
+        for row in 0..8 {
+            for col in 0..4 {
+                let k = row * 8 + col;
+                let scale = (1024i16 >> row).max(1);
+                for &mag in &[1i16, -1, scale, -scale] {
+                    let mut coef = [0i16; 64];
+                    coef[k] = mag;
+                    run_idct_cross(&coef);
+                }
+            }
+        }
+        // Combined trigger: rows 4..7 zero AND cols 4..7 zero ⇒ pass-1
+        // sparse kernel fires for the column pass, then the pass-2
+        // sparse kernel fires for the row pass on the same block.
+        for seed in 0..50u64 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut coef = [0i16; 64];
+            for row in 0..4 {
+                for col in 0..4 {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let r = (s >> 32) as i32;
+                    let scale = (1024i32 >> row).clamp(1, 2047);
+                    let span = scale * 2 + 1;
+                    let centered = r.rem_euclid(span) - scale;
+                    coef[row * 8 + col] = centered.clamp(-2047, 2047) as i16;
+                }
+            }
+            run_idct_cross(&coef);
         }
     }
 
