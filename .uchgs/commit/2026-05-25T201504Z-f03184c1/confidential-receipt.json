@@ -1,0 +1,17 @@
+{
+  "schema": 3,
+  "audited_tree": "f03184c12f19680d2846f0076366a7f655028d06",
+  "auditor": "code-audit/confidentiality",
+  "confirmed": true,
+  "date": "2026-05-25T20:15:49Z",
+  "note": "bench numbers refresh; 0 findings",
+  "history": [
+    {
+      "type": "state",
+      "date": "2026-05-25T20:15:49Z",
+      "auditor": "code-audit/confidentiality",
+      "confirmed": true,
+      "note": "bench numbers refresh; 0 findings"
+    }
+  ]
+}

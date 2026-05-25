@@ -17,7 +17,7 @@ cargo run --release --features force-scalar --bin bench -- --section all  # scal
 cargo test  --release --test comparison_bench -- --ignored --nocapture    # vs image crate
 ```
 
-## Hosts (0.6.0)
+## Hosts (0.7.0)
 
 | Label                | CPU                                       | Cores | SIMD floor       |
 | -------------------- | ----------------------------------------- | ----- | ---------------- |
@@ -167,13 +167,15 @@ there comes from IDCT + color only.
 
 | Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
 | --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   31.97 ms |     46.38 ms |   23.19 ms |     39.08 ms |   18.62 ms |     33.48 ms |
-| 1920 × 1080 (1080p)         |   37.09 ms |     53.52 ms |   26.50 ms |     45.02 ms |   21.47 ms |     38.58 ms |
-| 3840 × 2160 (4K)            |  149.80 ms |    213.50 ms |  107.99 ms |    179.86 ms |   87.00 ms |    154.82 ms |
+| 1592 × 1124 (session size)  |   34.09 ms |     48.47 ms |   24.43 ms |     42.88 ms |   19.51 ms |     37.40 ms |
+| 1920 × 1080 (1080p)         |   38.73 ms |     56.62 ms |   28.15 ms |     49.42 ms |   22.39 ms |     43.12 ms |
+| 3840 × 2160 (4K)            |  152.75 ms |    222.94 ms |  110.76 ms |    196.81 ms |   89.32 ms |    170.70 ms |
 
-AVX2 decode speedup vs `force-scalar`: 1.43× (4:4:4 4K) → **1.78×**
-(4:2:0 4K). Cycle 1 DS2 (AVX2 jidctint) + DS4 (AVX2 ycc_row_to_rgb)
-+ cycle 2 DS6 (AVX2 fancy upsample) account for the gain.
+AVX2 decode speedup vs `force-scalar`: 1.46× (4:4:4 4K) → **1.91×**
+(4:2:0 4K). AVX2 jidctint + AVX2 ycc_row_to_rgb + AVX2 fancy upsample
+account for the gain on synthetic content. Sparse fast paths and the
+combined Huffman LUT fire near-zero on XOR-pattern blocks, so the
+synthetic numbers move only with the SIMD kernels themselves.
 
 ---
 
@@ -205,12 +207,12 @@ to invert.
 
 | Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
 | --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   14.15 ms |     31.02 ms |   11.21 ms |     29.80 ms |   10.08 ms |     26.80 ms |
-| 1920 × 1080 (1080p)         |   15.99 ms |     34.95 ms |   12.59 ms |     34.27 ms |   11.26 ms |     31.12 ms |
-| 3840 × 2160 (4K)            |   64.28 ms |    137.42 ms |   51.79 ms |    136.43 ms |   44.42 ms |    122.88 ms |
+| 1592 × 1124 (session size)  |   14.70 ms |     31.31 ms |   11.04 ms |     30.57 ms |    9.64 ms |     28.16 ms |
+| 1920 × 1080 (1080p)         |   16.71 ms |     35.50 ms |   12.41 ms |     35.21 ms |   11.15 ms |     32.71 ms |
+| 3840 × 2160 (4K)            |   65.16 ms |    143.74 ms |   51.52 ms |    143.49 ms |   43.88 ms |    130.69 ms |
 
-AVX2 speedup vs `force-scalar` on natural content: 2.14× (4:4:4 4K) →
-**2.77×** (4:2:0 4K) — wider than on synthetic XOR because both the
+AVX2 speedup vs `force-scalar` on natural content: 2.21× (4:4:4 4K) →
+**2.98×** (4:2:0 4K) — wider than on synthetic XOR because both the
 SIMD kernels *and* the sparse fast paths contribute.
 
 ### IDCT sparse path — on / off comparison
@@ -221,15 +223,15 @@ on/off pair is two binaries with otherwise-identical code.
 
 | Subsampling × size | Apple M NEON on | NEON off | NEON gain | Cascade Lake AVX2 on | AVX2 off | AVX2 gain |
 | ------------------ | --------------: | -------: | --------: | -------------------: | -------: | --------: |
-| 4:4:4  1592×1124   |         3.39 ms |  4.00 ms |    +15.3% |             14.15 ms | 16.96 ms |    +16.6% |
-| 4:4:4  1080p       |         3.71 ms |  4.44 ms |    +16.4% |             15.99 ms | 19.05 ms |    +16.1% |
-| 4:4:4  4K          |        14.43 ms | 17.79 ms |    +18.9% |             64.28 ms | 75.69 ms |    +15.1% |
-| 4:2:2  1592×1124   |         2.43 ms |  2.86 ms |    +15.0% |             11.21 ms | 12.86 ms |    +12.8% |
-| 4:2:2  1080p       |         2.78 ms |  3.27 ms |    +15.0% |             12.59 ms | 14.53 ms |    +13.4% |
-| 4:2:2  4K          |        10.80 ms | 13.19 ms |    +18.1% |             51.79 ms | 58.46 ms |    +11.4% |
-| 4:2:0  1592×1124   |         2.07 ms |  2.33 ms |    +11.2% |             10.08 ms | 10.71 ms |     +5.9% |
-| 4:2:0  1080p       |         2.38 ms |  2.68 ms |    +11.2% |             11.26 ms | 12.04 ms |     +6.5% |
-| 4:2:0  4K          |         9.10 ms | 10.55 ms |    +13.7% |             44.42 ms | 49.16 ms |     +9.6% |
+| 4:4:4  1592×1124   |         3.39 ms |  4.00 ms |    +15.3% |             14.70 ms | 16.23 ms |    +10.4% |
+| 4:4:4  1080p       |         3.71 ms |  4.44 ms |    +16.4% |             16.71 ms | 18.76 ms |    +12.3% |
+| 4:4:4  4K          |        14.43 ms | 17.79 ms |    +18.9% |             65.16 ms | 75.43 ms |    +15.8% |
+| 4:2:2  1592×1124   |         2.43 ms |  2.86 ms |    +15.0% |             11.04 ms | 12.32 ms |    +11.6% |
+| 4:2:2  1080p       |         2.78 ms |  3.27 ms |    +15.0% |             12.41 ms | 14.15 ms |    +14.0% |
+| 4:2:2  4K          |        10.80 ms | 13.19 ms |    +18.1% |             51.52 ms | 58.43 ms |    +13.4% |
+| 4:2:0  1592×1124   |         2.07 ms |  2.33 ms |    +11.2% |              9.64 ms | 10.90 ms |    +13.1% |
+| 4:2:0  1080p       |         2.38 ms |  2.68 ms |    +11.2% |             11.15 ms | 12.36 ms |    +10.9% |
+| 4:2:0  4K          |         9.10 ms | 10.55 ms |    +13.7% |             43.88 ms | 49.21 ms |    +12.1% |
 
 The pattern is consistent across both backends: sparse contributes
 ~11–19% of decode time on natural content, more at 4:4:4 (no chroma
@@ -241,6 +243,38 @@ which is why this measurement lives in Section D-natural and not in
 Section D. The sparse paths are bit-exact with the regular kernels;
 cross-check tests in `tests/decode_x86_64.rs` and
 `tests/decode_neon.rs` assert that.
+
+### Combined AC/DC Huffman LUT — on / off comparison
+
+The combined Huffman LUT collapses the AC `(run, size)` lookup and
+DC `size` lookup with the magnitude-bits read into a single peek
+against a precomputed table, replacing the symbol-decode + magnitude
+read split. Toggled by short-circuiting `decode_ac_fast` /
+`decode_dc_fast` to `Ok(None)` at build time, so the on/off pair is
+two binaries with otherwise-identical code.
+
+| Subsampling × size | Cascade Lake AVX2 on | combined-off | gain  |
+| ------------------ | -------------------: | -----------: | ----: |
+| 4:4:4  1592×1124   |             14.70 ms |     14.98 ms | +1.9% |
+| 4:4:4  1080p       |             16.71 ms |     17.37 ms | +3.9% |
+| 4:4:4  4K          |             65.16 ms |     65.24 ms | +0.1% |
+| 4:2:2  1592×1124   |             11.04 ms |     11.16 ms | +1.1% |
+| 4:2:2  1080p       |             12.41 ms |     12.79 ms | +3.0% |
+| 4:2:2  4K          |             51.52 ms |     51.44 ms | −0.2% |
+| 4:2:0  1592×1124   |              9.64 ms |      9.61 ms | −0.3% |
+| 4:2:0  1080p       |             11.15 ms |     10.99 ms | −1.5% |
+| 4:2:0  4K          |             43.88 ms |     44.14 ms | +0.6% |
+
+On Apple M (NEON) the same toggle measured +4.7% at 4K 4:2:0
+natural; on Cascade Lake the effect sits at the noise floor across
+the matrix. The combined LUT was motivated by the entropy-decode
+profile share (37% `decode_symbol` self time, ~50–60% Huffman-related
+in aggregate on Apple M), but in practice both backends'
+straight-line slow paths run well enough on contemporary branch
+predictors that the LUT short-circuit moves the headline only a few
+percent at most. The change is kept — it's bit-exact and adds no
+runtime cost when the table misses — but the realized speedup is
+much smaller than the profile-share-derived ceiling suggested.
 
 ---
 
@@ -273,9 +307,9 @@ vs-encode comparison.
 | Apple M-series (NEON) | 1592×1124 |    5.57 ms |   4.25 ms |            0.76× |
 |                      | 1920×1080  |    6.30 ms |   4.92 ms |            0.78× |
 |                      | 3840×2160  |   25.05 ms |  19.22 ms |            0.77× |
-| Cascade Lake (AVX2)  | 1592×1124  |   18.59 ms |  13.43 ms |            0.72× |
-|                      | 1920×1080  |   21.76 ms |  14.14 ms |            0.65× |
-|                      | 3840×2160  |   88.40 ms |  68.07 ms |            0.77× |
+| Cascade Lake (AVX2)  | 1592×1124  |   19.39 ms |  12.75 ms |            0.66× |
+|                      | 1920×1080  |   21.96 ms |  14.67 ms |            0.67× |
+|                      | 3840×2160  |   91.19 ms |  68.99 ms |            0.76× |
 
 (ratio > 1 means jpeg-rusturbo is faster)
 
