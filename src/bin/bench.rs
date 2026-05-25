@@ -48,6 +48,7 @@ fn main() {
         Section::B => bench_b(),
         Section::C => bench_c(),
         Section::D => bench_d(),
+        Section::DNatural => bench_d_natural(),
         Section::All => {
             bench_a();
             bench_b();
@@ -63,6 +64,7 @@ enum Section {
     B,
     C,
     D,
+    DNatural,
     All,
 }
 
@@ -76,6 +78,7 @@ fn parse_section() -> Section {
                 "B" | "b" => Section::B,
                 "C" | "c" => Section::C,
                 "D" | "d" => Section::D,
+                "d-natural" | "D-natural" | "dn" | "DN" => Section::DNatural,
                 "all" | "All" => Section::All,
                 _ => usage_and_exit(),
             };
@@ -113,6 +116,7 @@ fn print_header(section: Section) {
         Section::B => "B (threads scaling)",
         Section::C => "C (optimize-huffman size)",
         Section::D => "D (decode pipeline)",
+        Section::DNatural => "D-natural (decode, natural-like content)",
         Section::All => "all",
     };
     println!("jpeg-rusturbo bench — section: {sec}");
@@ -201,11 +205,22 @@ fn bench_c() {
 // ---------------------------------------------------------------------------
 
 fn bench_d() {
-    println!("\n=== D. decode pipeline (q=80, JPEG -> RGB, default knobs) ===");
+    bench_d_inner("D. decode pipeline (q=80, synthetic XOR)", make_image);
+}
+
+fn bench_d_natural() {
+    bench_d_inner(
+        "D-natural. decode pipeline (q=80, procedural natural-like content)",
+        make_natural_image,
+    );
+}
+
+fn bench_d_inner(title: &str, gen_pixels: fn(u32, u32) -> Vec<u8>) {
+    println!("\n=== {title} ===");
     for &(sub_label, sub) in SUBSAMP_ALL {
         println!("\n  subsampling: {sub_label}");
         for &(label, w, h) in RES_ALL {
-            let pixels = make_image(w, h);
+            let pixels = gen_pixels(w, h);
 
             // Encode once outside the timed loop; the JPEG bytes are
             // deterministic, so we can reuse them across all iterations.
@@ -324,6 +339,66 @@ fn make_image(w: u32, h: u32) -> Vec<u8> {
             let r = ((x ^ y) & 0xFF) as u8;
             let g = ((x.wrapping_add(y)) & 0xFF) as u8;
             let b = (((x.wrapping_mul(7)) ^ (y.wrapping_mul(13))) & 0xFF) as u8;
+            v.push(r);
+            v.push(g);
+            v.push(b);
+            v.push(255);
+        }
+    }
+    v
+}
+
+/// Procedural natural-like RGBA image. The mix is intentionally
+/// photo-shaped: ~70% smooth gradient (sky / wall), ~25% low-AC
+/// texture (foliage / fabric), ~5% sharp edges (object boundary).
+/// Used by the sparse-path measurement bench (Section D-natural).
+///
+/// After quantize at q=80 the smooth regions produce many DC-only
+/// 8x8 blocks (= what the IDCT sparse fast path targets); the
+/// texture region produces low-AC blocks; the edge region produces
+/// full-AC blocks. The fraction roughly approximates a typical
+/// snapshot (skyline, portrait with bokeh, web hero image).
+fn make_natural_image(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 4) as usize);
+    // Smooth gradient region: top 70% of the image is sky-like
+    // (slow vertical color drift). Texture band: middle 20% with
+    // low-amplitude pseudo-noise. Edges: bottom 10% with two solid
+    // rectangles in contrasting colors.
+    let smooth_h = (h as u64 * 70) / 100;
+    let texture_h = (h as u64 * 20) / 100;
+    for y in 0..h {
+        let yu = y as u64;
+        for x in 0..w {
+            let xu = x as u64;
+            let (r, g, b);
+            if yu < smooth_h {
+                // Sky: B dominant, gentle horizontal + vertical drift.
+                let t = (yu * 80 / smooth_h.max(1)) as u8; // 0..80
+                r = 130u8.saturating_sub(t / 2);
+                g = 160u8.saturating_sub(t / 3);
+                b = 200u8.saturating_sub(t / 4);
+            } else if yu < smooth_h + texture_h {
+                // Texture band: base ~mid-gray + small high-frequency
+                // perturbation. Hash-based deterministic noise of
+                // amplitude ~8 LSB so the AC isn't completely flat.
+                let n = (xu.wrapping_mul(2654435761) ^ yu.wrapping_mul(40503)) & 0x0F; // 0..15
+                let base = 110u8;
+                r = base + (n as u8);
+                g = base + (((n * 3) & 0x0F) as u8);
+                b = base + (((n * 5) & 0x0F) as u8);
+            } else {
+                // Edge band: alternating wide bars of two colors.
+                let bar = (xu / 64) & 1;
+                if bar == 0 {
+                    r = 40;
+                    g = 60;
+                    b = 70;
+                } else {
+                    r = 230;
+                    g = 220;
+                    b = 200;
+                }
+            }
             v.push(r);
             v.push(g);
             v.push(b);
