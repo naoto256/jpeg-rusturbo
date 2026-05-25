@@ -1328,14 +1328,55 @@ pub mod dct {
 }
 
 // ===========================================================================
-// sample: decoder-side fancy chroma upsample (NEON kernel slot)
+// sample: decoder-side fancy chroma upsample (NEON kernel)
 // ===========================================================================
 //
-// Currently delegates to the scalar reference; the NEON port lands as
-// part of the cycle 2 / pair C decoder-SIMD work (see DS5 brief).
+// Ports libjpeg-turbo `simd/arm/jdsample-neon.c`. The vertical blend is a
+// straight `(3*cur + nbr + 2) >> 2` on 16-byte chunks; the horizontal pass
+// loads cur / prev / next via unaligned reads and stores even / odd output
+// pairs through `vst2q_u8`. Edges (src[-1] = src[0], src[n] = src[n-1])
+// stay on the scalar path so the hot loop is branch-free.
 pub mod sample {
+    use core::arch::aarch64::*;
+
     pub fn h2v2_fancy_vblend(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
-        crate::arch::scalar::sample::h2v2_fancy_vblend(cur, nbr, out, n)
+        debug_assert!(cur.len() >= n);
+        debug_assert!(nbr.len() >= n);
+        debug_assert!(out.len() >= n);
+        unsafe { h2v2_fancy_vblend_inner(cur, nbr, out, n) }
+    }
+
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. The debug_asserts in
+    /// the public wrapper bound `n` against all three slice lengths.
+    #[target_feature(enable = "neon")]
+    unsafe fn h2v2_fancy_vblend_inner(cur: &[u8], nbr: &[u8], out: &mut [u8], n: usize) {
+        unsafe {
+            let cp = cur.as_ptr();
+            let np = nbr.as_ptr();
+            let op = out.as_mut_ptr();
+            let mut i = 0usize;
+            while i + 16 <= n {
+                let c = vld1q_u8(cp.add(i));
+                let nb = vld1q_u8(np.add(i));
+                let c_lo = vmovl_u8(vget_low_u8(c));
+                let c_hi = vmovl_u8(vget_high_u8(c));
+                let n_lo = vmovl_u8(vget_low_u8(nb));
+                let n_hi = vmovl_u8(vget_high_u8(nb));
+                let t_lo = vaddq_u16(vmulq_n_u16(c_lo, 3), n_lo);
+                let t_hi = vaddq_u16(vmulq_n_u16(c_hi, 3), n_hi);
+                // vrshrn_n_u16(x, 2) = ((x + 2) >> 2) narrowed to u8.
+                let r = vcombine_u8(vrshrn_n_u16::<2>(t_lo), vrshrn_n_u16::<2>(t_hi));
+                vst1q_u8(op.add(i), r);
+                i += 16;
+            }
+            while i < n {
+                let c = *cp.add(i) as u16;
+                let nb = *np.add(i) as u16;
+                *op.add(i) = ((c * 3 + nb + 2) >> 2) as u8;
+                i += 1;
+            }
+        }
     }
 
     pub fn h2_fancy_upsample(src: &[u8], dst: &mut [u8], n: usize) {
@@ -1919,6 +1960,58 @@ mod tests {
                 coef[i] = (quantized[i] as i32 * qtab[i] as i32).clamp(-32768, 32767) as i16;
             }
             idct_xcheck(&coef, &format!("dequant seed={seed}"));
+        }
+    }
+
+    // ---- sample (fancy chroma upsample) cross-check ----
+
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 56) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sample_neon_h2v2_fancy_vblend_matches_scalar() {
+        for &n in &[
+            1usize, 2, 7, 15, 16, 17, 31, 32, 33, 47, 48, 64, 65, 128, 257, 1024,
+        ] {
+            for seed in 0..3u64 {
+                let cur = lcg_bytes(seed.wrapping_mul(2), n);
+                let nbr = lcg_bytes(seed.wrapping_mul(2).wrapping_add(1), n);
+                let mut a = vec![0u8; n];
+                let mut b = vec![0u8; n];
+                scalar::sample::h2v2_fancy_vblend(&cur, &nbr, &mut a, n);
+                sample::h2v2_fancy_vblend(&cur, &nbr, &mut b, n);
+                assert_eq!(a, b, "n={n} seed={seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn sample_neon_h2v2_fancy_vblend_extremes() {
+        for &n in &[16usize, 17, 32, 33, 48] {
+            let zeros = vec![0u8; n];
+            let max = vec![255u8; n];
+            let mut a = vec![0u8; n];
+            let mut b = vec![0u8; n];
+            scalar::sample::h2v2_fancy_vblend(&zeros, &max, &mut a, n);
+            sample::h2v2_fancy_vblend(&zeros, &max, &mut b, n);
+            assert_eq!(a, b, "cur=0,nbr=255 n={n}");
+            scalar::sample::h2v2_fancy_vblend(&max, &zeros, &mut a, n);
+            sample::h2v2_fancy_vblend(&max, &zeros, &mut b, n);
+            assert_eq!(a, b, "cur=255,nbr=0 n={n}");
+            scalar::sample::h2v2_fancy_vblend(&max, &max, &mut a, n);
+            sample::h2v2_fancy_vblend(&max, &max, &mut b, n);
+            assert_eq!(a, b, "cur=255,nbr=255 n={n}");
         }
     }
 }
