@@ -10,7 +10,10 @@ use crate::arch;
 use crate::tables::ZIGZAG;
 
 use super::error::{DecodeError, Result};
-use super::huffman::{BitReader, FastAcHuffmanTable, HuffmanDecodeTable, decode_ac_fast, extend};
+use super::huffman::{
+    BitReader, FastAcHuffmanTable, FastDcHuffmanTable, HuffmanDecodeTable, decode_ac_fast,
+    decode_dc_fast, extend,
+};
 use super::markers::{Component, DecoderHeaders, QuantTable, ScanHeader};
 
 /// AC Huffman decoder bundle: the canonical slow-path table plus the
@@ -22,6 +25,17 @@ use super::markers::{Component, DecoderHeaders, QuantTable, ScanHeader};
 pub struct AcTablePair {
     pub slow: HuffmanDecodeTable,
     pub fast: FastAcHuffmanTable,
+}
+
+/// DC Huffman decoder bundle, mirroring [`AcTablePair`]: the canonical
+/// slow-path table plus the 10-bit combined LUT that fuses
+/// `decode_symbol` + `get_bits` for the single per-block DC term. The
+/// per-block DC contribution to scan-loop cycles is small (one term vs.
+/// up to 63 AC terms), so the bundle exists mainly to extend the fast
+/// path's coverage to every Huffman lookup in the baseline scan.
+pub struct DcTablePair {
+    pub slow: HuffmanDecodeTable,
+    pub fast: FastDcHuffmanTable,
 }
 
 /// Decoded image data: per-component pixel planes (post-IDCT, post-
@@ -99,7 +113,7 @@ pub fn decode_baseline_scan_into(
     entropy_start: usize,
     headers: &DecoderHeaders,
     scan: &ScanHeader,
-    dc_tables: &[Option<HuffmanDecodeTable>; 4],
+    dc_tables: &[Option<DcTablePair>; 4],
     ac_tables: &[Option<AcTablePair>; 4],
     qt_by_id: &[Option<&QuantTable>; 4],
     planes: &mut [DecodedPlane],
@@ -272,19 +286,29 @@ pub fn decode_baseline_multi(
 /// updated to the new DC predictor on exit.
 fn decode_block_baseline(
     br: &mut BitReader,
-    dc_tbl: &HuffmanDecodeTable,
+    dc_tbl: &DcTablePair,
     ac_tbl: &AcTablePair,
     prev_dc: &mut i32,
     zz: &mut [i16; 64],
 ) -> Result<()> {
     // ---- DC term ----
-    let t = br.decode_symbol(dc_tbl)?;
-    let dc_size = t as u32;
+    // Try the combined DC LUT first; on a miss the bit buffer is
+    // untouched and we fall back to the canonical decode_symbol +
+    // get_bits path. The fast path collapses both peek/drop pairs
+    // into one whenever code_length + size fits the peek window.
+    let (dc_size, dc_bits) = match decode_dc_fast(br, &dc_tbl.fast)? {
+        Some(fast) => (fast.size as u32, fast.magnitude_raw),
+        None => {
+            let t = br.decode_symbol(&dc_tbl.slow)?;
+            let size = t as u32;
+            let bits = if size > 0 { br.get_bits(size)? } else { 0 };
+            (size, bits)
+        }
+    };
     let dc_diff = if dc_size == 0 {
         0
     } else {
-        let bits = br.get_bits(dc_size)?;
-        extend(bits, dc_size)
+        extend(dc_bits, dc_size)
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
     zz[0] = (*prev_dc) as i16;
@@ -373,16 +397,15 @@ fn place_block(plane: &mut DecodedPlane, base_x: usize, base_y: usize, block: &[
     }
 }
 
-/// One DC decoder slot per Huffman destination id (0..=3).
-pub type DcTableSlots = [Option<HuffmanDecodeTable>; 4];
+/// One DC decoder bundle per Huffman destination id (0..=3).
+pub type DcTableSlots = [Option<DcTablePair>; 4];
 /// One AC decoder bundle per Huffman destination id (0..=3).
 pub type AcTableSlots = [Option<AcTablePair>; 4];
 
 /// Scan the supplied DHT specs into the `(dc, ac)` decode-table arrays
-/// (indexed by destination id 0..=3). AC slots carry both the canonical
-/// slow-path table and the combined fast-path LUT so the scan loop can
-/// take whichever path each symbol fits. Used by the public decoder
-/// once header parsing is complete.
+/// (indexed by destination id 0..=3). Both DC and AC slots carry the
+/// canonical slow-path table and the combined fast-path LUT so the
+/// scan loop can take whichever path each symbol fits.
 pub fn build_huffman_tables(
     specs: &[super::markers::HuffmanTableSpec],
 ) -> Result<(DcTableSlots, AcTableSlots)> {
@@ -391,7 +414,9 @@ pub fn build_huffman_tables(
     for spec in specs {
         match spec.class {
             0 => {
-                dc[spec.id as usize] = Some(HuffmanDecodeTable::from_spec(spec)?);
+                let slow = HuffmanDecodeTable::from_spec(spec)?;
+                let fast = FastDcHuffmanTable::from_spec(spec)?;
+                dc[spec.id as usize] = Some(DcTablePair { slow, fast });
             }
             1 => {
                 let slow = HuffmanDecodeTable::from_spec(spec)?;
