@@ -10,8 +10,19 @@ use crate::arch;
 use crate::tables::ZIGZAG;
 
 use super::error::{DecodeError, Result};
-use super::huffman::{BitReader, HuffmanDecodeTable, extend};
+use super::huffman::{BitReader, FastAcHuffmanTable, HuffmanDecodeTable, decode_ac_fast, extend};
 use super::markers::{Component, DecoderHeaders, QuantTable, ScanHeader};
+
+/// AC Huffman decoder bundle: the canonical slow-path table plus the
+/// 10-bit combined LUT that fuses `decode_symbol` + `get_bits` into a
+/// single peek/drop on a hit. The scan loop tries `decode_ac_fast`
+/// against `fast` first and falls back to `decode_symbol(&slow)` +
+/// `get_bits` when the LUT slot is invalid (long codes or codes whose
+/// magnitude bits spill past the peek window).
+pub struct AcTablePair {
+    pub slow: HuffmanDecodeTable,
+    pub fast: FastAcHuffmanTable,
+}
 
 /// Decoded image data: per-component pixel planes (post-IDCT, post-
 /// level-shift). Each plane is `comp.plane_width × comp.plane_height`
@@ -89,7 +100,7 @@ pub fn decode_baseline_scan_into(
     headers: &DecoderHeaders,
     scan: &ScanHeader,
     dc_tables: &[Option<HuffmanDecodeTable>; 4],
-    ac_tables: &[Option<HuffmanDecodeTable>; 4],
+    ac_tables: &[Option<AcTablePair>; 4],
     qt_by_id: &[Option<&QuantTable>; 4],
     planes: &mut [DecodedPlane],
 ) -> Result<(usize, Option<u8>)> {
@@ -262,7 +273,7 @@ pub fn decode_baseline_multi(
 fn decode_block_baseline(
     br: &mut BitReader,
     dc_tbl: &HuffmanDecodeTable,
-    ac_tbl: &HuffmanDecodeTable,
+    ac_tbl: &AcTablePair,
     prev_dc: &mut i32,
     zz: &mut [i16; 64],
 ) -> Result<()> {
@@ -279,11 +290,24 @@ fn decode_block_baseline(
     zz[0] = (*prev_dc) as i16;
 
     // ---- AC terms ----
+    // Try the combined LUT first; on a miss the bit buffer is
+    // untouched and we fall back to the canonical decode_symbol +
+    // get_bits path. The fast path collapses peek/drop pairs from
+    // two to one when both the code and its magnitude bits fit in
+    // FAST_AC_PEEK_WIDTH bits — true for the bulk of standard-table
+    // baseline AC symbols (~95% slot coverage).
     let mut k: usize = 1;
     while k < 64 {
-        let rs = br.decode_symbol(ac_tbl)?;
-        let run = (rs >> 4) as usize;
-        let size = (rs & 0x0F) as u32;
+        let (run, size, mag_raw) = match decode_ac_fast(br, &ac_tbl.fast)? {
+            Some(fast) => (fast.run as usize, fast.size as u32, fast.magnitude_raw),
+            None => {
+                let rs = br.decode_symbol(&ac_tbl.slow)?;
+                let run = (rs >> 4) as usize;
+                let size = (rs & 0x0F) as u32;
+                let mag_raw = if size > 0 { br.get_bits(size)? } else { 0 };
+                (run, size, mag_raw)
+            }
+        };
         if size == 0 {
             if run == 15 {
                 // ZRL: 16 zeros, no value.
@@ -297,8 +321,7 @@ fn decode_block_baseline(
         if k >= 64 {
             return Err(DecodeError::Malformed("AC run exceeded block"));
         }
-        let bits = br.get_bits(size)?;
-        zz[k] = extend(bits, size) as i16;
+        zz[k] = extend(mag_raw, size) as i16;
         k += 1;
     }
     Ok(())
@@ -350,25 +373,33 @@ fn place_block(plane: &mut DecodedPlane, base_x: usize, base_y: usize, block: &[
     }
 }
 
-/// One slot per Huffman destination id (0..=3).
-pub type HuffmanTableSlots = [Option<HuffmanDecodeTable>; 4];
+/// One DC decoder slot per Huffman destination id (0..=3).
+pub type DcTableSlots = [Option<HuffmanDecodeTable>; 4];
+/// One AC decoder bundle per Huffman destination id (0..=3).
+pub type AcTableSlots = [Option<AcTablePair>; 4];
 
 /// Scan the supplied DHT specs into the `(dc, ac)` decode-table arrays
-/// (indexed by destination id 0..=3). Used by the public decoder once
-/// header parsing is complete.
+/// (indexed by destination id 0..=3). AC slots carry both the canonical
+/// slow-path table and the combined fast-path LUT so the scan loop can
+/// take whichever path each symbol fits. Used by the public decoder
+/// once header parsing is complete.
 pub fn build_huffman_tables(
     specs: &[super::markers::HuffmanTableSpec],
-) -> Result<(HuffmanTableSlots, HuffmanTableSlots)> {
-    let mut dc: [Option<HuffmanDecodeTable>; 4] = Default::default();
-    let mut ac: [Option<HuffmanDecodeTable>; 4] = Default::default();
+) -> Result<(DcTableSlots, AcTableSlots)> {
+    let mut dc: DcTableSlots = Default::default();
+    let mut ac: AcTableSlots = Default::default();
     for spec in specs {
-        let tbl = HuffmanDecodeTable::from_spec(spec)?;
-        let slot = match spec.class {
-            0 => &mut dc[spec.id as usize],
-            1 => &mut ac[spec.id as usize],
+        match spec.class {
+            0 => {
+                dc[spec.id as usize] = Some(HuffmanDecodeTable::from_spec(spec)?);
+            }
+            1 => {
+                let slow = HuffmanDecodeTable::from_spec(spec)?;
+                let fast = FastAcHuffmanTable::from_spec(spec)?;
+                ac[spec.id as usize] = Some(AcTablePair { slow, fast });
+            }
             _ => return Err(DecodeError::Malformed("DHT class > 1")),
-        };
-        *slot = Some(tbl);
+        }
     }
     Ok((dc, ac))
 }

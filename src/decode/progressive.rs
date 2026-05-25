@@ -145,7 +145,7 @@ fn run_progressive_scan(
     frame: &FrameHeader,
     scan: &ScanHeader,
     dc_tables: &[Option<HuffmanDecodeTable>; 4],
-    ac_tables: &[Option<HuffmanDecodeTable>; 4],
+    ac_tables: &[Option<super::baseline::AcTablePair>; 4],
     restart_interval: u16,
     comps: &mut [CoeffComponent],
 ) -> Result<(usize, Option<u8>)> {
@@ -223,9 +223,13 @@ fn run_progressive_scan(
         // ---- AC scan: always non-interleaved (Ns == 1, enforced) ----
         let sc = &scan.components[0];
         let comp_idx = find_component_idx(frame, sc.component_id)?;
-        let ac_tbl = ac_tables[sc.ac_table as usize]
+        // Progressive scans still go through the canonical decode_symbol
+        // + get_bits path; the combined-LUT fast path is wired only for
+        // baseline AC (progressive AC-refine zero-skip semantics differ).
+        let ac_tbl = &ac_tables[sc.ac_table as usize]
             .as_ref()
-            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?;
+            .ok_or(DecodeError::Malformed("scan refers to undefined AC table"))?
+            .slow;
         let blocks_x = comps[comp_idx].blocks_x;
         let blocks_y = comps[comp_idx].blocks_y;
         for by in 0..blocks_y {
