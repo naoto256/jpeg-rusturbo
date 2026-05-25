@@ -144,7 +144,7 @@ fn run_progressive_scan(
     entropy_start: usize,
     frame: &FrameHeader,
     scan: &ScanHeader,
-    dc_tables: &[Option<HuffmanDecodeTable>; 4],
+    dc_tables: &[Option<super::baseline::DcTablePair>; 4],
     ac_tables: &[Option<super::baseline::AcTablePair>; 4],
     restart_interval: u16,
     comps: &mut [CoeffComponent],
@@ -185,11 +185,12 @@ fn run_progressive_scan(
                                 if scan.ah == 0 {
                                     decode_dc_first_block(
                                         &mut br,
-                                        dc_tables[entry.dc_table as usize].as_ref().ok_or(
-                                            DecodeError::Malformed(
+                                        &dc_tables[entry.dc_table as usize]
+                                            .as_ref()
+                                            .ok_or(DecodeError::Malformed(
                                                 "scan refers to undefined DC table",
-                                            ),
-                                        )?,
+                                            ))?
+                                            .slow,
                                         &mut prev_dc[entry.comp_idx],
                                         scan.al,
                                         &mut dummy,
@@ -203,9 +204,12 @@ fn run_progressive_scan(
                             if scan.ah == 0 {
                                 decode_dc_first_block(
                                     &mut br,
-                                    dc_tables[entry.dc_table as usize].as_ref().ok_or(
-                                        DecodeError::Malformed("scan refers to undefined DC table"),
-                                    )?,
+                                    &dc_tables[entry.dc_table as usize]
+                                        .as_ref()
+                                        .ok_or(DecodeError::Malformed(
+                                            "scan refers to undefined DC table",
+                                        ))?
+                                        .slow,
                                     &mut prev_dc[entry.comp_idx],
                                     scan.al,
                                     coef,
