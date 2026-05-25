@@ -1529,6 +1529,132 @@ pub mod dct {
         }
     }
 
+    /// Pass-1 IDCT specialized to inputs whose rows 4..7 are all zero.
+    /// Same packing contract as `idct_dodct::<1>` so the dispatch site
+    /// only swaps the call:
+    ///   `in0_4`: lo = row 0, hi = 0    (row 4 zero)
+    ///   `in3_1`: lo = row 3, hi = row 1
+    ///   `in2_6`: lo = row 2, hi = 0    (row 6 zero)
+    ///   `in7_5`: all zero               (rows 7, 5 zero)
+    /// Returns `(data0_1, data3_2, data4_5, data7_6)` in pass-1 i16
+    /// packing, identical to what `idct_dodct::<1>` would return on
+    /// the same inputs. Mirrors `idct_pass1_sparse` in `arch::neon`.
+    ///
+    /// # Safety
+    /// Caller must have AVX2 enabled and must hold the sparse
+    /// pre-condition above; passing non-zero rows 4..7 produces
+    /// incorrect output.
+    #[inline(always)]
+    unsafe fn idct_dodct_sparse_p1(
+        in0_4: __m256i,
+        in3_1: __m256i,
+        in2_6: __m256i,
+        in7_5: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        unsafe {
+            // -- Even part: tmp3_2 from cols 2, 6 (row 6 = 0) ----------
+            // Same madd structure as the regular kernel; the in6_2 swap
+            // still carries one valid copy of row 2 into the upper lane
+            // (the lower lane of the swap is zero), and the pw_f130
+            // constants select tmp3 vs tmp2 by pair element. The
+            // by-zero multiplies fall out as no-ops at the i32 sum.
+            let in6_2 = _mm256_permute2x128_si256::<0x01>(in2_6, in2_6);
+            let l = _mm256_unpacklo_epi16(in2_6, in6_2);
+            let h = _mm256_unpackhi_epi16(in2_6, in6_2);
+            let pw_f130 = load(PW_F130_F054_MF130_F054.0.as_ptr());
+            let tmp3_2_l = _mm256_madd_epi16(l, pw_f130);
+            let tmp3_2_h = _mm256_madd_epi16(h, pw_f130);
+
+            // -- tmp0/1 = row 0 << CONST_BITS  (row 4 = 0) -------------
+            // In the regular kernel, sum_diff packs (in0+in4, in0-in4)
+            // across the 128-bit lanes; with in4 = 0 that collapses to
+            // (row0, row0), so we just broadcast row 0 into both halves
+            // and run the same (zero, x) widen + arithmetic-shift trick
+            // (16 - CONST_BITS = 3) to get value << CONST_BITS with
+            // sign preserved.
+            let row0_dup = _mm256_permute2x128_si256::<0x00>(in0_4, in0_4);
+            let zero = _mm256_setzero_si256();
+            let lo = _mm256_unpacklo_epi16(zero, row0_dup);
+            let hi = _mm256_unpackhi_epi16(zero, row0_dup);
+            let tmp0_1_l = _mm256_srai_epi32::<3>(lo);
+            let tmp0_1_h = _mm256_srai_epi32::<3>(hi);
+
+            let tmp13_12_l = _mm256_sub_epi32(tmp0_1_l, tmp3_2_l);
+            let tmp10_11_l = _mm256_add_epi32(tmp0_1_l, tmp3_2_l);
+            let tmp13_12_h = _mm256_sub_epi32(tmp0_1_h, tmp3_2_h);
+            let tmp10_11_h = _mm256_add_epi32(tmp0_1_h, tmp3_2_h);
+
+            // -- Odd part: in7_5 = 0 -----------------------------------
+            // z3_4 = in7_5 + in3_1 collapses to in3_1.
+            let z3_4 = in3_1;
+            let z4_3 = _mm256_permute2x128_si256::<0x01>(z3_4, z3_4);
+
+            let zl = _mm256_unpacklo_epi16(z3_4, z4_3);
+            let zh = _mm256_unpackhi_epi16(z3_4, z4_3);
+            let pw_mf078 = load(PW_MF078_F117_F078_F117.0.as_ptr());
+            let z3_4_l = _mm256_madd_epi16(zl, pw_mf078);
+            let z3_4_h = _mm256_madd_epi16(zh, pw_mf078);
+
+            // in71_53 mixes in7_5 (zero) with in1_3; the resulting
+            // half-zero pattern still feeds the same constant-pair madd
+            // — the zero halves drop out at the i32 sum stage.
+            let in1_3 = _mm256_permute2x128_si256::<0x01>(in3_1, in3_1);
+            let in71_53_l = _mm256_unpacklo_epi16(in7_5, in1_3);
+            let in71_53_h = _mm256_unpackhi_epi16(in7_5, in1_3);
+
+            let pw_mf060 = load(PW_MF060_MF089_MF050_MF256.0.as_ptr());
+            let part_l = _mm256_madd_epi16(in71_53_l, pw_mf060);
+            let part_h = _mm256_madd_epi16(in71_53_h, pw_mf060);
+            let tmp0_1_lo = _mm256_add_epi32(part_l, z3_4_l);
+            let tmp0_1_hi = _mm256_add_epi32(part_h, z3_4_h);
+
+            let pw_mf089 = load(PW_MF089_F060_MF256_F050.0.as_ptr());
+            let part_l = _mm256_madd_epi16(in71_53_l, pw_mf089);
+            let part_h = _mm256_madd_epi16(in71_53_h, pw_mf089);
+            let z4_3_l = _mm256_permute2x128_si256::<0x01>(z3_4_l, z3_4_l);
+            let z4_3_h = _mm256_permute2x128_si256::<0x01>(z3_4_h, z3_4_h);
+            let tmp3_2_lo = _mm256_add_epi32(part_l, z4_3_l);
+            let tmp3_2_hi = _mm256_add_epi32(part_h, z4_3_h);
+
+            // -- Final output stage (PASS = 1 hard-coded) --------------
+            let bias = _mm256_loadu_si256(PD_DESCALE_P1.0.as_ptr() as *const __m256i);
+
+            let a = _mm256_add_epi32(tmp10_11_l, tmp3_2_lo);
+            let b = _mm256_add_epi32(tmp10_11_h, tmp3_2_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let a = _mm256_srai_epi32::<11>(a);
+            let b = _mm256_srai_epi32::<11>(b);
+            let data0_1 = _mm256_packs_epi32(a, b);
+
+            let a = _mm256_sub_epi32(tmp10_11_l, tmp3_2_lo);
+            let b = _mm256_sub_epi32(tmp10_11_h, tmp3_2_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let a = _mm256_srai_epi32::<11>(a);
+            let b = _mm256_srai_epi32::<11>(b);
+            let data7_6 = _mm256_packs_epi32(a, b);
+
+            let a = _mm256_add_epi32(tmp13_12_l, tmp0_1_lo);
+            let b = _mm256_add_epi32(tmp13_12_h, tmp0_1_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let a = _mm256_srai_epi32::<11>(a);
+            let b = _mm256_srai_epi32::<11>(b);
+            let data3_2 = _mm256_packs_epi32(a, b);
+
+            let a = _mm256_sub_epi32(tmp13_12_l, tmp0_1_lo);
+            let b = _mm256_sub_epi32(tmp13_12_h, tmp0_1_hi);
+            let a = _mm256_add_epi32(a, bias);
+            let b = _mm256_add_epi32(b, bias);
+            let a = _mm256_srai_epi32::<11>(a);
+            let b = _mm256_srai_epi32::<11>(b);
+            let data4_5 = _mm256_packs_epi32(a, b);
+
+            (data0_1, data3_2, data4_5, data7_6)
+        }
+    }
+
     /// AVX2 implementation of `idct_islow`. Bit-exact equivalent of the
     /// scalar reference, modulo the asm-style late saturation that
     /// composes safely with the +128 level-shift for any input.
@@ -1605,16 +1731,12 @@ pub mod dct {
 
             // Pass 1 (columns).
             //
-            // Dispatch scaffold for a future sparse pass-1 kernel. When
-            // `rows_4567_zero`, frequencies 4..7 do not contribute to the
-            // column butterflies and a reduced kernel will be a win. The
-            // sparse kernel itself is not implemented yet — both arms
-            // call the regular `idct_dodct::<1>` so that the runtime
-            // behavior is unchanged. Replacing the `rows_4567_zero` arm
-            // with the sparse variant is the next step in this port.
+            // Dispatch on the sparse flag: when rows 4..7 are zero,
+            // a reduced pass-1 kernel skips the column butterflies that
+            // would multiply by zero. Bit-exact with the regular kernel
+            // under that pre-condition.
             let (m1, m2, m3, m4) = if rows_4567_zero {
-                // TODO: replace with sparse pass-1 kernel (idct_dodct_sparse_p1).
-                idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5)
+                idct_dodct_sparse_p1(in0_4, in3_1, in2_6, in7_5)
             } else {
                 idct_dodct::<1>(in0_4, in3_1, in2_6, in7_5)
             };
@@ -1850,6 +1972,50 @@ mod tests {
             dct::idct_islow(&coef, &mut avx_out);
             for (i, &v) in avx_out.iter().enumerate() {
                 assert_eq!(v, expected, "dc={dc} pos={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn idct_avx2_sparse_p1_matches_scalar_rows_4567_zero() {
+        // Exercises the sparse pass-1 kernel: blocks with rows 4..7
+        // all zero. Coefficient magnitudes follow the natural-image
+        // shape used by `idct_avx2_matches_scalar_random` (per-row
+        // dropoff with frequency) — staying inside the AVX2 kernel's
+        // i16-workspace contract — but the high-frequency rows 4..7
+        // are forced to zero so the detection flag fires.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for seed in 0..200u64 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut coef = [0i16; 64];
+            for (k, slot) in coef.iter_mut().enumerate().take(32) {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (s >> 32) as i32;
+                let scale = (1024i32 >> (k / 8)).clamp(1, 2047);
+                let span = scale * 2 + 1;
+                let centered = r.rem_euclid(span) - scale;
+                *slot = centered.clamp(-2047, 2047) as i16;
+            }
+            run_idct_cross(&coef);
+        }
+        // Single-coefficient impulses across the kept rows. Magnitudes
+        // stay inside the per-row natural range to honour the same
+        // i16-workspace contract as the random sweep above.
+        for k in 0..32 {
+            let scale = (1024i16 >> (k / 8)).max(1);
+            for &mag in &[1i16, -1] {
+                let mut coef = [0i16; 64];
+                coef[k] = mag;
+                run_idct_cross(&coef);
+            }
+            for &mag in &[scale, -scale] {
+                let mut coef = [0i16; 64];
+                coef[k] = mag;
+                run_idct_cross(&coef);
             }
         }
     }
