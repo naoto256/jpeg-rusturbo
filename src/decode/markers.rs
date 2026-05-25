@@ -192,9 +192,9 @@ impl<'a> MarkerReader<'a> {
     /// Tolerant variant: stray bytes between segments (some encoders leave
     /// trailing padding or junk between SOS / DHT / EOI; see e.g.
     /// `partial_progressive.jpg` in our test corpus) are silently skipped
-    /// until the next `0xFF` is found. Most other decoders (libjpeg-turbo,
-    /// zune-jpeg) behave the same way; without this we'd reject streams
-    /// the rest of the ecosystem reads fine.
+    /// until the next `0xFF` is found. libjpeg-turbo behaves the same
+    /// way; without this we'd reject streams the rest of the ecosystem
+    /// reads fine.
     fn read_marker(&mut self) -> Result<u8> {
         // Skip non-0xFF garbage until the next marker prefix or EOF.
         while self.pos < self.buf.len() && self.buf[self.pos] != 0xFF {

@@ -50,21 +50,30 @@
 //!
 //! # Performance
 //!
-//! Per-architecture SIMD kernels (NEON on aarch64, AVX2 + SSE2 on
-//! x86_64) are translated from libjpeg-turbo with bit-exact output
-//! guarantees against the scalar reference. Encoder whole-pipeline
-//! speedup vs scalar is ~1.7× on Apple Silicon and ~1.75× on Intel
-//! Broadwell at 1080p / 4K, q=80, 4:2:0. Versus the `image` crate's
-//! scalar encoder, jpeg-rusturbo's encoder is ~2.5× / ~3.2× faster
-//! (Apple M / Broadwell). Opt-in [`JpegEncoder::set_threads`] adds
-//! another 1.4–1.8× on top via MCU-row parallelism; opt-in
-//! [`JpegEncoder::set_optimize_huffman`] trims output size ~5%
-//! across subsampling/quality at ~1.5–1.8× encode cost. The decoder
-//! is scalar by design — it lags `image`'s SIMD decoder
-//! (zune-jpeg-backed) by ~2.4× but matches its coverage (baseline +
-//! progressive Huffman, fancy chroma upsample, all eight pixel
-//! layouts). Decoder SIMD is on the post-0.5 roadmap. See
-//! [`BENCH.md`] in the repository for detailed numbers.
+//! This crate exists because a real workload needed a fast JPEG
+//! encoder in pure Rust — `image`'s bundled encoder is scalar and
+//! 4:2:0-only, so encode-heavy pipelines leave throughput on the
+//! table. Per-architecture SIMD kernels (NEON on aarch64, AVX2 +
+//! SSE2 on x86_64) are translated from libjpeg-turbo with bit-exact
+//! output guarantees against the scalar reference. Encoder whole-
+//! pipeline speedup vs scalar is ~1.7× on Apple Silicon and ~2.4×
+//! on Intel Cascade Lake at 1080p / 4K, q=80, 4:2:0. Versus the
+//! `image` crate's scalar encoder, jpeg-rusturbo's encoder is
+//! ~2.9× / ~3.3× faster (Apple M / Cascade Lake). Opt-in
+//! [`JpegEncoder::set_threads`] adds another 1.2–1.8× on top via
+//! MCU-row parallelism; opt-in [`JpegEncoder::set_optimize_huffman`]
+//! trims output size ~5% across subsampling/quality at ~1.5–1.8×
+//! encode cost. Encode speed is the headline.
+//!
+//! The decoder is bundled for API symmetry — read your own JPEGs
+//! back without reaching for another crate — rather than as a speed
+//! play. It gained per-stage SIMD kernels in 0.6.0 (IDCT, YCC → RGB
+//! color convert, and fancy chroma upsample in NEON + AVX2); it now
+//! sits at ~0.77× of `image`'s SIMD decoder while matching its
+//! coverage (baseline + progressive Huffman, fancy chroma upsample,
+//! all eight pixel layouts). The remaining gap is the scalar Huffman
+//! entropy decoder, slated for 0.7.0. See [`BENCH.md`] in the
+//! repository for detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
