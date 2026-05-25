@@ -16,6 +16,7 @@ mod progressive;
 pub use error::{DecodeError, Result};
 
 use crate::PixelFormat;
+use crate::arch;
 use crate::color::PixelLayout;
 
 use baseline::{DecodedPlane, DecodedPlanes};
@@ -250,12 +251,11 @@ fn upsample_chroma_row(
         let off = j * plane.stride;
         vblend[..plane_w].copy_from_slice(&plane.samples[off..off + plane_w]);
     } else if v_step == 2 {
-        // libjpeg-turbo `h2v2_fancy` vertical pass: for each chroma
-        // row `cy`, the two output rows it covers are blended with
-        // the row above (upper output) and the row below (lower
-        // output) using weights (3 cur, 1 neighbor).
+        // libjpeg-turbo `h2v2_fancy` vertical pass — see the kernel
+        // contract in `arch::backend::sample::h2v2_fancy_vblend`.
+        // We pick the neighbor row here (clamped at the top / bottom
+        // plane edges) so the kernel itself stays branch-free.
         //
-        // Output row `j_out`:
         //   - cur = j_out / 2 (the chroma row this output sits inside)
         //   - phase = j_out & 1 → 0 = upper of pair, neighbor is cur-1
         //                       → 1 = lower of pair, neighbor is cur+1
@@ -268,13 +268,7 @@ fn upsample_chroma_row(
         };
         let cur_row = &plane.samples[cur * plane.stride..cur * plane.stride + plane_w];
         let nbr_row = &plane.samples[neighbor * plane.stride..neighbor * plane.stride + plane_w];
-        for (dst, (&c, &n)) in vblend
-            .iter_mut()
-            .take(plane_w)
-            .zip(cur_row.iter().zip(nbr_row.iter()))
-        {
-            *dst = (((c as u16) * 3 + n as u16 + 2) >> 2) as u8;
-        }
+        arch::backend::sample::h2v2_fancy_vblend(cur_row, nbr_row, vblend, plane_w);
     } else {
         // v_step > 2 (4:1:1 / 4:4:0 / unusual): box-replicate verbatim.
         let cy = (j_out / v_step).min(plane_h.saturating_sub(1));
@@ -293,37 +287,31 @@ fn upsample_chroma_row(
         return;
     }
     if h_step == 2 {
-        // libjpeg-turbo `h2_fancy` horizontal pass: for each chroma
-        // column `cx`, the two output columns are blended with the
-        // adjacent chroma column:
-        //   out[2*cx]   = (3*in[cx] + in[cx-1] + 2) >> 2
-        //   out[2*cx+1] = (3*in[cx] + in[cx+1] + 2) >> 2
-        // With edge clamping at cx=0 / cx=plane_w-1.
-        let mut x_out = 0usize;
-        for cx in 0..plane_w {
-            let cur = vblend[cx] as u16;
-            let prev = if cx == 0 { cur } else { vblend[cx - 1] as u16 };
-            let next = if cx + 1 >= plane_w {
-                cur
-            } else {
-                vblend[cx + 1] as u16
-            };
-            let out_even = ((cur * 3 + prev + 2) >> 2) as u8;
-            let out_odd = ((cur * 3 + next + 2) >> 2) as u8;
-            if x_out >= width {
-                break;
-            }
-            dst[x_out] = out_even;
-            x_out += 1;
-            if x_out >= width {
-                break;
-            }
-            dst[x_out] = out_odd;
-            x_out += 1;
+        // libjpeg-turbo `h2_fancy` horizontal pass — see the kernel
+        // contract in `arch::backend::sample::h2_fancy_upsample`.
+        // The kernel produces exactly `2 * plane_w` bytes; we truncate
+        // / pad here to match the requested output `width`.
+        if plane_w == 0 {
+            dst[..width].fill(0);
+            return;
         }
-        while x_out < width {
-            dst[x_out] = dst[x_out - 1];
-            x_out += 1;
+        let full = 2 * plane_w;
+        if width >= full {
+            arch::backend::sample::h2_fancy_upsample(vblend, dst, plane_w);
+            if width > full {
+                // Replicate the last produced sample over trailing
+                // output columns (= rare: requested output width
+                // exceeds 2 * chroma-plane-width).
+                let last = dst[full - 1];
+                dst[full..width].fill(last);
+            }
+        } else {
+            // Output narrower than the kernel's natural output (=
+            // partial right-edge row). Produce the full `2 * plane_w`
+            // into a stack scratch and copy the prefix.
+            let mut scratch = vec![0u8; full];
+            arch::backend::sample::h2_fancy_upsample(vblend, &mut scratch, plane_w);
+            dst[..width].copy_from_slice(&scratch[..width]);
         }
         return;
     }
