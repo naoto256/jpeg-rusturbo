@@ -28,7 +28,12 @@ zig-zag, chroma downsample, and Huffman nonzero bitmap. The decoder
 reads baseline (SOF0) and progressive (SOF2) Huffman streams with
 SIMD IDCT, color convert (YCC → RGB), and fancy (interpolating)
 chroma upsample on the standard 4:2:0 / 4:2:2 / 4:4:0 layouts. The
-Huffman entropy decoder itself stays scalar (0.7.0 target).
+Huffman entropy decoder stays scalar by design — the bit-reader +
+canonical-table walk has a serial dependency on per-symbol code
+length that doesn't reshape into vector SIMD — but 0.7.0 lands two
+scalar bit-ops refinements (combined run/size + magnitude LUT, and
+a SWAR 32-bit bit-reader refill) on top of the per-stage SIMD
+kernels.
 
 ## Why
 
@@ -49,10 +54,13 @@ It gained per-stage SIMD kernels in 0.6.0 (IDCT / color convert /
 fancy upsample): it now sits at **~0.77×** of `image`'s SIMD
 decoder, closed from 0.5.0's 0.41×, while matching coverage —
 baseline + progressive Huffman with fancy chroma upsample, output
-in any of eight pixel layouts. The remaining decode gap is the
-scalar Huffman entropy step, slated for 0.7.0. On a roundtrip
-workload the two crates come out roughly even, with the encode side
-winning by a wider margin.
+in any of eight pixel layouts. 0.7.0 narrows the remaining decode
+gap on natural photographic content via two pieces of decode-side
+work: AVX2 IDCT sparse-path parity with NEON (+12–16% on natural 4K
+on Cascade Lake) and a cross-arch SWAR 32-bit Huffman bit-reader
+refill (+4–7% on both NEON and AVX2). On a roundtrip workload the
+two crates come out roughly even, with the encode side winning by a
+wider margin.
 
 ## Performance
 
@@ -73,8 +81,12 @@ per-section breakdown in [BENCH.md](BENCH.md).
 
 `image`'s JPEG decoder is SIMD-accelerated. Our decoder gained
 per-stage SIMD kernels in 0.6.0 (IDCT / color convert / fancy
-upsample), closing the gap from 0.5.0's ~0.41× to **~0.77×**. The
-remaining gap is the scalar Huffman entropy step (0.7.0 target).
+upsample), closing the gap from 0.5.0's ~0.41× to **~0.77×**. 0.7.0
+adds AVX2 IDCT sparse parity and a SWAR 32-bit Huffman bit-reader
+refill, which deliver +12–16% / +4–7% on natural content respectively
+(see [BENCH.md](BENCH.md) Section D-natural); the synthetic ratios
+below are unchanged because both optimizations target patterns that
+don't appear in the XOR test image.
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
@@ -217,8 +229,20 @@ modes return `DecodeError::Unsupported`.
 - **NEON / AVX2 YCC → RGB color convert** — per-row converter ported
   from libjpeg-turbo, runtime-dispatched alongside IDCT and upsample.
 - **Scalar Huffman entropy decoder** — bit-reader + canonical-table
-  walk stays scalar in 0.6.0; SIMDifying it (a table-driven
-  approach) is the 0.7.0 target.
+  walk; the serial dependency on per-symbol code length doesn't
+  reshape into vector SIMD, so the entropy decoder is scalar by
+  design. 0.7.0 lands two scalar bit-ops refinements on top: a
+  combined run/size + magnitude LUT (table-driven path, ~97% slot
+  coverage on standard JPEG tables) for both AC and DC terms,
+  including the progressive DC-first and AC-first scans; and a SWAR
+  32-bit bit-reader refill that fills the `u64` accumulator four
+  bytes at a time when no `0xFF` byte stuffing is present (checked
+  via `(y - 0x0101_0101) & !y & 0x8080_8080`). The SWAR refill
+  delivers +4–7% on natural 4K content across both NEON and AVX2;
+  the combined LUT is at the noise floor at q=80 on Cascade Lake
+  and Apple M but is retained as a table-driven foundation —
+  bit-exact, zero runtime cost on misses, and the canonical
+  approach used by libjpeg-turbo and zune-jpeg.
 - **Eight output pixel layouts** via the same `PixelFormat` enum the
   encoder accepts.
 - **Cross-decoder validation** — `tests/comparison_progressive.rs`
@@ -265,13 +289,22 @@ settled but `0.x` reserves the right to evolve before `1.0`.
 
 The 0.5.0 line shipped the encoder differentiation work: optimized
 two-pass Huffman, multi-thread MCU-row encode, restart intervals,
-and custom quantization tables. **0.6.0 lands decoder SIMD** —
+and custom quantization tables. **0.6.0 landed decoder SIMD** —
 NEON + AVX2 kernels for IDCT, YCC → RGB color convert, and fancy
 chroma upsample — closing the decode-side gap vs `image` from
 ~0.41× to ~0.77× on the standard 4:2:0 path. The release profile
-also tightens to `lto = "fat"` + `codegen-units = 1`. The remaining
-decode gap is the scalar Huffman entropy step; SIMDifying it is the
-**0.7.0 target**. **Trellis quantization** (mozjpeg-style RDO per-block
+also tightened to `lto = "fat"` + `codegen-units = 1`. **0.7.0
+lands two decode-side refinements**: AVX2 IDCT sparse parity
+(porting the NEON DC-only and rows/cols-4–7-zero fast paths to
+x86_64, +12–16% on natural 4K content on Cascade Lake), and a
+cross-arch SWAR 32-bit Huffman bit-reader refill (+4–7% on natural
+content across both NEON and AVX2). Vector-SIMD Huffman remains
+impractical due to the serial dependency on per-symbol code length;
+the table-driven combined LUT also landed in 0.7.0 (for both AC and
+DC, including progressive scans) is the canonical alternative used
+by libjpeg-turbo and zune-jpeg — bit-exact and kept as a foundation
+even though q=80 gain sits at the noise floor on the hosts we
+measure. **Trellis quantization** (mozjpeg-style RDO per-block
 search) remains under consideration for a later release, depending
 on demand.
 
