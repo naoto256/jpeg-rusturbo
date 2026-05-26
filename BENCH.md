@@ -276,6 +276,38 @@ percent at most. The change is kept — it's bit-exact and adds no
 runtime cost when the table misses — but the realized speedup is
 much smaller than the profile-share-derived ceiling suggested.
 
+### SWAR 32-bit bit-reader refill — on / off comparison
+
+The Huffman `BitReader::fill` path traditionally shifts one byte at
+a time into the 64-bit accumulator, branching on every byte for the
+`0xFF`-stuffed-by-`0x00` JPEG sequence. The SWAR variant peeks
+four bytes ahead, runs a single has-byte-equal-`0xFF` test
+(`(y - 0x0101_0101) & !y & 0x8080_8080`), and shifts all four bytes
+in via a single 32-bit OR when the test is zero; falls back to the
+per-byte path otherwise. Toggle is a build-time revert pair (the
+SWAR fast-path is removed and the loop falls back to the per-byte
+path), so the on/off pair is two binaries with otherwise-identical
+code. Numbers are 4K natural, single-run on Apple M and 5-run median
+on Cascade Lake (variance ~1–2% on both):
+
+| Subsampling × size | Apple M NEON on | NEON off | NEON gain | Cascade Lake AVX2 on | AVX2 off | AVX2 gain |
+| ------------------ | --------------: | -------: | --------: | -------------------: | -------: | --------: |
+| 4:4:4  4K          |        13.92 ms | 15.00 ms |    +7.2%  |             72.55 ms | 76.86 ms |    +5.6%  |
+| 4:2:2  4K          |        10.57 ms | 11.27 ms |    +6.2%  |             57.66 ms | 60.34 ms |    +4.4%  |
+| 4:2:0  4K          |         8.72 ms |  9.41 ms |    +7.3%  |             49.37 ms | 52.00 ms |    +5.1%  |
+
+The SWAR variant is **cross-arch consistent +4–7%** on natural 4K
+content. Unlike the combined LUT (which sits at the noise floor at
+q=80), the SWAR refill amortizes the per-byte branch overhead on
+the dominant non-stuffed path and shows up in real measurements on
+both NEON and AVX2 hosts. The Cascade Lake numbers here were
+collected on a separate Azure D4s_v3 run from the Section D-natural
+matrix above (different `rg`, different VM allocation), so the
+baseline absolute ms don't line up exactly with the 43.88 ms in
+that table — read the *gain* column rather than comparing raw ms
+across subsections. Bit-exact equivalence to the per-byte path is
+asserted by the existing decode cross-check tests.
+
 ---
 
 ## vs `image` crate
@@ -315,9 +347,12 @@ vs-encode comparison.
 
 The decode-side gap closed substantially in 0.6.0: 0.5.0 sat at
 ~0.41× on Apple M (image about 2.4× faster); 0.6.0 lands at **0.77×**
-(image now only ~1.3× faster). The remaining gap is the Huffman
-entropy decoder, which stays scalar in 0.6.0. Closing that is a
-separate piece of work (post-0.6 roadmap).
+(image now only ~1.3× faster). 0.7.0 narrows the gap further on
+natural photographic content via AVX2 IDCT sparse parity and a SWAR
+32-bit Huffman bit-reader refill (see Section D-natural for the
+on/off numbers); the synthetic ratios above are unchanged because
+both optimizations target patterns that don't appear in the XOR
+test image.
 
 ---
 
@@ -334,8 +369,11 @@ Encode side:
   Huffman (64-bit acc + bitmap)  ~30%   NEON-bitmap ~1.4× / SSE2-bitmap ~1.4×
   Marker writes/IO      ~15%   scalar in both
 
-Decode side (new in 0.6.0):
-  Entropy decode        ~35%   scalar in both (post-0.6 roadmap)
+Decode side (per-stage SIMD landed in 0.6.0):
+  Entropy decode        ~35%   scalar by design (serial code-length
+                                dependency); 0.7.0 adds combined
+                                AC/DC LUT + SWAR 32-bit refill
+                                (+4–7% on natural across NEON/AVX2)
   IDCT                  ~25%   NEON ~2.0× / AVX2 ~2.5× / scalar 1.0×
                                 + DC-only / sparse-row fast paths
                                   (NEON 0.6.0, AVX2 0.7.0; +11–19% of
@@ -360,7 +398,10 @@ decode and the unavoidable serial marker / IO sections.
   SIMD; the per-nonzero emission stays scalar — it's tight enough
   that LLVM autovectorizes the bit-writer drain and table lookups
   don't reshape cleanly into SIMD.
-- SIMD Huffman *decode*. The bit reader + canonical-Huffman table
-  walk is branchy; the cost-vs-implementation-complexity for a
-  table-driven SIMD decoder is non-trivial. Tracked separately from
-  the per-stage kernel ports that landed in 0.6.0.
+- Vector-SIMD Huffman *decode*. The bit reader + canonical-Huffman
+  table walk has a serial dependency on per-symbol code length, so
+  vectorizing across symbols isn't tractable. The optimizations that
+  do help are scalar bit-ops: 0.7.0 lands a combined AC/DC LUT
+  (table-driven path, used by baseline and progressive scans) and a
+  SWAR 32-bit bit-reader refill — see the SWAR on/off and combined
+  LUT on/off subsections under Section D-natural.
