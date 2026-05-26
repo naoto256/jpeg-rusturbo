@@ -71,12 +71,22 @@
 //! color convert, and fancy chroma upsample in NEON + AVX2); it now
 //! sits at ~0.77× of `image`'s SIMD decoder while matching its
 //! coverage (baseline + progressive Huffman, fancy chroma upsample,
-//! all eight pixel layouts). The IDCT additionally carries DC-only
-//! and sparse-row fast paths that fire on smooth regions in natural
-//! photographs (+11–19% of total decode time on natural content,
-//! noise-level on synthetic input). The remaining gap is the scalar
-//! Huffman entropy decoder, slated for 0.7.0. See [`BENCH.md`] in
-//! the repository for detailed numbers.
+//! all eight pixel layouts). The IDCT carries DC-only and sparse-row
+//! fast paths that fire on smooth regions in natural photographs
+//! (+11–19% of total decode time on natural content, noise-level on
+//! synthetic input); 0.7.0 ports those fast paths to AVX2 to match
+//! NEON. The Huffman entropy decoder is scalar by design — the
+//! bit-reader + canonical-table walk has a serial dependency on
+//! per-symbol code length that doesn't reshape into vector SIMD —
+//! and 0.7.0 lands two scalar bit-ops refinements on top: a combined
+//! run/size + magnitude LUT (table-driven path, used by both AC and
+//! DC including progressive scans) and a SWAR 32-bit bit-reader
+//! refill that fills the `u64` accumulator four bytes at a time
+//! when no `0xFF` byte stuffing is present. The SWAR refill delivers
+//! +4–7% on natural 4K content across both NEON and AVX2; the
+//! combined LUT sits at the noise floor at q=80 and is retained as a
+//! bit-exact foundation. See [`BENCH.md`] in the repository for
+//! detailed numbers.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!
