@@ -81,20 +81,43 @@ per-section breakdown in [BENCH.md](BENCH.md).
 
 `image`'s JPEG decoder is SIMD-accelerated. Our decoder gained
 per-stage SIMD kernels in 0.6.0 (IDCT / color convert / fancy
-upsample), closing the gap from 0.5.0's ~0.41× to **~0.77×**. 0.7.0
-adds AVX2 IDCT sparse parity and a SWAR 32-bit Huffman bit-reader
-refill, which deliver +12–16% / +4–7% on natural content respectively
-(see [BENCH.md](BENCH.md) Section D-natural); the synthetic ratios
-below are unchanged because both optimizations target patterns that
-don't appear in the XOR test image.
+upsample). 0.7.0 adds AVX2 IDCT sparse parity, a combined AC/DC
+Huffman LUT, and a SWAR 32-bit Huffman bit-reader refill.
+
+Both decoders are timed on the same harness
+(`tests/comparison_bench.rs`) against two corpora: the synthetic
+XOR pattern used everywhere else in the docs (Huffman-heavy worst
+case — every block is full-AC) and a procedural natural-content
+image (smooth sky + low-AC texture + edge bars) that is the fairer
+proxy for typical web/photo input.
+
+**Synthetic (worst case):**
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
-| 1592 × 1124 (session size)  |        5.57 ms |         4.25 ms |  0.76×  |            18.59 ms |             13.43 ms |  0.72×  |
-| 1920 × 1080 (1080p)         |        6.30 ms |         4.92 ms |  0.78×  |            21.76 ms |             14.14 ms |  0.65×  |
-| 3840 × 2160 (4K)            |       25.05 ms |        19.22 ms |  0.77×  |            88.40 ms |             68.07 ms |  0.77×  |
+| 1592 × 1124 (session size)  |        4.27 ms |         4.31 ms |  1.01×  |            17.26 ms |             12.80 ms |  0.74×  |
+| 1920 × 1080 (1080p)         |        4.81 ms |         4.89 ms |  1.02×  |            19.99 ms |             15.06 ms |  0.75×  |
+| 3840 × 2160 (4K)            |       20.20 ms |        19.58 ms |  0.97×  |            81.62 ms |             69.73 ms |  0.85×  |
+
+**Natural content (procedural sky + texture + edges):**
+
+| Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
+| --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
+| 1592 × 1124 (session size)  |        1.98 ms |         1.52 ms |  0.77×  |             9.15 ms |              4.92 ms |  0.54×  |
+| 1920 × 1080 (1080p)         |        2.24 ms |         1.82 ms |  0.81×  |            10.32 ms |              5.71 ms |  0.55×  |
+| 3840 × 2160 (4K)            |        8.67 ms |         6.80 ms |  0.78×  |            45.60 ms |             34.27 ms |  0.75×  |
 
 (ratio > 1 means jpeg-rusturbo is faster)
+
+The synthetic row is where our absolute work matches `image`'s most
+closely — Apple M is at parity, Cascade Lake is at 0.74–0.85×. The
+natural row is faster in absolute terms on both decoders (sparse
+IDCT and the LUT/SWAR Huffman path do fire on our side), but
+jpeg-decoder benefits more from the same corpus shift, so the
+*ratio* on natural input is currently lower than on synthetic. The
+remaining gap on natural content (entropy decoder coverage of
+edge-case symbols, colour-convert/upsample batch shape) is queued
+for 0.8.0.
 
 ### Threading and optimized Huffman
 
