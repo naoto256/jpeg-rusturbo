@@ -24,11 +24,12 @@ cargo test  --release --test comparison_bench -- --ignored --nocapture    # vs i
 | Apple M-series       | Apple Silicon (M-series)                  | 8 P+E | NEON (always-on) |
 | Intel Xeon (Cascade Lake) | Xeon Platinum 8272CL @ 2.60 GHz        | 4 vCPU | AVX2 + SSE2  |
 
-Intel host was a fresh `Standard_D4s_v3` Linux VM in Azure
-`centralus` (Ubuntu 24.04, Rust stable). Azure's D4s_v3 inventory
-rotates through Broadwell → Skylake → Cascade Lake → Ice Lake, so
-absolute ms numbers aren't directly comparable across releases;
-the SIMD-vs-scalar ratios and the vs-`image`-crate ratios are.
+Intel host was a fresh 4-vCPU cloud VM (Ubuntu 24.04, Rust stable).
+The shared-tenant 4-vCPU bucket we use rotates through Broadwell →
+Skylake → Cascade Lake → Ice Lake as the underlying inventory
+changes, so absolute ms numbers aren't directly comparable across
+releases; the SIMD-vs-scalar ratios and the vs-`image`-crate ratios
+are.
 
 Apple M was a developer laptop with background chat / IDE running —
 performance-core load was light but non-zero, so trust the *ratios*
@@ -301,11 +302,10 @@ content. Unlike the combined LUT (which sits at the noise floor at
 q=80), the SWAR refill amortizes the per-byte branch overhead on
 the dominant non-stuffed path and shows up in real measurements on
 both NEON and AVX2 hosts. The Cascade Lake numbers here were
-collected on a separate Azure D4s_v3 run from the Section D-natural
-matrix above (different `rg`, different VM allocation), so the
-baseline absolute ms don't line up exactly with the 43.88 ms in
-that table — read the *gain* column rather than comparing raw ms
-across subsections. Bit-exact equivalence to the per-byte path is
+collected on a separate run from the Section D-natural matrix above
+(different VM allocation), so the baseline absolute ms don't line
+up exactly with the 43.88 ms in that table — read the *gain*
+column rather than comparing raw ms across subsections. Bit-exact equivalence to the per-byte path is
 asserted by the existing decode cross-check tests.
 
 ---
