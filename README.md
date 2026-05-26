@@ -143,7 +143,7 @@ bandwidth matters more than CPU.
 ```toml
 # Cargo.toml
 [dependencies]
-jpeg-rusturbo = "0.6"
+jpeg-rusturbo = "0.7"
 ```
 
 ### Encode
