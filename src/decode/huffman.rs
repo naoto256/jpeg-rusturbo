@@ -66,6 +66,29 @@ impl<'a> BitReader<'a> {
 
     fn fill(&mut self, need: u32) -> Result<()> {
         debug_assert!(need <= 32);
+        // Fast refill: pull 4 bytes at once when no stuff byte or marker
+        // is in the window. SWAR has-byte-equal-FF check (`(~x - 1) & x`
+        // form, applied to the bitwise complement) lets the per-byte
+        // loop handle only the rare 0xFF cases. Requires `nbits <= 32`
+        // so the shifted-in chunk fits in `buf`.
+        if self.marker.is_none() && self.nbits <= 32 && self.pos + 4 <= self.src.len() {
+            let chunk = u32::from_be_bytes([
+                self.src[self.pos],
+                self.src[self.pos + 1],
+                self.src[self.pos + 2],
+                self.src[self.pos + 3],
+            ]);
+            let y = !chunk;
+            let has_ff = y.wrapping_sub(0x0101_0101) & !y & 0x8080_8080;
+            if has_ff == 0 {
+                self.buf = (self.buf << 32) | (chunk as u64);
+                self.nbits += 32;
+                self.pos += 4;
+                if self.nbits >= need {
+                    return Ok(());
+                }
+            }
+        }
         while self.nbits < need {
             if self.marker.is_some() {
                 self.buf <<= 8;
