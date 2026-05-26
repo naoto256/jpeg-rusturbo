@@ -1,0 +1,17 @@
+{
+  "schema": 3,
+  "audited_tree": "47f0117981f7e471511e3f7012db5fb4d19b9483",
+  "auditor": "code-audit/confidentiality",
+  "confirmed": true,
+  "date": "2026-05-26T02:42:53Z",
+  "note": "SWAR refill commit: 0 findings; pre-existing 'two-step' false positives outside diff.",
+  "history": [
+    {
+      "type": "state",
+      "date": "2026-05-26T02:42:53Z",
+      "auditor": "code-audit/confidentiality",
+      "confirmed": true,
+      "note": "SWAR refill commit: 0 findings; pre-existing 'two-step' false positives outside diff."
+    }
+  ]
+}
