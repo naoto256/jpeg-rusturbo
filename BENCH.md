@@ -334,25 +334,50 @@ vs-encode comparison.
 
 ### Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
 
-| Host                 | Resolution | ours       | image     | ratio (img/ours) |
-| -------------------- | ---------- | ---------: | --------: | ---------------: |
-| Apple M-series (NEON) | 1592×1124 |    5.57 ms |   4.25 ms |            0.76× |
-|                      | 1920×1080  |    6.30 ms |   4.92 ms |            0.78× |
-|                      | 3840×2160  |   25.05 ms |  19.22 ms |            0.77× |
-| Cascade Lake (AVX2)  | 1592×1124  |   19.39 ms |  12.75 ms |            0.66× |
-|                      | 1920×1080  |   21.96 ms |  14.67 ms |            0.67× |
-|                      | 3840×2160  |   91.19 ms |  68.99 ms |            0.76× |
+Both corpora are bench-driven from `tests/comparison_bench.rs`. The
+*synthetic* row is the same XOR pattern used everywhere else in this
+document — every block is full-AC, which is the Huffman-heavy
+worst case for both decoders. The *natural-content* row drives the
+same harness with `make_natural_image` (smooth sky + low-AC texture +
+edge bars), the corpus introduced for Section D-natural; it is the
+fairer proxy for typical web/photo input.
+
+| Host                  | Corpus      | Resolution | ours       | image     | ratio (img/ours) |
+| --------------------- | ----------- | ---------- | ---------: | --------: | ---------------: |
+| Apple M-series (NEON) | synthetic   | 1592×1124  |    4.27 ms |   4.31 ms |            1.01× |
+|                       | synthetic   | 1920×1080  |    4.81 ms |   4.89 ms |            1.02× |
+|                       | synthetic   | 3840×2160  |   20.20 ms |  19.58 ms |            0.97× |
+|                       | natural     | 1592×1124  |    1.98 ms |   1.52 ms |            0.77× |
+|                       | natural     | 1920×1080  |    2.24 ms |   1.82 ms |            0.81× |
+|                       | natural     | 3840×2160  |    8.67 ms |   6.80 ms |            0.78× |
+| Cascade Lake (AVX2)   | synthetic   | 1592×1124  |   17.26 ms |  12.80 ms |            0.74× |
+|                       | synthetic   | 1920×1080  |   19.99 ms |  15.06 ms |            0.75× |
+|                       | synthetic   | 3840×2160  |   81.62 ms |  69.73 ms |            0.85× |
+|                       | natural     | 1592×1124  |    9.15 ms |   4.92 ms |            0.54× |
+|                       | natural     | 1920×1080  |   10.32 ms |   5.71 ms |            0.55× |
+|                       | natural     | 3840×2160  |   45.60 ms |  34.27 ms |            0.75× |
 
 (ratio > 1 means jpeg-rusturbo is faster)
 
-The decode-side gap closed substantially in 0.6.0: 0.5.0 sat at
-~0.41× on Apple M (image about 2.4× faster); 0.6.0 lands at **0.77×**
-(image now only ~1.3× faster). 0.7.0 narrows the gap further on
-natural photographic content via AVX2 IDCT sparse parity and a SWAR
-32-bit Huffman bit-reader refill (see Section D-natural for the
-on/off numbers); the synthetic ratios above are unchanged because
-both optimizations target patterns that don't appear in the XOR
-test image.
+Reading the numbers honestly:
+
+- On synthetic Huffman-heavy content we now sit at parity on Apple M
+  and ~0.74–0.85× on Cascade Lake. The 0.6.0 number on Apple M was
+  0.77×; the 0.7.0 sparse-parity + SWAR refill changes do show up
+  here even though the corpus is "worst case" for the per-pixel
+  parts of the pipeline, because both optimizations also benefit
+  the dominant non-stuffed Huffman path.
+- On natural-content input `image` (jpeg-decoder) pulls further
+  ahead, ending the 0.7.0 cycle at ~0.54–0.78×. The absolute decode
+  time on our side drops by ~2× from the synthetic row to the
+  natural row — sparse IDCT and the LUT/SWAR Huffman path do fire —
+  but `image` drops by ~3× over the same corpus, so the *ratio*
+  widens rather than narrowing. The remaining gap is in the parts
+  of the entropy decoder we have not yet rewritten (combined LUT
+  coverage of edge-case symbols, AC band-loop scheduling) and in
+  the colour-convert / upsample stages that benefit more from
+  jpeg-decoder's batch shape than from ours. This is the honest
+  read; future work is queued in the 0.8.0 plan.
 
 ---
 
