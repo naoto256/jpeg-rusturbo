@@ -1,6 +1,6 @@
-//! JPEG decoder — baseline (and, on the 0.4.0 roadmap, progressive)
-//! Huffman scans translated from libjpeg-turbo, sharing the
-//! `arch::backend` SIMD kernels with the encoder where they overlap.
+//! JPEG decoder — baseline (SOF0) and progressive (SOF2) Huffman
+//! scans translated from libjpeg-turbo, sharing the `arch::backend`
+//! SIMD kernels with the encoder where they overlap.
 //!
 //! Top-level entry point: [`Decoder::new`] parses the header chain
 //! (SOI / DQT / DHT / SOF / SOS) eagerly; [`Decoder::decode`] runs
@@ -210,8 +210,10 @@ fn compose_output(
 /// Out-of-range `j` (e.g. when the component has been vertically
 /// downsampled below the output height — non-conventional sampling
 /// layouts where Y is not the highest-sampled component) is clamped to
-/// the last available row; fancy upsample will address this properly in
-/// the 0.4.0 chroma-upsample refactor.
+/// the last available row. Standard 4:2:0 / 4:2:2 / 4:4:0 layouts go
+/// through the fancy chroma upsample (`upsample_chroma_row`) which
+/// does its own boundary handling; this fallback is only hit for
+/// unusual sampling factors that fall back to box replication.
 fn copy_plane_row(plane: &DecodedPlane, j: usize, dst: &mut [u8], width: usize) {
     let j = j.min(plane.plane_height.saturating_sub(1));
     let off = j * plane.stride;
