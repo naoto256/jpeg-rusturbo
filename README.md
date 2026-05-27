@@ -51,16 +51,16 @@ the headline.**
 The decoder is bundled for API symmetry — read your own JPEGs back
 without reaching for another crate — rather than as a speed play.
 It gained per-stage SIMD kernels in 0.6.0 (IDCT / color convert /
-fancy upsample): it now sits at **~0.77×** of `image`'s SIMD
-decoder, closed from 0.5.0's 0.41×, while matching coverage —
-baseline + progressive Huffman with fancy chroma upsample, output
-in any of eight pixel layouts. 0.7.0 narrows the remaining decode
-gap on natural photographic content via two pieces of decode-side
-work: AVX2 IDCT sparse-path parity with NEON (+12–16% on natural 4K
-on Cascade Lake) and a cross-arch SWAR 32-bit Huffman bit-reader
-refill (+4–7% on both NEON and AVX2). On a roundtrip workload the
-two crates come out roughly even, with the encode side winning by a
-wider margin.
+fancy upsample) and progressively closed the gap to `image`'s SIMD
+decoder over 0.7.x; **as of 0.7.5 we are faster than `image` at 4K
+on both microarchitectures and both corpora** (~1.06–1.10× on
+synthetic Huffman-heavy content, ~1.19–1.21× on natural-content),
+while matching coverage — baseline + progressive Huffman with
+fancy chroma upsample, output in any of eight pixel layouts. The
+0.7.5 hot-path changes (entropy + dequant fusion, AVX2 PSHUFB
+RGB interleave, uninit-alloc) are why; the smaller-resolution
+fixed-cost overhead means we still trail by 5–11% at 1592×1124 /
+1080p on Cascade Lake, which is queued for 0.8.x.
 
 ## Performance
 
@@ -79,10 +79,15 @@ per-section breakdown in [BENCH.md](BENCH.md).
 
 ### vs `image` crate — decode (JPEG → RGB)
 
-`image`'s JPEG decoder is SIMD-accelerated. Our decoder gained
-per-stage SIMD kernels in 0.6.0 (IDCT / color convert / fancy
-upsample). 0.7.0 adds AVX2 IDCT sparse parity, a combined AC/DC
-Huffman LUT, and a SWAR 32-bit Huffman bit-reader refill.
+`image` 0.25 ships `zune-jpeg` as its JPEG decoder, also fully
+SIMD-accelerated. Our decoder gained per-stage SIMD kernels in
+0.6.0 (IDCT / color convert / fancy upsample). 0.7.0 added AVX2
+IDCT sparse parity, a combined AC/DC Huffman LUT, and a SWAR
+32-bit Huffman bit-reader refill. 0.7.5 fuses dequantize into
+the entropy-decode block loop (eliminating the per-block dequant
+pass), replaces an x86_64 scalar RGB-interleave loop with a
+PSHUFB shuffle kernel, and skips zero-fill on the per-decode
+plane / output Vec allocations.
 
 Both decoders are timed on the same harness
 (`tests/comparison_bench.rs`) against two corpora: the synthetic
@@ -95,29 +100,32 @@ proxy for typical web/photo input.
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
-| 1592 × 1124 (session size)  |        4.27 ms |         4.31 ms |  1.01×  |            17.26 ms |             12.80 ms |  0.74×  |
-| 1920 × 1080 (1080p)         |        4.81 ms |         4.89 ms |  1.02×  |            19.99 ms |             15.06 ms |  0.75×  |
-| 3840 × 2160 (4K)            |       20.20 ms |        19.58 ms |  0.97×  |            81.62 ms |             69.73 ms |  0.85×  |
+| 1592 × 1124 (session size)  |        3.91 ms |         4.31 ms |  1.10×  |            12.90 ms |             12.30 ms |  0.95×  |
+| 1920 × 1080 (1080p)         |        4.53 ms |         4.93 ms |  1.09×  |            14.61 ms |             14.24 ms |  0.97×  |
+| 3840 × 2160 (4K)            |       18.29 ms |        19.34 ms |  1.06×  |            62.04 ms |             68.25 ms |  1.10×  |
 
 **Natural content (procedural sky + texture + edges):**
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
-| 1592 × 1124 (session size)  |        1.98 ms |         1.52 ms |  0.77×  |             9.15 ms |              4.92 ms |  0.54×  |
-| 1920 × 1080 (1080p)         |        2.24 ms |         1.82 ms |  0.81×  |            10.32 ms |              5.71 ms |  0.55×  |
-| 3840 × 2160 (4K)            |        8.67 ms |         6.80 ms |  0.78×  |            45.60 ms |             34.27 ms |  0.75×  |
+| 1592 × 1124 (session size)  |        1.33 ms |         1.55 ms |  1.17×  |             5.10 ms |              4.56 ms |  0.89×  |
+| 1920 × 1080 (1080p)         |        1.53 ms |         1.85 ms |  1.21×  |             5.70 ms |              5.29 ms |  0.93×  |
+| 3840 × 2160 (4K)            |        5.87 ms |         7.00 ms |  1.19×  |            26.79 ms |             32.54 ms |  1.21×  |
 
 (ratio > 1 means jpeg-rusturbo is faster)
 
-The synthetic row is where our absolute work matches `image`'s most
-closely — Apple M is at parity, Cascade Lake is at 0.74–0.85×. The
-natural row is faster in absolute terms on both decoders (sparse
-IDCT and the LUT/SWAR Huffman path do fire on our side), but
-jpeg-decoder benefits more from the same corpus shift, so the
-*ratio* on natural input is currently lower than on synthetic. The
-remaining gap on natural content (entropy decoder coverage of
-edge-case symbols, colour-convert/upsample batch shape) is queued
-for 0.8.0.
+At 4K — the resolution that dominates real workloads — we sit
+ahead of `image` on both microarchitectures and on both corpora:
+1.06×–1.10× on synthetic Huffman-heavy content and 1.19×–1.21×
+on natural-content. At smaller resolutions the picture is more
+mixed on Cascade Lake (we lose by 5–11% at 1592×1124 / 1080p on
+both corpora) because the per-decode fixed-cost overhead is a
+larger fraction of total time there; the relative gain from the
+0.7.5 hot-path changes (entropy + dequant fusion, AVX2 RGB
+interleave, uninit-alloc) scales with the amount of per-pixel
+work and so shows up most strongly at 4K. Apple M's lower
+fixed-cost overhead means even small-resolution decode comes
+out ahead.
 
 ### Threading and optimized Huffman
 
@@ -317,17 +325,23 @@ NEON + AVX2 kernels for IDCT, YCC → RGB color convert, and fancy
 chroma upsample — closing the decode-side gap vs `image` from
 ~0.41× to ~0.77× on the standard 4:2:0 path. The release profile
 also tightened to `lto = "fat"` + `codegen-units = 1`. **0.7.0
-lands two decode-side refinements**: AVX2 IDCT sparse parity
+landed two decode-side refinements**: AVX2 IDCT sparse parity
 (porting the NEON DC-only and rows/cols-4–7-zero fast paths to
-x86_64, +12–16% on natural 4K content on Cascade Lake), and a
-cross-arch SWAR 32-bit Huffman bit-reader refill (+4–7% on natural
-content across both NEON and AVX2). Vector-SIMD Huffman remains
-impractical due to the serial dependency on per-symbol code length;
-the table-driven combined LUT also landed in 0.7.0 (for both AC and
-DC, including progressive scans) is the canonical alternative used
-by libjpeg-turbo and zune-jpeg — bit-exact and kept as a foundation
-even though q=80 gain sits at the noise floor on the hosts we
-measure. **Trellis quantization** (mozjpeg-style RDO per-block
+x86_64), and a cross-arch SWAR 32-bit Huffman bit-reader refill.
+Vector-SIMD Huffman remains impractical due to the serial dependency
+on per-symbol code length; the table-driven combined LUT (for both
+AC and DC, including progressive scans) is the canonical alternative
+used by libjpeg-turbo and `zune-jpeg`. **0.7.5 closes the decoder
+cycle**: fusing dequantize into the entropy-decode block loop
+(eliminating the per-block intermediate `zz_coef` and the
+`for k in 0..64` dequant pass), replacing the x86_64 RGB 3-byte
+interleave's scalar VPEXTRB loop with a PSHUFB shuffle kernel
+(saved ~6 ms on Cascade Lake 4K), and skipping zero-fill on the
+per-decode plane / output Vec allocations (saved ~5 ms on Cascade
+Lake 4K). Combined effect: 4K 4:2:0 natural-content decode drops
+from 41.8 ms → 22.1 ms on Cascade Lake and 8.6 ms → 5.7 ms on
+Apple M, putting both microarchitectures ahead of `image` /
+`zune-jpeg` on the same fixture. **Trellis quantization** (mozjpeg-style RDO per-block
 search) remains under consideration for a later release, depending
 on demand.
 

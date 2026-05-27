@@ -342,42 +342,44 @@ same harness with `make_natural_image` (smooth sky + low-AC texture +
 edge bars), the corpus introduced for Section D-natural; it is the
 fairer proxy for typical web/photo input.
 
+`image` 0.25 ships `zune-jpeg` as its JPEG decoder (so the "image"
+column below is `zune-jpeg`'s decode path).
+
 | Host                  | Corpus      | Resolution | ours       | image     | ratio (img/ours) |
 | --------------------- | ----------- | ---------- | ---------: | --------: | ---------------: |
-| Apple M-series (NEON) | synthetic   | 1592×1124  |    4.27 ms |   4.31 ms |            1.01× |
-|                       | synthetic   | 1920×1080  |    4.81 ms |   4.89 ms |            1.02× |
-|                       | synthetic   | 3840×2160  |   20.20 ms |  19.58 ms |            0.97× |
-|                       | natural     | 1592×1124  |    1.98 ms |   1.52 ms |            0.77× |
-|                       | natural     | 1920×1080  |    2.24 ms |   1.82 ms |            0.81× |
-|                       | natural     | 3840×2160  |    8.67 ms |   6.80 ms |            0.78× |
-| Cascade Lake (AVX2)   | synthetic   | 1592×1124  |   17.26 ms |  12.80 ms |            0.74× |
-|                       | synthetic   | 1920×1080  |   19.99 ms |  15.06 ms |            0.75× |
-|                       | synthetic   | 3840×2160  |   81.62 ms |  69.73 ms |            0.85× |
-|                       | natural     | 1592×1124  |    9.15 ms |   4.92 ms |            0.54× |
-|                       | natural     | 1920×1080  |   10.32 ms |   5.71 ms |            0.55× |
-|                       | natural     | 3840×2160  |   45.60 ms |  34.27 ms |            0.75× |
+| Apple M-series (NEON) | synthetic   | 1592×1124  |    3.91 ms |   4.31 ms |            1.10× |
+|                       | synthetic   | 1920×1080  |    4.53 ms |   4.93 ms |            1.09× |
+|                       | synthetic   | 3840×2160  |   18.29 ms |  19.34 ms |            1.06× |
+|                       | natural     | 1592×1124  |    1.33 ms |   1.55 ms |            1.17× |
+|                       | natural     | 1920×1080  |    1.53 ms |   1.85 ms |            1.21× |
+|                       | natural     | 3840×2160  |    5.87 ms |   7.00 ms |            1.19× |
+| Cascade Lake (AVX2)   | synthetic   | 1592×1124  |   12.90 ms |  12.30 ms |            0.95× |
+|                       | synthetic   | 1920×1080  |   14.61 ms |  14.24 ms |            0.97× |
+|                       | synthetic   | 3840×2160  |   62.04 ms |  68.25 ms |            1.10× |
+|                       | natural     | 1592×1124  |    5.10 ms |   4.56 ms |            0.89× |
+|                       | natural     | 1920×1080  |    5.70 ms |   5.29 ms |            0.93× |
+|                       | natural     | 3840×2160  |   26.79 ms |  32.54 ms |            1.21× |
 
 (ratio > 1 means jpeg-rusturbo is faster)
 
 Reading the numbers honestly:
 
-- On synthetic Huffman-heavy content we now sit at parity on Apple M
-  and ~0.74–0.85× on Cascade Lake. The 0.6.0 number on Apple M was
-  0.77×; the 0.7.0 sparse-parity + SWAR refill changes do show up
-  here even though the corpus is "worst case" for the per-pixel
-  parts of the pipeline, because both optimizations also benefit
-  the dominant non-stuffed Huffman path.
-- On natural-content input `image` (jpeg-decoder) pulls further
-  ahead, ending the 0.7.0 cycle at ~0.54–0.78×. The absolute decode
-  time on our side drops by ~2× from the synthetic row to the
-  natural row — sparse IDCT and the LUT/SWAR Huffman path do fire —
-  but `image` drops by ~3× over the same corpus, so the *ratio*
-  widens rather than narrowing. The remaining gap is in the parts
-  of the entropy decoder we have not yet rewritten (combined LUT
-  coverage of edge-case symbols, AC band-loop scheduling) and in
-  the colour-convert / upsample stages that benefit more from
-  jpeg-decoder's batch shape than from ours. This is the honest
-  read; future work is queued in the 0.8.0 plan.
+- **At 4K** we are ahead of `zune-jpeg` on both microarchitectures
+  and both corpora: ~1.06–1.10× on synthetic Huffman-heavy content,
+  ~1.19–1.21× on natural-content. This is where the 0.7.5 hot-path
+  changes (entropy + dequant fusion, AVX2 PSHUFB interleave,
+  uninit-alloc) show up most cleanly — the amount of per-pixel work
+  is large enough to dominate per-decode fixed-cost overhead.
+- **At smaller resolutions** the picture is mixed on Cascade Lake.
+  At 1592×1124 / 1920×1080 we are 0.89–0.97× of `zune-jpeg`: the
+  per-decode setup (header parse + 3 plane Vec allocations + scratch
+  buffers) is a larger fraction of total time at those sizes, and
+  zune's lower setup overhead shows. Apple M's setup is itself
+  cheap enough that we lead even at smaller resolutions.
+- **vs prior cycles**: 0.6.0 was 0.41× → 0.77× on this fixture;
+  0.7.0 was 0.78× on natural 4K; 0.7.5 brings 4K to 1.19–1.21×.
+  The decoder cycle 0.6 → 0.7.5 is now closed (next cycle returns
+  to encoder work).
 
 ---
 
