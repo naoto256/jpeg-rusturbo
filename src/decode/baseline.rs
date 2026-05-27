@@ -80,16 +80,22 @@ pub fn allocate_planes(frame: &super::markers::FrameHeader) -> Vec<DecodedPlane>
         let ph = (frame.height as u32 * comp.v as u32).div_ceil(v_max as u32) as usize;
         let stride = (mcus_x as usize) * (comp.h as usize) * 8;
         let padded_height = (mcus_y as usize) * (comp.v as usize) * 8;
-        // Skip the per-decode zero-fill: every byte at indices
-        // `[0, stride * padded_height)` is overwritten by exactly one
-        // `place_block` write during the scan (the buffer is block-
-        // aligned, so the right / bottom edge blocks fully cover the
-        // padded area). For 4K 4:2:0 this saves ~12 MB of zero-fill
-        // page-fault cost per decode.
+        // Skip the per-decode zero-fill. Block-aligned coverage:
+        // every byte INSIDE the `plane_width × plane_height` image
+        // rectangle is overwritten by exactly one `place_block` write
+        // during the scan. Bytes in the stride / padded-height slack
+        // (right / bottom edges for non-aligned widths and components
+        // whose `plane_width` does not equal `stride`) may remain
+        // uninitialized — that's sound because `compose_output` only
+        // reads within `plane_width` / `plane_height` (see
+        // `decode::mod::copy_plane_row` and `upsample_chroma_row`).
+        // For 4K 4:2:0 this saves ~12 MB of zero-fill page-fault
+        // cost per decode.
         // Safety: `u8` has no validity invariants, so `set_len` on a
         // freshly allocated Vec<u8> without initialization is sound;
-        // the "fully written before read" contract above keeps it
-        // from being read-as-uninit (= no UB).
+        // soundness rests on consumers (compose_output) reading only
+        // within `plane_width` / `plane_height`, not on every byte
+        // having been written.
         let mut samples: Vec<u8> = Vec::with_capacity(stride * padded_height);
         #[allow(clippy::uninit_vec)]
         unsafe {
