@@ -635,9 +635,10 @@ fn finalize_to_planes(
             "frame component refers to undefined quant table",
         ))?;
         // See `decode::baseline::allocate_planes` for the safety
-        // argument: every byte in this buffer is written by exactly
-        // one `place_block` during finalization, so we skip the
-        // per-decode zero-fill.
+        // argument. In short: bytes inside `plane_width *
+        // plane_height` are covered by per-block `place_block`
+        // writes; bytes in the stride / padded-height slack may stay
+        // uninitialized but are never read (compose_output trims).
         let mut samples: Vec<u8> = Vec::with_capacity(stride * padded_height);
         #[allow(clippy::uninit_vec)]
         unsafe {
