@@ -222,14 +222,7 @@ pub fn decode_baseline_scan_into(
                     mcus_since_restart = 0;
                 }
                 nat_coef.fill(0);
-                decode_block_baseline(
-                    &mut br,
-                    dc_tbl,
-                    ac_tbl,
-                    qt,
-                    &mut prev_dc[0],
-                    &mut nat_coef,
-                )?;
+                decode_block_baseline(&mut br, dc_tbl, ac_tbl, qt, &mut prev_dc[0], &mut nat_coef)?;
                 let mut block = [0u8; 64];
                 arch::backend::dct::idct_islow(&nat_coef, &mut block);
                 place_block(plane, bx * 8, by * 8, &block);
