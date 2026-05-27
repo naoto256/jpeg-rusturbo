@@ -14,7 +14,15 @@ all-features = true
 [advisories]
 # Advisories are surfaced separately by cargo-audit; we let cargo-deny
 # evaluate them too so any rule mismatch shows up in both reports.
-ignore = []
+ignore = [
+    # `instant 0.1.x` is unmaintained (upstream recommends `web-time`).
+    # It reaches our graph transitively through `minifb`, which is a
+    # [dev-dependencies] entry used only by the `visual_realtime`
+    # example. It is not part of the published library and not present
+    # in any path reachable from `lib.rs`. Accept until `minifb` (or
+    # its `raw-window-handle` chain) migrates upstream.
+    { id = "RUSTSEC-2024-0384", reason = "instant 0.1.x unmaintained, minifb dev-dep transitive only" },
+]
 
 [licenses]
 allow = [
