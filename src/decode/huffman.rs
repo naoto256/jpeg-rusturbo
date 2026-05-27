@@ -439,6 +439,7 @@ pub struct FastAcDecoded {
 /// the caller must then fall back to
 /// `BitReader::decode_symbol` + `BitReader::get_bits` (and the bit
 /// buffer is left untouched so the slow path sees the same bits).
+#[inline(always)]
 pub fn decode_ac_fast(
     br: &mut BitReader,
     tbl: &FastAcHuffmanTable,
@@ -587,6 +588,7 @@ pub struct FastDcDecoded {
 /// returns `Some` on a hit (reader advanced by `total_consumed`),
 /// `Ok(None)` on a miss with the bit buffer untouched so the slow
 /// path sees the same bits.
+#[inline(always)]
 pub fn decode_dc_fast(
     br: &mut BitReader,
     tbl: &FastDcHuffmanTable,
