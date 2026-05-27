@@ -37,7 +37,6 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    #[allow(dead_code)] // used by progressive scan path (on the 0.4.0 roadmap)
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -145,7 +144,6 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read 1 bit. Used by progressive AC refine and 1-bit refinement.
-    #[allow(dead_code)] // used by progressive scan path (on the 0.4.0 roadmap)
     pub fn get_bit(&mut self) -> Result<u32> {
         self.get_bits(1)
     }
@@ -185,6 +183,49 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Expand a DHT spec into the canonical Huffman tables.
+///
+/// Returns `(huffsize, huffcode)` where `huffsize[i]` is the bit length
+/// of the `i`-th symbol and `huffcode[i]` is the canonical Huffman code
+/// for that symbol (Annex C of T.81). All three downstream builders
+/// (`HuffmanDecodeTable`, `FastAcHuffmanTable`, `FastDcHuffmanTable`)
+/// start from this output and only differ in how they fill the LUT.
+fn build_canonical_codes(spec: &HuffmanTableSpec) -> Result<(Vec<u8>, Vec<u32>)> {
+    let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
+    for (l_idx, &count) in spec.bits.iter().enumerate() {
+        for _ in 0..count {
+            huffsize.push((l_idx + 1) as u8);
+        }
+    }
+    if huffsize.len() != spec.values.len() {
+        return Err(DecodeError::Malformed("DHT bits/values mismatch"));
+    }
+    if huffsize.is_empty() {
+        return Err(DecodeError::Malformed("empty DHT table"));
+    }
+
+    let mut huffcode: Vec<u32> = Vec::with_capacity(huffsize.len());
+    let mut code: u32 = 0;
+    let mut si = huffsize[0] as u32;
+    let mut p = 0usize;
+    loop {
+        while p < huffsize.len() && (huffsize[p] as u32) == si {
+            huffcode.push(code);
+            code = code.wrapping_add(1);
+            p += 1;
+        }
+        if p == huffsize.len() {
+            break;
+        }
+        while (huffsize[p] as u32) != si {
+            code <<= 1;
+            si += 1;
+        }
+    }
+
+    Ok((huffsize, huffcode))
+}
+
 /// Decode-side Huffman lookup table.
 pub struct HuffmanDecodeTable {
     /// 8-bit fast LUT. `look[next_8_bits] = (length << 8) | symbol`,
@@ -203,42 +244,9 @@ pub struct HuffmanDecodeTable {
 
 impl HuffmanDecodeTable {
     pub fn from_spec(spec: &HuffmanTableSpec) -> Result<Self> {
-        // 1. Build huffsize[]: per-symbol code length.
-        let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
-        for (l_idx, &count) in spec.bits.iter().enumerate() {
-            for _ in 0..count {
-                huffsize.push((l_idx + 1) as u8);
-            }
-        }
-        if huffsize.len() != spec.values.len() {
-            return Err(DecodeError::Malformed("DHT bits/values mismatch"));
-        }
-        if huffsize.is_empty() {
-            return Err(DecodeError::Malformed("empty DHT table"));
-        }
+        let (_huffsize, huffcode) = build_canonical_codes(spec)?;
 
-        // 2. Build huffcode[]: canonical Huffman code per symbol.
-        let mut huffcode: Vec<u32> = Vec::with_capacity(huffsize.len());
-        let mut code: u32 = 0;
-        let mut si = huffsize[0] as u32;
-        let mut p = 0usize;
-        loop {
-            while p < huffsize.len() && (huffsize[p] as u32) == si {
-                huffcode.push(code);
-                code = code.wrapping_add(1);
-                p += 1;
-            }
-            if p == huffsize.len() {
-                break;
-            }
-            // Bump length until we match the next group's size.
-            while (huffsize[p] as u32) != si {
-                code <<= 1;
-                si += 1;
-            }
-        }
-
-        // 3. Build the 8-bit fast LUT.
+        // Build the 8-bit fast LUT.
         let mut look = [0u16; 256];
         let mut p_fast = 0usize;
         for l in 1..=8usize {
@@ -355,41 +363,9 @@ impl FastAcHuffmanTable {
     /// slots prefixed by [code | every magnitude variant | every
     /// don't-care tail] with the same packed entry.
     pub fn from_spec(spec: &HuffmanTableSpec) -> Result<Self> {
-        // 1. huffsize: per-symbol code length.
-        let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
-        for (l_idx, &count) in spec.bits.iter().enumerate() {
-            for _ in 0..count {
-                huffsize.push((l_idx + 1) as u8);
-            }
-        }
-        if huffsize.len() != spec.values.len() {
-            return Err(DecodeError::Malformed("DHT bits/values mismatch"));
-        }
-        if huffsize.is_empty() {
-            return Err(DecodeError::Malformed("empty DHT table"));
-        }
+        let (huffsize, huffcode) = build_canonical_codes(spec)?;
 
-        // 2. huffcode: canonical Huffman code per symbol.
-        let mut huffcode: Vec<u32> = Vec::with_capacity(huffsize.len());
-        let mut code: u32 = 0;
-        let mut si = huffsize[0] as u32;
-        let mut p = 0usize;
-        loop {
-            while p < huffsize.len() && (huffsize[p] as u32) == si {
-                huffcode.push(code);
-                code = code.wrapping_add(1);
-                p += 1;
-            }
-            if p == huffsize.len() {
-                break;
-            }
-            while (huffsize[p] as u32) != si {
-                code <<= 1;
-                si += 1;
-            }
-        }
-
-        // 3. Fill the LUT. Codes whose length itself exceeds
+        // Fill the LUT. Codes whose length itself exceeds
         // PEEK_WIDTH, and codes where code_length + size exceeds
         // PEEK_WIDTH, are left at valid=0 — the canonical Huffman
         // prefix property guarantees their LUT slots don't collide
@@ -558,41 +534,9 @@ impl FastDcHuffmanTable {
     /// Build from a DHT spec (DC class). Mirrors `FastAcHuffmanTable::from_spec`
     /// but treats the symbol byte as the magnitude bit count directly.
     pub fn from_spec(spec: &HuffmanTableSpec) -> Result<Self> {
-        // 1. huffsize: per-symbol code length.
-        let mut huffsize: Vec<u8> = Vec::with_capacity(spec.values.len());
-        for (l_idx, &count) in spec.bits.iter().enumerate() {
-            for _ in 0..count {
-                huffsize.push((l_idx + 1) as u8);
-            }
-        }
-        if huffsize.len() != spec.values.len() {
-            return Err(DecodeError::Malformed("DHT bits/values mismatch"));
-        }
-        if huffsize.is_empty() {
-            return Err(DecodeError::Malformed("empty DHT table"));
-        }
+        let (huffsize, huffcode) = build_canonical_codes(spec)?;
 
-        // 2. huffcode: canonical Huffman code per symbol.
-        let mut huffcode: Vec<u32> = Vec::with_capacity(huffsize.len());
-        let mut code: u32 = 0;
-        let mut si = huffsize[0] as u32;
-        let mut p = 0usize;
-        loop {
-            while p < huffsize.len() && (huffsize[p] as u32) == si {
-                huffcode.push(code);
-                code = code.wrapping_add(1);
-                p += 1;
-            }
-            if p == huffsize.len() {
-                break;
-            }
-            while (huffsize[p] as u32) != si {
-                code <<= 1;
-                si += 1;
-            }
-        }
-
-        // 3. Fill the LUT. Symbols whose code_length exceeds PEEK_WIDTH,
+        // Fill the LUT. Symbols whose code_length exceeds PEEK_WIDTH,
         // or whose code_length + size exceeds it, are left at valid=0
         // (the canonical prefix property keeps those slots collision-free).
         let mut lut = Box::new([FastDcEntry::INVALID; FAST_DC_LUT_SIZE]);
