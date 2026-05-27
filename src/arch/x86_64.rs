@@ -743,18 +743,107 @@ pub mod color {
         layout: PixelLayout,
     ) {
         unsafe {
-            let mut rb = [0u8; 16];
-            let mut gb = [0u8; 16];
-            let mut bb = [0u8; 16];
-            _mm_storeu_si128(rb.as_mut_ptr() as *mut __m128i, r);
-            _mm_storeu_si128(gb.as_mut_ptr() as *mut __m128i, g);
-            _mm_storeu_si128(bb.as_mut_ptr() as *mut __m128i, b);
-            for i in 0..16 {
-                let p = out.add(i * 3);
-                *p.add(layout.r_off) = rb[i];
-                *p.add(layout.g_off) = gb[i];
-                *p.add(layout.b_off) = bb[i];
-            }
+            // Map r/g/b into (c0, c1, c2) = the three output channel
+            // positions in interleave order (= byte 0, 1, 2 of each
+            // pixel). For RGB layout: c0=r, c1=g, c2=b. For BGR: c0=b,
+            // c1=g, c2=r. (layout.r_off / g_off / b_off ∈ {0,1,2} and
+            // sum to 3.)
+            let mut slot = [r; 3];
+            slot[layout.r_off] = r;
+            slot[layout.g_off] = g;
+            slot[layout.b_off] = b;
+            store_block16_interleaved_ssse3(slot[0], slot[1], slot[2], out);
+        }
+    }
+
+    /// PSHUFB-based 3-byte interleave for 16 pixels (= 48 bytes).
+    ///
+    /// Given three xmm inputs `c0, c1, c2` (= the first/second/third
+    /// byte of each pixel in the final layout), writes 48 contiguous
+    /// bytes to `out` such that pixel `i` occupies bytes
+    /// `[3*i, 3*i+3)` and pixel-byte `j` ∈ {0,1,2} is `c{j}[i]`.
+    ///
+    /// Replaces a 16-iter scalar interleave loop (= 48 VPEXTRBs +
+    /// 48 byte stores) with 9 PSHUFB + 6 POR + 3 16-byte stores.
+    /// On Cascade Lake (Skylake-SP family) this lifts the channel
+    /// interleave from ~15% of `ycc_bulk_avx2` self-time down to
+    /// near-zero.
+    ///
+    /// # Safety
+    /// - SSSE3 must be available (PSHUFB). Caller is gated by AVX2,
+    ///   which implies SSSE3.
+    /// - `out` must be writable for 48 bytes.
+    #[inline(always)]
+    unsafe fn store_block16_interleaved_ssse3(
+        c0: __m128i,
+        c1: __m128i,
+        c2: __m128i,
+        out: *mut u8,
+    ) {
+        unsafe {
+            // Shuffle masks: PSHUFB picks source byte at the index given
+            // in the mask byte, or zeros the lane when the high bit is
+            // set (0x80 sentinel). Each output 16-byte chunk takes 6
+            // bytes from one channel and 5 from each of the other two.
+            //
+            // out0 = [c0_0 c1_0 c2_0 c0_1 c1_1 c2_1 ... c0_5]
+            //                                       ^ byte 15
+            // out1 = [c1_5 c2_5 c0_6 c1_6 c2_6 c0_7 ... c1_10]
+            // out2 = [c2_10 c0_11 c1_11 c2_11 ... c1_15 c2_15]
+            const M0_C0: [i8; 16] = [
+                0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5,
+            ];
+            const M0_C1: [i8; 16] = [
+                -1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1,
+            ];
+            const M0_C2: [i8; 16] = [
+                -1, -1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1,
+            ];
+            const M1_C0: [i8; 16] = [
+                -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10, -1,
+            ];
+            const M1_C1: [i8; 16] = [
+                5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10,
+            ];
+            const M1_C2: [i8; 16] = [
+                -1, 5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1,
+            ];
+            const M2_C0: [i8; 16] = [
+                -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1,
+            ];
+            const M2_C1: [i8; 16] = [
+                -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1,
+            ];
+            const M2_C2: [i8; 16] = [
+                10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15,
+            ];
+
+            let m0_c0 = _mm_loadu_si128(M0_C0.as_ptr() as *const __m128i);
+            let m0_c1 = _mm_loadu_si128(M0_C1.as_ptr() as *const __m128i);
+            let m0_c2 = _mm_loadu_si128(M0_C2.as_ptr() as *const __m128i);
+            let m1_c0 = _mm_loadu_si128(M1_C0.as_ptr() as *const __m128i);
+            let m1_c1 = _mm_loadu_si128(M1_C1.as_ptr() as *const __m128i);
+            let m1_c2 = _mm_loadu_si128(M1_C2.as_ptr() as *const __m128i);
+            let m2_c0 = _mm_loadu_si128(M2_C0.as_ptr() as *const __m128i);
+            let m2_c1 = _mm_loadu_si128(M2_C1.as_ptr() as *const __m128i);
+            let m2_c2 = _mm_loadu_si128(M2_C2.as_ptr() as *const __m128i);
+
+            let out0 = _mm_or_si128(
+                _mm_or_si128(_mm_shuffle_epi8(c0, m0_c0), _mm_shuffle_epi8(c1, m0_c1)),
+                _mm_shuffle_epi8(c2, m0_c2),
+            );
+            let out1 = _mm_or_si128(
+                _mm_or_si128(_mm_shuffle_epi8(c0, m1_c0), _mm_shuffle_epi8(c1, m1_c1)),
+                _mm_shuffle_epi8(c2, m1_c2),
+            );
+            let out2 = _mm_or_si128(
+                _mm_or_si128(_mm_shuffle_epi8(c0, m2_c0), _mm_shuffle_epi8(c1, m2_c1)),
+                _mm_shuffle_epi8(c2, m2_c2),
+            );
+
+            _mm_storeu_si128(out as *mut __m128i, out0);
+            _mm_storeu_si128(out.add(16) as *mut __m128i, out1);
+            _mm_storeu_si128(out.add(32) as *mut __m128i, out2);
         }
     }
 }
