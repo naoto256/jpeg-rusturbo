@@ -17,7 +17,7 @@ cargo run --release --features force-scalar --bin bench -- --section all  # scal
 cargo test  --release --test comparison_bench -- --ignored --nocapture    # vs image crate
 ```
 
-## Hosts (0.7.0)
+## Hosts
 
 | Label                | CPU                                       | Cores | SIMD floor       |
 | -------------------- | ----------------------------------------- | ----- | ---------------- |
