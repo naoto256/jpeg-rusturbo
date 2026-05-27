@@ -1,33 +1,55 @@
 # Architecture
 
-`jpeg-rusturbo` is a baseline JPEG encoder. The public surface is
-small (`JpegEncoder`, `ChromaSubsampling`); the rest of the crate is
-the encoding pipeline plus per-architecture kernel backends.
+`jpeg-rusturbo` is a baseline JPEG encoder + baseline-and-progressive
+decoder. The public surface stays small (`JpegEncoder` /
+`ChromaSubsampling` on the encode side, `Decoder` / `decode` /
+`PixelFormat` / `ImageInfo` on the decode side); the rest of the
+crate is the encode + decode pipelines plus per-architecture kernel
+backends shared between them.
 
 ## File layout
 
 ```
 src/
-├── lib.rs          — public API (JpegEncoder), pipeline orchestration,
-│                     SamplingScheme trait + Yuv444/Yuv420 impls
-├── color.rs        — block / MCU extraction with edge replication
-├── quant.rs        — Divisors, build_divisors, compute_reciprocal,
-│                     zig-zag wrapper around the kernel
-├── huffman.rs      — HuffmanTable, BitWriter, encode_block,
-│                     magnitude_category
-├── markers.rs      — JPEG segment writers (SOI, APP0, DQT, SOF0,
-│                     DHT, SOS, EOI)
-├── tables.rs       — JPEG Annex K standard tables (luma/chroma
-│                     quant, luma/chroma DC/AC Huffman, ZIGZAG)
+├── lib.rs                  — public API (JpegEncoder, PixelFormat),
+│                             encode-side pipeline orchestration,
+│                             SamplingScheme trait + Yuv444 / Yuv422 /
+│                             Yuv420 / Yuv411 / Yuv440 impls
+├── color.rs                — block / MCU extraction with edge replication
+├── quant.rs                — Divisors, build_divisors,
+│                             compute_reciprocal, zig-zag wrapper
+├── huffman.rs              — HuffmanTable, BitWriter, encode_block,
+│                             magnitude_category (encode side)
+├── huffman_optimize.rs     — two-pass optimized Huffman table builder
+├── markers.rs              — JPEG segment writers (SOI, APP0, DQT,
+│                             SOF0, DHT, SOS, EOI)
+├── tables.rs               — JPEG Annex K standard tables + ZIGZAG
+├── decode/
+│   ├── mod.rs              — public Decoder + decode() entry points,
+│   │                         compose_output (plane → RGB)
+│   ├── baseline.rs         — baseline Huffman scan + dequant + IDCT
+│   ├── progressive.rs      — progressive (multi-scan) decode
+│   ├── huffman.rs          — BitReader, HuffmanDecodeTable, combined
+│   │                         AC/DC LUTs, SWAR refill
+│   ├── markers.rs          — JPEG marker parser (header chain)
+│   └── error.rs            — DecodeError / Result
 ├── arch/
-│   ├── mod.rs      — cfg dispatch hub, picks the active backend
-│   ├── scalar.rs   — bit-exact scalar reference for all four hot
-│   │                 kernels (always compiled)
-│   ├── neon.rs     — AArch64 NEON kernels (compiled on aarch64)
-│   └── x86_64.rs   — x86_64 AVX2 kernels (compiled on x86_64)
-└── bin/bench.rs    — tiny benchmark harness used to produce
-                      BENCH.md numbers
+│   ├── mod.rs              — cfg dispatch hub, picks the active backend
+│   ├── scalar.rs           — bit-exact scalar reference for every
+│   │                         hot kernel (always compiled)
+│   ├── neon.rs             — AArch64 NEON kernels (compiled on aarch64)
+│   └── x86_64.rs           — x86_64 AVX2 kernels (compiled on x86_64)
+└── bin/bench.rs            — bench harness used to produce BENCH.md
 ```
+
+Each `arch::<backend>` exposes five inline modules — `color`, `dct`,
+`quant`, `huffman`, `sample` — with bit-exact-equivalent signatures
+to `arch::scalar`. `sample` hosts chroma upsample / downsample
+kernels (e.g. `h2v2_fancy_vblend`, `h2_fancy_upsample`,
+`h2v2_downsample`). The decoder uses `dct::idct_islow` + `color::
+ycc_row_to_rgb` + `sample::*` upsample; the encoder uses
+`dct::fdct_islow` + `color::rgb_row_to_ycc` + `sample::*` downsample
++ `quant::quantize_natural` + `huffman::group_of_8_is_zero`.
 
 ## Encode pipeline
 
@@ -57,10 +79,13 @@ DQT / SOF0 / DHT / SOS), then dispatches the entropy-coded segment to
 the right `SamplingScheme` impl. After the scan it flushes the
 bitwriter and writes EOI.
 
-The four hot kernels live behind `arch::backend::*` and are
-addressed by name: `color::rgb_row_to_ycc`, `color::h2v2_downsample`,
-`dct::fdct_islow`, `quant::quantize_natural`,
-`huffman::group_of_8_is_zero`. Each backend implementation is
+The hot kernels live behind `arch::backend::*` and are addressed
+by name: `color::rgb_row_to_ycc`, `color::ycc_row_to_rgb` (decoder
+counterpart), `dct::fdct_islow`, `dct::idct_islow` (decoder
+counterpart), `quant::quantize_natural`,
+`huffman::group_of_8_is_zero`, `sample::h2v2_downsample` /
+`sample::h2v2_fancy_vblend` / `sample::h2_fancy_upsample`. Each
+backend implementation is
 internally stand-alone — no shared trait — but they all expose the
 same function signatures, and cross-check tests in `arch::neon::tests`
 and `arch::x86_64::tests` assert bit-exact equality with the scalar
@@ -94,9 +119,10 @@ result is cached on first call.
 
 ## Subsampling dispatch
 
-`ChromaSubsampling` is an enum (`Yuv444`, `Yuv420`); each variant has
-a corresponding zero-sized scheme type implementing the
-`SamplingScheme` trait:
+`ChromaSubsampling` is an enum spanning the five baseline-JPEG
+sampling layouts the encoder produces (`Yuv444`, `Yuv422`, `Yuv420`,
+`Yuv411`, `Yuv440`); each variant has a corresponding zero-sized
+scheme type implementing the `SamplingScheme` trait:
 
 ```rust
 trait SamplingScheme {
@@ -108,22 +134,21 @@ trait SamplingScheme {
 ```
 
 `encode_scan<S: SamplingScheme>` is generic over the scheme and
-collapses what used to be two near-duplicate `encode_scan_NNN`
-functions into one MCU loop. Adding a new scheme — 4:2:2 (h2v1) is
-the realistic next one — is:
+collapses what would have been five near-duplicate `encode_scan_NNN`
+functions into one MCU loop. Adding a new scheme is:
 
-1. `impl SamplingScheme for Yuv422Scheme { ... }`
-2. `ChromaSubsampling::Yuv422` variant
+1. `impl SamplingScheme for Yuv<NNN>Scheme { ... }`
+2. `ChromaSubsampling::Yuv<NNN>` variant
 3. one match arm in each of the two dispatch sites (SOF0 + scan)
-4. an `extract_mcu_422` analog of `extract_mcu_420` in `color.rs`
+4. an `extract_mcu_NNN` analog of `extract_mcu_420` in `color.rs`
 
 …with no edits to the scan loop itself.
 
 ## Adding a new arch backend
 
-1. Create `src/arch/<name>.rs` with four inline modules — `color`,
-   `dct`, `quant`, `huffman` — each exposing the same kernel
-   functions named in `arch::scalar`. Use
+1. Create `src/arch/<name>.rs` with five inline modules — `color`,
+   `dct`, `quant`, `huffman`, `sample` — each exposing the same
+   kernel functions named in `arch::scalar`. Use
    `pub use crate::arch::scalar::<kernel>::*;` for any kernel you
    don't override.
 2. Declare the module in `arch/mod.rs` under the appropriate
@@ -176,10 +201,16 @@ backend the host can reach.
 | Want to change … | File |
 |---|---|
 | Quality scaling, standard tables | `src/tables.rs` |
-| MCU iteration, scan-level dispatch | `src/lib.rs` |
+| Encode MCU iteration, scan-level dispatch | `src/lib.rs` |
 | 8x8 / 16x16 block extraction, padding, level shift | `src/color.rs` |
 | Quant divisor construction (`compute_reciprocal`) | `src/quant.rs` |
-| Bit-stuffing, byte-stuffing, Huffman emission | `src/huffman.rs` |
-| Per-arch hot kernels | `src/arch/{scalar,neon,x86_64}.rs` |
-| JPEG segment headers | `src/markers.rs` |
+| Encode-side bit-stuffing, byte-stuffing, Huffman emission | `src/huffman.rs` |
+| Two-pass optimized Huffman table builder | `src/huffman_optimize.rs` |
+| Decode entry points (`Decoder`, `decode`) | `src/decode/mod.rs` |
+| Baseline scan, dequant fusion, IDCT dispatch | `src/decode/baseline.rs` |
+| Progressive (multi-scan) decode | `src/decode/progressive.rs` |
+| Decode-side BitReader, combined AC/DC LUTs, SWAR refill | `src/decode/huffman.rs` |
+| Header chain parser (SOI / DQT / DHT / SOF / SOS / EOI) | `src/decode/markers.rs` |
+| Per-arch hot kernels (5 modules: color / dct / quant / huffman / sample) | `src/arch/{scalar,neon,x86_64}.rs` |
+| JPEG segment writers (encode side) | `src/markers.rs` |
 | Benchmark harness output / labels | `src/bin/bench.rs` |

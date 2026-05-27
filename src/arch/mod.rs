@@ -1,8 +1,12 @@
 //! Per-architecture kernels.
 //!
 //! Each backend submodule (`scalar`, `neon`, `x86_64`) re-exports the
-//! same set of inner modules — `color`, `dct`, `quant`, `huffman` —
-//! with bit-exact-equivalent function signatures. The crate as a whole
+//! same set of inner modules — `color`, `dct`, `quant`, `huffman`,
+//! `sample` — with bit-exact-equivalent function signatures. The
+//! `sample` module hosts the chroma-upsample / -downsample kernels
+//! (`h2v2_fancy_vblend`, `h2_fancy_upsample`, etc.); it joined the
+//! backend lineup with the decode-side SIMD work in 0.6.0. The crate
+//! as a whole
 //! talks to `arch::backend::*`, which is an alias for the active
 //! backend selected at compile time.
 //!
@@ -19,10 +23,11 @@
 //!
 //! ## Adding a new backend
 //!
-//! 1. Create `arch/<name>.rs` with four inline modules (`color`, `dct`,
-//!    `quant`, `huffman`), each exposing the kernel functions named in
-//!    `arch::scalar` (use `pub use crate::arch::scalar::<kernel>::*;`
-//!    for any kernel you don't override).
+//! 1. Create `arch/<name>.rs` with five inline modules (`color`,
+//!    `dct`, `quant`, `huffman`, `sample`), each exposing the kernel
+//!    functions named in `arch::scalar` (use
+//!    `pub use crate::arch::scalar::<kernel>::*;` for any kernel you
+//!    don't override).
 //! 2. Declare the module here under the appropriate `#[cfg(target_arch
 //!    = "...")]` gate.
 //! 3. Add a `pub use <name> as backend;` cfg arm so it gets selected.
