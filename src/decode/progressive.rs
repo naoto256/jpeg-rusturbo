@@ -634,7 +634,15 @@ fn finalize_to_planes(
         let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
             "frame component refers to undefined quant table",
         ))?;
-        let mut samples = vec![0u8; stride * padded_height];
+        // See `decode::baseline::allocate_planes` for the safety
+        // argument: every byte in this buffer is written by exactly
+        // one `place_block` during finalization, so we skip the
+        // per-decode zero-fill.
+        let mut samples: Vec<u8> = Vec::with_capacity(stride * padded_height);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            samples.set_len(stride * padded_height);
+        }
 
         let mut nat_coef = [0i16; 64];
         let mut block = [0u8; 64];
