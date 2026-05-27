@@ -94,8 +94,8 @@ pub mod color {
 
     /// Box-upsample 8x8 chroma into 16x16 by 2x replication in both
     /// axes. Pairs with [`h2v2_downsample`] on the encoder side but
-    /// is intentionally a simple nearest-neighbor expansion — fancy
-    /// (interpolating) upsample is on the roadmap.
+    /// is intentionally a simple nearest-neighbor expansion. Fancy
+    /// (interpolating) upsample is not implemented.
     pub fn h2v2_upsample(src: &[u8; 64], dst: &mut [u8; 256]) {
         for j in 0..8 {
             for i in 0..8 {
