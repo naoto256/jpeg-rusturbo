@@ -145,7 +145,6 @@ pub fn decode_baseline_scan_into(
     let restart_interval = headers.restart_interval as u32;
     let mut mcus_since_restart: u32 = 0;
     let mut expected_rst: u8 = 0;
-    let mut zz_coef = [0i16; 64];
     let mut nat_coef = [0i16; 64];
 
     if scan.components.len() > 1 {
@@ -169,18 +168,15 @@ pub fn decode_baseline_scan_into(
                     ))?;
                     for v_block in 0..(comp.v as u32) {
                         for h_block in 0..(comp.h as u32) {
-                            zz_coef.fill(0);
+                            nat_coef.fill(0);
                             decode_block_baseline(
                                 &mut br,
                                 dc_tbl,
                                 ac_tbl,
+                                qt,
                                 &mut prev_dc[scan_idx],
-                                &mut zz_coef,
+                                &mut nat_coef,
                             )?;
-                            for k in 0..64 {
-                                nat_coef[ZIGZAG[k]] =
-                                    zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
-                            }
                             let mut block = [0u8; 64];
                             arch::backend::dct::idct_islow(&nat_coef, &mut block);
                             let base_x = (mx * comp.h as u32 + h_block) as usize * 8;
@@ -225,11 +221,15 @@ pub fn decode_baseline_scan_into(
                     handle_restart(&mut br, &mut prev_dc, &mut expected_rst)?;
                     mcus_since_restart = 0;
                 }
-                zz_coef.fill(0);
-                decode_block_baseline(&mut br, dc_tbl, ac_tbl, &mut prev_dc[0], &mut zz_coef)?;
-                for k in 0..64 {
-                    nat_coef[ZIGZAG[k]] = zz_coef[k].wrapping_mul(qt.values[ZIGZAG[k]] as i16);
-                }
+                nat_coef.fill(0);
+                decode_block_baseline(
+                    &mut br,
+                    dc_tbl,
+                    ac_tbl,
+                    qt,
+                    &mut prev_dc[0],
+                    &mut nat_coef,
+                )?;
                 let mut block = [0u8; 64];
                 arch::backend::dct::idct_islow(&nat_coef, &mut block);
                 place_block(plane, bx * 8, by * 8, &block);
@@ -296,14 +296,27 @@ pub fn decode_baseline_multi(
     })
 }
 
-/// Decode the next 8x8 block in zig-zag order into `zz`. `prev_dc` is
-/// updated to the new DC predictor on exit.
+/// Decode the next 8x8 block and write the dequantized natural-order
+/// coefficients into `nat_coef`. `prev_dc` is updated on exit.
+///
+/// Caller must zero `nat_coef` before each call — only non-zero
+/// positions are written here (the entropy stream's RLE structure
+/// skips runs of zero coefficients, and writing them again would just
+/// re-zero something we already pre-zeroed).
+///
+/// Fusing dequant into entropy decode eliminates the intermediate
+/// `zz_coef` buffer and the separate `for k in 0..64` dequant loop:
+/// each AC magnitude flows directly into `nat_coef[ZIGZAG[k]]`
+/// pre-multiplied by `qt.values[ZIGZAG[k]]`. On natural-content the
+/// AC scan terminates early (EOB), so the dequant loop's 64-iter
+/// constant cost disappears entirely on sparse blocks.
 fn decode_block_baseline(
     br: &mut BitReader,
     dc_tbl: &DcTablePair,
     ac_tbl: &AcTablePair,
+    qt: &QuantTable,
     prev_dc: &mut i32,
-    zz: &mut [i16; 64],
+    nat_coef: &mut [i16; 64],
 ) -> Result<()> {
     // ---- DC term ----
     // Try the combined DC LUT first; on a miss the bit buffer is
@@ -325,7 +338,8 @@ fn decode_block_baseline(
         extend(dc_bits, dc_size)
     };
     *prev_dc = prev_dc.wrapping_add(dc_diff);
-    zz[0] = (*prev_dc) as i16;
+    // ZIGZAG[0] = 0; DC always lands at natural position 0.
+    nat_coef[0] = (*prev_dc as i16).wrapping_mul(qt.values[0] as i16);
 
     // ---- AC terms ----
     // Try the combined LUT first; on a miss the bit buffer is
@@ -359,7 +373,9 @@ fn decode_block_baseline(
         if k >= 64 {
             return Err(DecodeError::Malformed("AC run exceeded block"));
         }
-        zz[k] = extend(mag_raw, size) as i16;
+        let mag = extend(mag_raw, size) as i16;
+        let nat_idx = ZIGZAG[k];
+        nat_coef[nat_idx] = mag.wrapping_mul(qt.values[nat_idx] as i16);
         k += 1;
     }
     Ok(())
