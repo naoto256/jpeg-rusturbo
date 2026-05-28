@@ -101,7 +101,11 @@ fn progressive_emits_sof2_and_full_sa_scan_plan() {
     let sof0_count = segs.iter().filter(|(m, _)| *m == 0xC0).count();
     assert_eq!(sof2_count, 1, "expected one SOF2");
     assert_eq!(sof0_count, 0, "SOF0 should be absent in progressive output");
-    assert_eq!(count_sos(&out), 8, "expected 8 SOS segments for SA scan plan");
+    assert_eq!(
+        count_sos(&out),
+        8,
+        "expected 8 SOS segments for SA scan plan"
+    );
 }
 
 #[test]
@@ -113,7 +117,8 @@ fn progressive_decodes_via_self_decoder() {
         enc.set_progressive(true);
         enc.encode_rgb(&pixels, 128, 96).unwrap();
     }
-    let decoded = decode::decode(&out, PixelFormat::Rgb).expect("self-decoder rejected progressive output");
+    let decoded =
+        decode::decode(&out, PixelFormat::Rgb).expect("self-decoder rejected progressive output");
     assert_eq!(decoded.len(), pixels.len());
     let p = psnr(&pixels, &decoded);
     assert!(p > 33.0, "progressive roundtrip PSNR too low: {p:.2}");
@@ -187,7 +192,13 @@ fn baseline_unchanged_when_progressive_off() {
         enc.encode_rgb(&pixels, 32, 32).unwrap();
     }
     let segs = collect_marker_segments(&out);
-    assert!(segs.iter().any(|(m, _)| *m == 0xC0), "expected SOF0 in baseline output");
-    assert!(!segs.iter().any(|(m, _)| *m == 0xC2), "SOF2 leaked into baseline output");
+    assert!(
+        segs.iter().any(|(m, _)| *m == 0xC0),
+        "expected SOF0 in baseline output"
+    );
+    assert!(
+        !segs.iter().any(|(m, _)| *m == 0xC2),
+        "SOF2 leaked into baseline output"
+    );
     assert_eq!(count_sos(&out), 1, "baseline should emit exactly one SOS");
 }
