@@ -546,6 +546,23 @@ pub mod quant {
         }
     }
 
+    /// Permute `natural` (DCT natural order) into `zz` (zig-zag order).
+    /// Reference scalar form; SIMD backends override with a permutation
+    /// kernel.
+    ///
+    /// `get_unchecked` drops the per-iteration bounds check that LLVM
+    /// cannot prove away (ZIGZAG is `const [usize; 64]`, not a refined
+    /// index type). Safety: every ZIGZAG entry is `< 64`, verified by
+    /// `tables::tests`.
+    pub fn zigzag_scatter(natural: &[i16; 64], zz: &mut [i16; 64]) {
+        use crate::tables::ZIGZAG;
+        for k in 0..64 {
+            unsafe {
+                *zz.get_unchecked_mut(k) = *natural.get_unchecked(*ZIGZAG.get_unchecked(k));
+            }
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn quantize_one(temp: i16, recip: u16, corr: u16, shift: i16) -> i16 {
         let neg = temp < 0;
