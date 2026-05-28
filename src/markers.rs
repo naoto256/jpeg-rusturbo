@@ -185,6 +185,24 @@ pub fn write_dri<W: Write>(w: &mut W, interval: u16) -> io::Result<()> {
 ///
 /// `components` items: (component id, dc_tab_id, ac_tab_id).
 pub fn write_sos<W: Write>(w: &mut W, components: &[(u8, u8, u8)]) -> io::Result<()> {
+    // Baseline sequential: full spectral range 0..=63 with no
+    // successive approximation.
+    write_sos_spectral(w, components, 0, 63, 0, 0)
+}
+
+/// SOS for progressive-mode scans. Identical framing to
+/// [`write_sos`], but the trailing 3 bytes carry the scan's spectral
+/// selection (Ss..Se) and successive approximation (Ah / Al). See
+/// T.81 G.2 — the same MCU-ordering rules apply, but each scan emits
+/// only a sub-band or refines a previously-sent sub-band.
+pub fn write_sos_spectral<W: Write>(
+    w: &mut W,
+    components: &[(u8, u8, u8)],
+    ss: u8,
+    se: u8,
+    ah: u8,
+    al: u8,
+) -> io::Result<()> {
     w.write_all(&[0xFF, 0xDA])?;
     let n = components.len() as u16;
     write_be_u16(w, 6 + 2 * n)?;
@@ -192,8 +210,29 @@ pub fn write_sos<W: Write>(w: &mut W, components: &[(u8, u8, u8)]) -> io::Result
     for &(id, dc, ac) in components {
         w.write_all(&[id, ((dc & 0xF) << 4) | (ac & 0xF)])?;
     }
-    // Spectral selection start/end + successive approximation: fixed
-    // values for baseline sequential.
-    w.write_all(&[0, 63, 0])?;
+    w.write_all(&[ss, se, ((ah & 0xF) << 4) | (al & 0xF)])?;
+    Ok(())
+}
+
+/// SOF2 — Start Of Frame, progressive DCT. Same layout as
+/// [`write_sof0`] except for the marker byte (0xC2 instead of 0xC0);
+/// the decoder uses the marker to know whether to expect one scan
+/// (sequential) or many (progressive).
+pub fn write_sof2<W: Write>(
+    w: &mut W,
+    width: u16,
+    height: u16,
+    components: &[(u8, u8, u8, u8)],
+) -> io::Result<()> {
+    w.write_all(&[0xFF, 0xC2])?;
+    let n = components.len() as u16;
+    write_be_u16(w, 8 + 3 * n)?;
+    w.write_all(&[8])?;
+    write_be_u16(w, height)?;
+    write_be_u16(w, width)?;
+    w.write_all(&[n as u8])?;
+    for &(id, h, v, tq) in components {
+        w.write_all(&[id, ((h & 0xF) << 4) | (v & 0xF), tq])?;
+    }
     Ok(())
 }
