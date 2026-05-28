@@ -143,6 +143,7 @@ pub mod decode;
 mod huffman;
 mod huffman_optimize;
 mod markers;
+mod progressive_encode;
 mod quant;
 mod tables;
 
@@ -291,6 +292,7 @@ pub struct JpegEncoder<W: Write> {
     restart_interval: u16,
     custom_quant: Option<QuantPair>,
     optimize_huffman: bool,
+    progressive: bool,
     threads: u32,
     exif: Option<Vec<u8>>,
     icc_profile: Option<Vec<u8>>,
@@ -315,6 +317,7 @@ impl<W: Write> JpegEncoder<W> {
             restart_interval: 0,
             custom_quant: None,
             optimize_huffman: false,
+            progressive: false,
             threads: 1,
             exif: None,
             icc_profile: None,
@@ -447,6 +450,31 @@ impl<W: Write> JpegEncoder<W> {
         self.icc_profile = icc;
     }
 
+    /// Emit a **progressive** JPEG (SOF2) instead of the default
+    /// baseline (SOF0). Progressive splits the entropy-coded segment
+    /// into multiple scans that each carry a sub-band of every
+    /// block's coefficients — a conforming decoder can render a
+    /// coarse "DC-only" preview as soon as the first scan finishes,
+    /// then refine as later scans arrive. This is the standard JPEG
+    /// shape for slow-network photo delivery (browsers, image
+    /// galleries).
+    ///
+    /// This first cut ships a four-scan **spectral** plan: DC of all
+    /// three components interleaved, then per-component AC at full
+    /// precision. Successive-approximation refinement (which trades
+    /// scan count for additional ~5-10% file-size reduction and
+    /// smoother progressive rendering) is a follow-up; the output is
+    /// already valid progressive JPEG without it.
+    ///
+    /// Mutually exclusive with the optimized-Huffman two-pass path —
+    /// when both are set, progressive wins (the optimized-Huffman
+    /// path doesn't yet know how to build per-scan tables). Default
+    /// is `false` (= baseline SOF0, byte-identical to a build that
+    /// doesn't know about this setter).
+    pub fn set_progressive(&mut self, on: bool) {
+        self.progressive = on;
+    }
+
     /// Encode an RGB pixel buffer (3 bytes/pixel) as a complete JPEG
     /// stream into the sink.
     ///
@@ -549,6 +577,15 @@ impl<W: Write> JpegEncoder<W> {
         };
         let div_luma = quant::build_divisors(&luma_q);
         let div_chroma = quant::build_divisors(&chroma_q);
+
+        // Progressive (SOF2) takes precedence — it ships its own
+        // SOI..EOI shape with multi-scan entropy. Optimized Huffman
+        // for progressive is a follow-up.
+        if self.progressive {
+            return progressive_encode::encode_progressive_inner(
+                self, pixels, width, height, layout, &div_luma, &div_chroma,
+            );
+        }
 
         // Optimized Huffman: run a separate two-pass entry point.
         // Returns once it has produced a complete stream (SOI..EOI).
@@ -866,7 +903,7 @@ fn encode_optimized<S: SamplingScheme, W: Write>(
 /// Per-MCU running DC predictor for the three components. Difference-coded
 /// across MCUs within a scan (F.1.2.1).
 #[derive(Default)]
-struct DcPredictors {
+pub(crate) struct DcPredictors {
     y: i16,
     cb: i16,
     cr: i16,
@@ -878,7 +915,7 @@ struct DcPredictors {
 /// generic `encode_scan` below just iterates MCUs and forwards. Adding a
 /// new scheme is "impl this trait + add a variant + register here",
 /// no scan-level surgery required (Rule of Three: prep work at 2 instances).
-trait SamplingScheme {
+pub(crate) trait SamplingScheme {
     /// `(h_factor, v_factor)` for the Y component in SOF0. Cb/Cr are
     /// always (1, 1) in the schemes we support.
     const H_V: (u8, u8);
@@ -956,7 +993,7 @@ trait SamplingScheme {
     );
 }
 
-struct Yuv444Scheme;
+pub(crate) struct Yuv444Scheme;
 impl SamplingScheme for Yuv444Scheme {
     const H_V: (u8, u8) = (1, 1);
     const MCU_W: u32 = 8;
@@ -1080,7 +1117,7 @@ impl SamplingScheme for Yuv444Scheme {
     }
 }
 
-struct Yuv420Scheme;
+pub(crate) struct Yuv420Scheme;
 impl SamplingScheme for Yuv420Scheme {
     const H_V: (u8, u8) = (2, 2);
     const MCU_W: u32 = 16;
@@ -1210,7 +1247,7 @@ impl SamplingScheme for Yuv420Scheme {
     }
 }
 
-struct Yuv422Scheme;
+pub(crate) struct Yuv422Scheme;
 impl SamplingScheme for Yuv422Scheme {
     const H_V: (u8, u8) = (2, 1);
     const MCU_W: u32 = 16;
