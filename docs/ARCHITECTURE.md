@@ -14,7 +14,7 @@ src/
 ├── lib.rs                  — public API (JpegEncoder, PixelFormat),
 │                             encode-side pipeline orchestration,
 │                             SamplingScheme trait + Yuv444 / Yuv422 /
-│                             Yuv420 / Yuv411 / Yuv440 impls
+│                             Yuv420 impls
 ├── color.rs                — block / MCU extraction with edge replication
 ├── quant.rs                — Divisors, build_divisors,
 │                             compute_reciprocal, zig-zag wrapper
@@ -119,10 +119,10 @@ result is cached on first call.
 
 ## Subsampling dispatch
 
-`ChromaSubsampling` is an enum spanning the five baseline-JPEG
-sampling layouts the encoder produces (`Yuv444`, `Yuv422`, `Yuv420`,
-`Yuv411`, `Yuv440`); each variant has a corresponding zero-sized
-scheme type implementing the `SamplingScheme` trait:
+`ChromaSubsampling` is an enum spanning the three baseline-JPEG
+sampling layouts the encoder produces (`Yuv444`, `Yuv422`, `Yuv420`);
+each variant has a corresponding zero-sized scheme type implementing
+the `SamplingScheme` trait:
 
 ```rust
 trait SamplingScheme {
