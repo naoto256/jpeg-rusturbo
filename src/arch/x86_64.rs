@@ -86,6 +86,16 @@ pub mod huffman {
             bm
         }
     }
+
+    /// Precompute the JPEG magnitude category (`size`) and the
+    /// magnitude bits for every coefficient. Routed to the scalar form
+    /// for now — an AVX2 SIMD version is feasible (PSRLW + sign mask +
+    /// lzcnt-like pattern via PSHUFB lookup) but `encode_block` self-
+    /// time isn't yet hot enough on Cascade Lake to justify it. Revisit
+    /// when profiling shows otherwise.
+    pub fn ac_magnitudes(block: &[i16; 64], sizes: &mut [u8; 64], bits_lut: &mut [u16; 64]) {
+        crate::arch::scalar::huffman::ac_magnitudes(block, sizes, bits_lut)
+    }
 }
 
 // ===========================================================================
