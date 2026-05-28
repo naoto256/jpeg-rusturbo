@@ -1525,6 +1525,82 @@ pub mod quant {
             }
         }
     }
+
+    // ---- zigzag scatter ----------------------------------------------------
+    //
+    // 8 × 16-byte output chunks (= 8 × 8 i16 = 64 i16 = whole `zz` buffer).
+    // For each chunk: two `vqtbl4q_u8` lookups against the low / high halves
+    // of `natural`, OR-merged. Out-of-range TBL4 indices (>= 64) produce 0,
+    // which is what makes the OR-merge work: each lo-mask byte that should
+    // pull from the high half is set to 0xFF and the corresponding hi-mask
+    // byte does the real lookup (and vice versa).
+    //
+    // The const mask tables come from `ZIGZAG` and are baked at compile time
+    // (= 16 × 16 = 256 B of `.rodata`). Loading them inside the loop costs
+    // 16 `vld1q_u8`s but those overlap with `vqtbl4q_u8` latency.
+    //
+    // Replaces the scalar `for k in 0..64 { zz[k] = natural[ZIGZAG[k]] }`
+    // loop in `quant::quantize_and_zigzag` (was ~96 dynamic insn → ~32 here).
+    const fn build_zigzag_masks() -> ([[u8; 16]; 8], [[u8; 16]; 8]) {
+        let mut lo = [[0xFFu8; 16]; 8];
+        let mut hi = [[0xFFu8; 16]; 8];
+        let mut chunk = 0;
+        while chunk < 8 {
+            let mut j = 0;
+            while j < 8 {
+                let src = crate::tables::ZIGZAG[chunk * 8 + j];
+                if src < 32 {
+                    lo[chunk][j * 2] = (src * 2) as u8;
+                    lo[chunk][j * 2 + 1] = (src * 2 + 1) as u8;
+                } else {
+                    let off = (src - 32) * 2;
+                    hi[chunk][j * 2] = off as u8;
+                    hi[chunk][j * 2 + 1] = (off + 1) as u8;
+                }
+                j += 1;
+            }
+            chunk += 1;
+        }
+        (lo, hi)
+    }
+
+    static ZIGZAG_MASKS: ([[u8; 16]; 8], [[u8; 16]; 8]) = build_zigzag_masks();
+
+    /// Permute `natural` (DCT natural order) into `zz` (zig-zag order).
+    /// Bit-exact equivalent to `arch::scalar::quant::zigzag_scatter`.
+    pub fn zigzag_scatter(natural: &[i16; 64], zz: &mut [i16; 64]) {
+        unsafe { zigzag_scatter_inner(natural, zz) }
+    }
+
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. All inputs are fixed-size
+    /// references.
+    #[target_feature(enable = "neon")]
+    unsafe fn zigzag_scatter_inner(natural: &[i16; 64], zz: &mut [i16; 64]) {
+        unsafe {
+            let nat = natural.as_ptr() as *const u8;
+            let dst = zz.as_mut_ptr() as *mut u8;
+            let lo_table = uint8x16x4_t(
+                vld1q_u8(nat),
+                vld1q_u8(nat.add(16)),
+                vld1q_u8(nat.add(32)),
+                vld1q_u8(nat.add(48)),
+            );
+            let hi_table = uint8x16x4_t(
+                vld1q_u8(nat.add(64)),
+                vld1q_u8(nat.add(80)),
+                vld1q_u8(nat.add(96)),
+                vld1q_u8(nat.add(112)),
+            );
+            let (ref lo_masks, ref hi_masks) = ZIGZAG_MASKS;
+            for k in 0..8 {
+                let lo_m = vld1q_u8(lo_masks[k].as_ptr());
+                let hi_m = vld1q_u8(hi_masks[k].as_ptr());
+                let chunk = vorrq_u8(vqtbl4q_u8(lo_table, lo_m), vqtbl4q_u8(hi_table, hi_m));
+                vst1q_u8(dst.add(k * 16), chunk);
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -1821,6 +1897,22 @@ mod tests {
         let mut nout = [0i16; 64];
         scalar::quant::quantize_natural(&block, &div, &mut sout);
         quant::quantize_natural(&block, &div, &mut nout);
+        assert_eq!(sout, nout);
+    }
+
+    #[test]
+    fn zigzag_scatter_neon_matches_scalar() {
+        // Fill with a non-trivial pattern so a permutation bug shows up
+        // anywhere in the 64-entry output, not just at zero positions.
+        let mut natural = [0i16; 64];
+        for (i, v) in natural.iter_mut().enumerate() {
+            let m = (i as i32 * 73) % 9001 - 4500;
+            *v = m as i16;
+        }
+        let mut sout = [0i16; 64];
+        let mut nout = [0i16; 64];
+        scalar::quant::zigzag_scatter(&natural, &mut sout);
+        quant::zigzag_scatter(&natural, &mut nout);
         assert_eq!(sout, nout);
     }
 

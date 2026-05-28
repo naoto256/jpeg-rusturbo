@@ -853,6 +853,16 @@ pub mod quant {
         }
     }
 
+    /// Permute `natural` (DCT natural order) into `zz` (zig-zag order).
+    /// AVX2 SIMD permutation would need cross-lane shuffles (the scatter
+    /// pattern is not lane-symmetric), so for now we route to the scalar
+    /// `get_unchecked` loop — which LLVM already 4×-unrolls into a tight
+    /// `ldp/ldrh × 4/strh × 4` block. Revisit if profiling shows this is
+    /// hot on x86_64.
+    pub fn zigzag_scatter(natural: &[i16; 64], zz: &mut [i16; 64]) {
+        crate::arch::scalar::quant::zigzag_scatter(natural, zz)
+    }
+
     /// # Safety
     /// AVX2 must be available (the runtime gate in `quantize_natural`
     /// checks). All inputs are fixed-size references.
