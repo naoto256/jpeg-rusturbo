@@ -605,6 +605,23 @@ pub mod huffman {
         }
         bm
     }
+
+    /// Precompute the JPEG magnitude category (`size`) and the raw
+    /// magnitude bits (low `size` bits of `value` for positive, low
+    /// `size` bits of `!value` for negative) for every coefficient.
+    /// Both lanes are zero when the coefficient is zero.
+    ///
+    /// `encode_block` consults this lut once per non-zero AC coefficient
+    /// rather than calling `magnitude_category` per-iter inside the
+    /// inner loop. SIMD backends do the same work with a single
+    /// 4-vector pass.
+    pub fn ac_magnitudes(block: &[i16; 64], sizes: &mut [u8; 64], bits_lut: &mut [u16; 64]) {
+        for (k, &v) in block.iter().enumerate() {
+            let (sz, b) = crate::huffman::magnitude_category(v as i32);
+            sizes[k] = sz;
+            bits_lut[k] = b as u16;
+        }
+    }
 }
 
 // ===========================================================================
