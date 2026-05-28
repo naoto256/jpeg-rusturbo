@@ -116,7 +116,9 @@ fn set_icc_large_splits_into_multi_segment() {
     // payload cap is 65519 bytes (= 65533 - 12-byte ID - 2-byte seq
     // header), so 200_000 bytes needs 4 segments
     // (4 * 65519 = 262076 > 200000).
-    let icc: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(31) & 0xFF) as u8).collect();
+    let icc: Vec<u8> = (0..200_000u32)
+        .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
+        .collect();
     let pixels = solid_rgb(W, H, [20, 20, 200]);
     let mut out = Vec::new();
     {
