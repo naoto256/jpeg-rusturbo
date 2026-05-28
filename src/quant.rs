@@ -29,7 +29,6 @@
 //! exactly the `vpmulhuw` semantics).
 
 use crate::arch;
-use crate::tables::ZIGZAG;
 
 /// Per-coefficient quantization helper. Indexed in *natural* order
 /// (NOT zig-zag). The `quantize_and_zigzag` function reorders on output.
@@ -120,8 +119,6 @@ pub fn quantize_and_zigzag(block: &[i16; 64], div: &Divisors) -> [i16; 64] {
     let mut natural = [0i16; 64];
     arch::backend::quant::quantize_natural(block, div, &mut natural);
     let mut zz = [0i16; 64];
-    for (k, &nat) in ZIGZAG.iter().enumerate() {
-        zz[k] = natural[nat];
-    }
+    arch::backend::quant::zigzag_scatter(&natural, &mut zz);
     zz
 }
