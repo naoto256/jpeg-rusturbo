@@ -592,6 +592,14 @@ fn encode_ac_refine_scan<W: Write>(
 ///   and any pending refinement bits for prior-positions-in-this-
 ///   block.
 /// - **zero** (`|coef| < 1 << Al`): contributes to `zero_run`.
+//
+// `clippy::needless_range_loop` would have us rewrite these walks
+// as `.iter().enumerate()` over the band slice — but the closures
+// `prev_sig` / `new_sig` (and the per-element ZRL accounting) want
+// to query `block[r]` at indices the body computes separately, so
+// the range-loop form is the readable one. Allow the lint
+// site-locally.
+#[allow(clippy::needless_range_loop)]
 fn encode_ac_refine_block<W: Write>(
     bw: &mut BitWriter<W>,
     block: &[i16; 64],

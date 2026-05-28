@@ -583,7 +583,13 @@ impl<W: Write> JpegEncoder<W> {
         // for progressive is a follow-up.
         if self.progressive {
             return progressive_encode::encode_progressive_inner(
-                self, pixels, width, height, layout, &div_luma, &div_chroma,
+                self,
+                pixels,
+                width,
+                height,
+                layout,
+                &div_luma,
+                &div_chroma,
             );
         }
 
