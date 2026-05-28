@@ -292,6 +292,8 @@ pub struct JpegEncoder<W: Write> {
     custom_quant: Option<QuantPair>,
     optimize_huffman: bool,
     threads: u32,
+    exif: Option<Vec<u8>>,
+    icc_profile: Option<Vec<u8>>,
 }
 
 impl<W: Write> JpegEncoder<W> {
@@ -314,6 +316,8 @@ impl<W: Write> JpegEncoder<W> {
             custom_quant: None,
             optimize_huffman: false,
             threads: 1,
+            exif: None,
+            icc_profile: None,
         }
     }
 
@@ -403,6 +407,44 @@ impl<W: Write> JpegEncoder<W> {
     /// byte-identical to a build without this setter.
     pub fn set_optimize_huffman(&mut self, on: bool) {
         self.optimize_huffman = on;
+    }
+
+    /// Attach an EXIF metadata blob, emitted as an APP1 segment
+    /// immediately after the JFIF header. `exif` should be the raw
+    /// EXIF payload (typically `TIFF header + IFD0 + ...`) — the
+    /// encoder prepends the standard `"Exif\0\0"` identifier itself.
+    ///
+    /// Pass-through use case: read an existing JPEG with a separate
+    /// EXIF parser, hand the bytes back here, re-encode without
+    /// losing camera / orientation metadata. Image-processing
+    /// pipelines that strip EXIF by default can use this to restore
+    /// it.
+    ///
+    /// EXIF is allowed exactly one APP1 segment, so the payload is
+    /// capped at ~65 KB. Setting `None` (or never calling this)
+    /// produces a JPEG with no APP1 — bit-identical to a build
+    /// without this setter.
+    pub fn set_exif(&mut self, exif: Option<Vec<u8>>) {
+        self.exif = exif;
+    }
+
+    /// Attach an ICC color profile, emitted as one or more APP2
+    /// segments per the ICC.1 embedding convention. `icc` is the raw
+    /// `.icc` / `.icm` profile bytes — the encoder writes the
+    /// `"ICC_PROFILE\0"` identifier and the multi-segment chunking
+    /// itself.
+    ///
+    /// Pass-through use case: same as `set_exif` but for color
+    /// management. Photo-display pipelines on macOS / Windows /
+    /// browsers respect APP2 ICC when present and gracefully fall
+    /// back to sRGB when absent, so this is purely additive.
+    ///
+    /// Multi-segment chunking handles profiles up to ~16.7 MB
+    /// (255 segments × ~65 KB); realistic ICC profiles are 1-5 KB and
+    /// fit in a single segment. Setting `None` emits no APP2 —
+    /// bit-identical to a build without this setter.
+    pub fn set_icc_profile(&mut self, icc: Option<Vec<u8>>) {
+        self.icc_profile = icc;
     }
 
     /// Encode an RGB pixel buffer (3 bytes/pixel) as a complete JPEG
@@ -530,6 +572,18 @@ impl<W: Write> JpegEncoder<W> {
         // ---- Header ----
         markers::write_soi(&mut self.out)?;
         markers::write_app0_jfif(&mut self.out)?;
+        // EXIF / ICC pass-through metadata. APP1 / APP2 segments are
+        // written immediately after the JFIF APP0 — that's the
+        // conventional libjpeg / exiftool placement and what every
+        // decoder we tested expects. They're absent (= bit-identical
+        // to a no-metadata build) when the user never called
+        // `set_exif` / `set_icc_profile`.
+        if let Some(exif) = self.exif.as_deref() {
+            markers::write_app1_exif(&mut self.out, exif)?;
+        }
+        if let Some(icc) = self.icc_profile.as_deref() {
+            markers::write_app2_icc(&mut self.out, icc)?;
+        }
         markers::write_dqt(&mut self.out, 0, &luma_q)?;
         markers::write_dqt(&mut self.out, 1, &chroma_q)?;
 
@@ -739,6 +793,13 @@ fn encode_optimized<S: SamplingScheme, W: Write>(
     // ---- Header emission.
     markers::write_soi(&mut enc.out)?;
     markers::write_app0_jfif(&mut enc.out)?;
+    // EXIF / ICC pass-through — mirror of the baseline path above.
+    if let Some(exif) = enc.exif.as_deref() {
+        markers::write_app1_exif(&mut enc.out, exif)?;
+    }
+    if let Some(icc) = enc.icc_profile.as_deref() {
+        markers::write_app2_icc(&mut enc.out, icc)?;
+    }
     markers::write_dqt(&mut enc.out, 0, luma_q)?;
     markers::write_dqt(&mut enc.out, 1, chroma_q)?;
     let (h_y, v_y) = S::H_V;
