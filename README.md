@@ -30,7 +30,7 @@ SIMD IDCT, color convert (YCC → RGB), and fancy (interpolating)
 chroma upsample on the standard 4:2:0 / 4:2:2 / 4:4:0 layouts. The
 Huffman entropy decoder stays scalar by design — the bit-reader +
 canonical-table walk has a serial dependency on per-symbol code
-length that doesn't reshape into vector SIMD — but 0.7.0 lands two
+length that doesn't reshape into vector SIMD — but 0.7.0 landed two
 scalar bit-ops refinements (combined run/size + magnitude LUT, and
 a SWAR 32-bit bit-reader refill) on top of the per-stage SIMD
 kernels.
@@ -262,7 +262,7 @@ modes return `DecodeError::Unsupported`.
 - **Scalar Huffman entropy decoder** — bit-reader + canonical-table
   walk; the serial dependency on per-symbol code length doesn't
   reshape into vector SIMD, so the entropy decoder is scalar by
-  design. 0.7.0 lands two scalar bit-ops refinements on top: a
+  design. 0.7.0 landed two scalar bit-ops refinements on top: a
   combined run/size + magnitude LUT (table-driven path, ~97% slot
   coverage on standard JPEG tables) for both AC and DC terms,
   including the progressive DC-first and AC-first scans; and a SWAR

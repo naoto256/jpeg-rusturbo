@@ -1,0 +1,12 @@
+# Mirror of the `[advisories] ignore` block in `deny.toml`. `cargo
+# audit` does not read `deny.toml`, so the two tools' ignore lists
+# must be maintained side-by-side. Any change here should be
+# replicated in `deny.toml` (and vice versa) with the same rationale.
+[advisories]
+ignore = [
+    # `instant 0.1.x` is unmaintained (upstream recommends `web-time`).
+    # Transitive via `minifb`, a `[dev-dependencies]` entry used only
+    # by the `visual_realtime` example. Not reachable from anything
+    # published by the library.
+    "RUSTSEC-2024-0384",
+]
