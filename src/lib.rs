@@ -811,7 +811,7 @@ struct DcPredictors {
     cr: i16,
 }
 
-/// One chroma-subsampling scheme (4:4:4, 4:2:0, future: 4:2:2 …).
+/// One chroma-subsampling scheme (4:4:4, 4:2:2, 4:2:0).
 ///
 /// Each impl owns its MCU geometry and the per-MCU encode work — the
 /// generic `encode_scan` below just iterates MCUs and forwards. Adding a
