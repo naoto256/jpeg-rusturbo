@@ -1,7 +1,18 @@
 //! Real-time encode/decode visualizer. Generates an animated frame,
 //! encodes with `jpeg-rusturbo` at q=80 4:2:0, decodes with
 //! `jpeg-rusturbo`, and displays the decoded buffer in a minifb
-//! window. Title bar reports the encode + decode time per frame.
+//! window. Title bar reports the encode + decode time per frame
+//! plus the active encoder mode (baseline / progressive / metadata
+//! pass-through).
+//!
+//! Keys:
+//!   - `ESC`: quit
+//!   - `P`: toggle progressive (SOF2) ↔ baseline (SOF0)
+//!   - `M`: toggle EXIF + ICC pass-through (synthetic small blobs)
+//!
+//! Both toggles affect the *encoder* only — the decode path is
+//! identical, so a visual divergence between modes would indicate
+//! an encoder bug.
 //!
 //! Run: `cargo run --release --example visual_realtime`
 
@@ -31,15 +42,46 @@ fn main() {
     let mut t_dec_sum = 0.0;
     let mut count = 0;
 
+    // Mode toggles. The decoded buffer is bit-identical in shape
+    // regardless of mode (= same width / height / pixel format), so
+    // any visual artifact while toggling between modes points at an
+    // encoder bug rather than a UI sync issue.
+    let mut progressive = false;
+    let mut with_metadata = false;
+    let mut prev_p = false;
+    let mut prev_m = false;
+    // Small synthetic EXIF + ICC blobs; the encoder routes them
+    // through as APP1 / APP2 segments without parsing.
+    let exif: Vec<u8> = b"II\x2A\x00\x08\x00\x00\x00\x00\x00\x00\x00".to_vec();
+    let icc: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Edge-triggered toggles so a held key doesn't flip every
+        // frame.
+        let p_now = window.is_key_down(Key::P);
+        if p_now && !prev_p {
+            progressive = !progressive;
+        }
+        prev_p = p_now;
+        let m_now = window.is_key_down(Key::M);
+        if m_now && !prev_m {
+            with_metadata = !with_metadata;
+        }
+        prev_m = m_now;
+
         let phase = frame as f32 * 0.04;
         render(&mut rgb, W as u32, H as u32, phase);
 
-        // ---- Encode (q=80 4:2:0) ----
+        // ---- Encode (q=80 4:2:0, mode-dependent) ----
         let t0 = Instant::now();
         jpeg.clear();
         let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
         enc.set_subsampling(ChromaSubsampling::Yuv420);
+        enc.set_progressive(progressive);
+        if with_metadata {
+            enc.set_exif(Some(exif.clone()));
+            enc.set_icc_profile(Some(icc.clone()));
+        }
         enc.encode_rgb(&rgb, W as u32, H as u32).unwrap();
         let t_enc = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -57,11 +99,16 @@ fn main() {
         count += 1;
         if last_report.elapsed().as_secs_f64() > 0.5 {
             let n = count as f64;
+            let mode = match (progressive, with_metadata) {
+                (false, false) => "baseline",
+                (true, false) => "progressive",
+                (false, true) => "baseline+meta",
+                (true, true) => "progressive+meta",
+            };
             window.set_title(&format!(
-                "jpeg-rusturbo: enc {:.2} ms · dec {:.2} ms · roundtrip {:.2} ms · JPEG {} KB ({} fps cap 60)",
+                "jpeg-rusturbo [{mode}] (P/M toggle): enc {:.2} ms · dec {:.2} ms · JPEG {} KB ({} fps cap 60)",
                 t_enc_sum / n,
                 t_dec_sum / n,
-                (t_enc_sum + t_dec_sum) / n,
                 jpeg.len() / 1024,
                 (n / last_report.elapsed().as_secs_f64()) as u32,
             ));
