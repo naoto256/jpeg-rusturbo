@@ -55,36 +55,54 @@
 //! 4:2:0-only, so encode-heavy pipelines leave throughput on the
 //! table. Per-architecture SIMD kernels (NEON on aarch64, AVX2 +
 //! SSE2 on x86_64) are translated from libjpeg-turbo with bit-exact
-//! output guarantees against the scalar reference. Encoder whole-
-//! pipeline speedup vs scalar is ~1.7× on Apple Silicon and ~2.4×
-//! on Intel Cascade Lake at 1080p / 4K, q=80, 4:2:0. Versus the
+//! output guarantees against the scalar reference. Versus the
 //! `image` crate's scalar encoder, jpeg-rusturbo's encoder is
-//! ~2.9× / ~3.3× faster (Apple M / Cascade Lake). Opt-in
-//! [`JpegEncoder::set_threads`] adds another 1.2–1.8× on top via
-//! MCU-row parallelism; opt-in [`JpegEncoder::set_optimize_huffman`]
-//! trims output size ~5% across subsampling/quality at ~1.5–1.8×
-//! encode cost. Encode speed is the headline.
+//! ~4.5× on Apple M and ~3.5× on Cascade Lake at 4K 4:2:0 q=80
+//! (up from ~2.9× / ~3.3× in 0.7.5 — the 0.8.0 encoder hot-path
+//! pass added unsafe `BitWriter::drain_high32`, NEON
+//! `vqtbl4q`-based zig-zag scatter, fused AC code+magnitude
+//! `write_bits`, and a one-shot SIMD precompute of the JPEG
+//! magnitude category; the first two help both backends, the
+//! latter two are NEON-only). Opt-in [`JpegEncoder::set_threads`]
+//! adds another 1.2–2.2× on top via MCU-row parallelism; opt-in
+//! [`JpegEncoder::set_optimize_huffman`] trims output size ~5%
+//! across subsampling/quality at ~1.5–1.8× encode cost. Encode
+//! speed is the headline.
+//!
+//! 0.8.0 also adds two encoder-surface features:
+//! [`JpegEncoder::set_progressive`] for SOF2 output (8-scan
+//! successive-approximation plan covering all four progressive
+//! scan types) and [`JpegEncoder::set_exif`] /
+//! [`JpegEncoder::set_icc_profile`] for APP1 / APP2 metadata
+//! pass-through. Both are off by default — when neither is called,
+//! the encoder's output is bit-identical to a build that doesn't
+//! know about them.
 //!
 //! The decoder is bundled for API symmetry — read your own JPEGs
 //! back without reaching for another crate — rather than as a speed
 //! play. It gained per-stage SIMD kernels in 0.6.0 (IDCT, YCC → RGB
-//! color convert, and fancy chroma upsample in NEON + AVX2); it now
-//! sits at ~0.77× of `image`'s SIMD decoder while matching its
-//! coverage (baseline + progressive Huffman, fancy chroma upsample,
-//! all eight pixel layouts). The IDCT carries DC-only and sparse-row
-//! fast paths that fire on smooth regions in natural photographs
-//! (+11–19% of total decode time on natural content, noise-level on
-//! synthetic input); 0.7.0 ports those fast paths to AVX2 to match
-//! NEON. The Huffman entropy decoder is scalar by design — the
-//! bit-reader + canonical-table walk has a serial dependency on
-//! per-symbol code length that doesn't reshape into vector SIMD —
-//! and 0.7.0 lands two scalar bit-ops refinements on top: a combined
-//! run/size + magnitude LUT (table-driven path, used by both AC and
-//! DC including progressive scans) and a SWAR 32-bit bit-reader
-//! refill that fills the `u64` accumulator four bytes at a time
-//! when no `0xFF` byte stuffing is present. The SWAR refill delivers
-//! +4–7% on natural 4K content across both NEON and AVX2; the
-//! combined LUT sits at the noise floor at q=80 and is retained as a
+//! color convert, and fancy chroma upsample in NEON + AVX2). As of
+//! 0.7.5 (entropy + dequant fusion, AVX2 PSHUFB RGB interleave,
+//! uninit `Vec` allocation) it sits ahead of `image` at 4K on both
+//! microarchitectures and both corpora (~1.06–1.10× on synthetic
+//! Huffman-heavy content, ~1.19–1.21× on natural-content), while
+//! matching coverage — baseline + progressive Huffman, fancy chroma
+//! upsample, all eight pixel layouts. 0.8.0 doesn't touch the
+//! decoder; the above carries over. The IDCT carries DC-only and
+//! sparse-row fast paths that fire on smooth regions in natural
+//! photographs (+11–19% of total decode time on natural content,
+//! noise-level on synthetic input); 0.7.0 ported those fast paths
+//! to AVX2 to match NEON. The Huffman entropy decoder is scalar by
+//! design — the bit-reader + canonical-table walk has a serial
+//! dependency on per-symbol code length that doesn't reshape into
+//! vector SIMD — and 0.7.0 lands two scalar bit-ops refinements on
+//! top: a combined run/size + magnitude LUT (table-driven path,
+//! used by both AC and DC including progressive scans) and a SWAR
+//! 32-bit bit-reader refill that fills the `u64` accumulator four
+//! bytes at a time when no `0xFF` byte stuffing is present. The
+//! SWAR refill delivers +4–7% on natural 4K content across both
+//! NEON and AVX2; the combined LUT sits at the noise floor at q=80
+//! and is retained as a
 //! bit-exact foundation. See [`BENCH.md`] in the repository for
 //! detailed numbers.
 //!

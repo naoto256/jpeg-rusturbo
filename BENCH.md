@@ -43,35 +43,67 @@ profile.
 
 ## Section A — encode pipeline
 
-`q=80`, single thread, optimize-huffman off. Pure encode time
-(`JpegEncoder::encode_rgba`), ms/iter.
+`q=80`, single thread, optimize-huffman off, baseline (SOF0). Pure
+encode time (`JpegEncoder::encode_rgba`), ms/iter.
 
 ### Apple M-series (aarch64)
 
-| Resolution                  | 4:4:4 NEON | 4:4:4 scalar | 4:2:2 NEON | 4:2:2 scalar | 4:2:0 NEON | 4:2:0 scalar |
-| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |    9.96 ms |     13.83 ms |    6.90 ms |     10.16 ms |    5.19 ms |      8.20 ms |
-| 1920 × 1080 (1080p)         |   11.29 ms |     15.94 ms |    7.95 ms |     11.70 ms |    6.06 ms |      9.47 ms |
-| 3840 × 2160 (4K)            |   44.75 ms |     62.71 ms |   31.39 ms |     45.90 ms |   23.57 ms |     40.94 ms |
+| Resolution                  | 4:4:4 NEON | 4:2:2 NEON | 4:2:0 NEON |
+| --------------------------- | ---------: | ---------: | ---------: |
+| 1592 × 1124 (session size)  |    7.09 ms |    4.74 ms |    3.65 ms |
+| 1920 × 1080 (1080p)         |    8.21 ms |    5.47 ms |    4.17 ms |
+| 3840 × 2160 (4K)            |   31.19 ms |   21.27 ms |   16.90 ms |
 
-NEON speedup vs `force-scalar`: 1.38× (4:4:4 4K) → 1.74× (4:2:0 4K).
+vs 0.7.5 at 4K 4:2:0: **22.20 ms → 16.90 ms (-23.9%)** from the
+0.8.0 encoder hot-path pass — unsafe `BitWriter::drain_high32`,
+NEON `vqtbl4q`-based zig-zag scatter, fused AC code+magnitude
+`write_bits`, and a one-shot SIMD precompute of the JPEG
+magnitude category for every coefficient in the block. The first
+three help every backend; the magnitude precompute is NEON-only
+(epi16 has no vector `clz` outside AVX-512).
 
 ### Intel Xeon (Cascade Lake) x86_64
 
-| Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
-| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   34.90 ms |     64.82 ms |   20.65 ms |     48.70 ms |   15.93 ms |     38.24 ms |
-| 1920 × 1080 (1080p)         |   40.15 ms |     74.78 ms |   23.58 ms |     55.83 ms |   18.30 ms |     43.85 ms |
-| 3840 × 2160 (4K)            |  159.51 ms |    298.01 ms |   93.48 ms |    222.50 ms |   73.37 ms |    173.63 ms |
+| Resolution                  | 4:4:4 AVX2 | 4:2:2 AVX2 | 4:2:0 AVX2 |
+| --------------------------- | ---------: | ---------: | ---------: |
+| 1592 × 1124 (session size)  |   31.62 ms |   18.12 ms |   14.22 ms |
+| 1920 × 1080 (1080p)         |   36.39 ms |   20.78 ms |   16.44 ms |
+| 3840 × 2160 (4K)            |  144.55 ms |   82.83 ms |   65.68 ms |
 
-AVX2 speedup vs `force-scalar`: 1.87× (4:4:4 4K) → 2.37× (4:2:0 4K).
-Encode-side speedup unchanged vs 0.5.0; the encode pipeline didn't
-gain new SIMD kernels in 0.6.0.
+vs 0.7.5 at 4K 4:2:0: **73.37 ms → 65.68 ms (-10.5%)** from the
+two backend-agnostic items in the 0.8.0 encoder pass (`drain_high32`
++ AC fusion). The NEON-only items (zig-zag scatter, magnitude
+precompute) leave Cascade Lake's AVX2 path untouched — AVX2
+equivalents are queued for 0.9.0 (zig-zag via `vpermd` /
+`vpshufb`, magnitude lookup via PSHUFB-based bit-length table).
 
 Output bytes are byte-identical across SIMD ↔ scalar and across
-hosts (e.g. 4K 4:2:0 q=80 = `1940692` bytes everywhere). This is the
-bit-exact equivalence we set out to preserve when porting
-libjpeg-turbo's integer LL&M DCT, and is asserted in the unit tests.
+hosts (e.g. 4K 4:2:0 q=80 baseline = `1940692` bytes everywhere).
+This is the bit-exact equivalence we set out to preserve when
+porting libjpeg-turbo's integer LL&M DCT, and is asserted in the
+unit tests.
+
+### Progressive (SOF2) encode
+
+`q=80`, single thread, 4:2:0, 4K natural-content gradient, Apple M:
+
+| mode               | encode    | file size |
+| ------------------ | --------: | --------: |
+| baseline (SOF0)    |  11.33 ms |    168 KB |
+| progressive (SOF2) |  27.91 ms |    264 KB |
+
+The SOF2 path quantizes every block once into a per-component
+buffer (~13 MB at 4K 4:2:0) and then runs the 8-scan successive-
+approximation plan over the stored coefficients. Encode time is
+the spec-bound 2.5× of baseline (one buffer pass + eight scan
+passes). The +57% file size is on us, not the spec: the
+progressive encoder emits `EOB0` per block rather than the
+multi-block `EOBn` runs the format permits, because the Annex K
+reference Huffman tables this crate ships don't carry `EOBn`
+codes for `n ≥ 1`. A future `encode_progressive_optimize` (mirror
+of the existing optimized-Huffman baseline path) can derive
+tables that include the `EOBn` symbols and recover the
+file-size loss, at the cost of a second entropy pass.
 
 ---
 
@@ -85,19 +117,19 @@ across rayon worker pool; `threads=auto` picks
 
 | Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
 | ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
-| 1920×1080 (1080p)  |   5.87 ms |   4.28 ms |   3.66 ms |   3.47 ms |      3.47 ms |            1.69× |
-| 3840×2160 (4K)     |  23.82 ms |  17.09 ms |  14.39 ms |  13.31 ms |     13.31 ms |            1.79× |
+| 1920×1080 (1080p)  |   4.00 ms |   2.54 ms |   2.06 ms |   1.92 ms |      1.83 ms |            2.19× |
+| 3840×2160 (4K)     |  15.75 ms |  10.10 ms |   7.93 ms |   7.06 ms |      6.93 ms |            2.27× |
 
 ### Intel Xeon (Cascade Lake, AVX2, 4 vCPU)
 
 | Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
 | ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
-| 1920×1080 (1080p)  |  18.35 ms |  15.22 ms |  15.99 ms |  16.03 ms |     15.39 ms |            1.19× |
-| 3840×2160 (4K)     |  73.20 ms |  63.68 ms |  61.07 ms |  59.20 ms |     58.88 ms |            1.24× |
+| 1920×1080 (1080p)  |  16.67 ms |  13.59 ms |  14.74 ms |  14.86 ms |     14.09 ms |            1.18× |
+| 3840×2160 (4K)     |  65.80 ms |  54.34 ms |  53.73 ms |  52.81 ms |     52.99 ms |            1.24× |
 
 The 4-vCPU Cascade Lake saturates at 2 threads on 1080p; per-MCU
 work-per-chunk isn't enough to offset rayon's scheduling cost beyond
-that. The 8-core Apple host gets clean 1.8× at 4K. Output bytes are
+that. The 8-core Apple host gets ~2.2× at 4K. Output bytes are
 byte-identical across all thread counts (asserted in
 `tests/threaded.rs`).
 
@@ -377,9 +409,12 @@ Reading the numbers honestly:
   zune's lower setup overhead shows. Apple M's setup is itself
   cheap enough that we lead even at smaller resolutions.
 - **vs prior cycles**: 0.6.0 was 0.41× → 0.77× on this fixture;
-  0.7.0 was 0.78× on natural 4K; 0.7.5 brings 4K to 1.19–1.21×.
-  The decoder cycle 0.6 → 0.7.5 is now closed (next cycle returns
-  to encoder work).
+  0.7.0 was 0.78× on natural 4K; 0.7.5 brought 4K to 1.19–1.21×
+  and closed the decoder cycle. 0.8.0 doesn't touch the decoder —
+  these numbers carry over unchanged — and instead spends the
+  cycle on the encoder hot path (Section A above) plus two
+  feature additions (progressive (SOF2) emit, EXIF / ICC
+  pass-through).
 
 ---
 
