@@ -161,21 +161,40 @@ impl<W: io::Write> BitWriter<W> {
     /// Drain the top 32 bits of the accumulator as four bytes (with
     /// 0xFF stuffing). Called whenever the queue depth reaches 32+; on
     /// exit `nbits` is in `0..32`.
+    ///
+    /// Per-byte write goes through an unsafe pointer-bump path after a
+    /// single `reserve(8)` (= 4 data bytes + worst-case 4 stuffing
+    /// bytes) so the hot loop skips `Vec::push`'s per-call bounds /
+    /// capacity check. Bit-identical output to the previous
+    /// `push_stuffed × 4` implementation.
     #[inline]
     fn drain_high32(&mut self) {
         let high = (self.buffer >> 32) as u32;
-        let b0 = (high >> 24) as u8;
-        let b1 = (high >> 16) as u8;
-        let b2 = (high >> 8) as u8;
-        let b3 = high as u8;
-        // The stuffing branches are predictable in practice — 0xFF is
-        // rare in entropy-coded JPEG output (most Huffman codes do not
-        // span eight 1-bits aligned to a byte boundary). The compiler
-        // turns this into well-predicted branches.
-        push_stuffed(&mut self.buf, b0);
-        push_stuffed(&mut self.buf, b1);
-        push_stuffed(&mut self.buf, b2);
-        push_stuffed(&mut self.buf, b3);
+        // 4 data bytes + up to 4 stuffing bytes = 8.
+        self.buf.reserve(8);
+        let len = self.buf.len();
+        let mut written: usize = 0;
+        // Safety: we just reserved 8 bytes; `written ∈ 0..=8` after the
+        // loop (each byte writes 1 byte, optionally +1 for stuffing).
+        // `u8` is plain-old-data so writing through `*mut u8` and then
+        // `set_len` is sound.
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(len);
+            for &b in &[
+                (high >> 24) as u8,
+                (high >> 16) as u8,
+                (high >> 8) as u8,
+                high as u8,
+            ] {
+                *dst.add(written) = b;
+                written += 1;
+                if b == 0xFF {
+                    *dst.add(written) = 0;
+                    written += 1;
+                }
+            }
+            self.buf.set_len(len + written);
+        }
         self.buffer <<= 32;
         self.nbits -= 32;
     }
