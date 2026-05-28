@@ -259,16 +259,19 @@ pub fn encode_block<W: io::Write>(
     ac_tab: &HuffmanTable,
 ) -> io::Result<i16> {
     // ----- DC term: difference-coded (F.1.2.1) -----
+    //
+    // Emit `(huff_code, magnitude_bits)` as a single fused write. JPEG
+    // bounds DC magnitude category at 11 and Huffman code length at 16,
+    // so the combined width is `≤ 27` — fits `write_bits`' budget. When
+    // `size == 0` (`diff == 0`) `bits` is 0 and the fused value
+    // collapses to the bare Huffman code.
     let dc = block[0];
     let diff = dc as i32 - prev_dc as i32;
     let (size, bits) = magnitude_category(diff);
     let dc_entry = dc_tab.packed[size as usize];
     let dc_code = dc_entry & 0xFFFF;
     let dc_len = dc_entry >> 16;
-    bw.write_bits(dc_code, dc_len)?;
-    if size > 0 {
-        bw.write_bits(bits, size as u32)?;
-    }
+    bw.write_bits((dc_code << size) | bits, dc_len + size as u32)?;
 
     // ----- AC terms: run-length of zeros + magnitude (F.1.2.2) -----
     // Build a 64-bit bitmap of nonzero positions, then drive the scan
@@ -307,8 +310,15 @@ pub fn encode_block<W: io::Write>(
         );
         let symbol = ((zero_run as usize) << 4) | (size as usize & 0x0F);
         let entry = ac_tab.packed[symbol];
-        bw.write_bits(entry & 0xFFFF, entry >> 16)?;
-        bw.write_bits(bits, size as u32)?;
+        // Fuse the Huffman code and magnitude-bits emits into one
+        // `write_bits` call. AC magnitude category is bounded at 10
+        // (commented at the `debug_assert` above) and Huffman code
+        // length at 16, so the combined width fits `write_bits`'
+        // 27-bit budget. Halves the per-coefficient
+        // shift / mask / OR / drain-check chain on the AC hot path.
+        let huff_code = entry & 0xFFFF;
+        let huff_nbits = entry >> 16;
+        bw.write_bits((huff_code << size) | bits, huff_nbits + size as u32)?;
         remaining &= !(1u64 << next_k);
         k = next_k + 1;
     }
