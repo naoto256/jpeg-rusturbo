@@ -4,12 +4,13 @@
 [![Release](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**SIMD-accelerated baseline JPEG encoder + Huffman (baseline +
-progressive) decoder with libjpeg-turbo-derived kernels.** Both
-sides ship NEON-on-aarch64 and AVX2-on-x86_64 kernels; non-SIMD
-targets fall through to a bit-exact scalar reference. Drop-in for
-`image::codecs::jpeg::JpegEncoder` on the encode side; standalone
-decoder under `jpeg_rusturbo::decode`.
+**SIMD-accelerated JPEG encoder (baseline SOF0 + progressive
+SOF2 + EXIF / ICC metadata pass-through) and Huffman decoder
+(baseline + progressive), with libjpeg-turbo-derived kernels.**
+Both sides ship NEON-on-aarch64 and AVX2-on-x86_64 kernels;
+non-SIMD targets fall through to a bit-exact scalar reference.
+Drop-in for `image::codecs::jpeg::JpegEncoder` on the encode side;
+standalone decoder under `jpeg_rusturbo::decode`.
 
 ```rust
 use jpeg_rusturbo::{JpegEncoder, PixelFormat, decode};
@@ -40,13 +41,16 @@ kernels.
 This crate exists because a real workload needed a **fast JPEG
 encoder in pure Rust** — `image`'s bundled encoder is solid but
 purely scalar and 4:2:0-only, which leaves throughput on the table
-for pipelines that emit a lot of JPEGs. The SIMD encoder here lifts
-whole-pipeline throughput roughly **2.9×** on Apple Silicon and
-**3.3×** on Intel Cascade Lake versus `image`'s encoder on the same
-content, supports 4:4:4 / 4:2:2 / 4:2:0, and opts in to
-multi-threaded MCU-row encode, optimized (two-pass) Huffman tables,
-restart markers, and custom quantization tables. **Encode speed is
-the headline.**
+for pipelines that emit a lot of JPEGs. The SIMD encoder here
+lifts whole-pipeline throughput roughly **4.5×** on Apple Silicon
+and **3.5×** on Intel Cascade Lake versus `image`'s encoder on
+the same content (was 2.9× / 3.3× in 0.7.5; 0.8.0's encoder
+hot-path pass closes the gap to and through 4× on aarch64),
+supports 4:4:4 / 4:2:2 / 4:2:0, **progressive (SOF2) output**
+alongside baseline, **EXIF / ICC pass-through** for re-encode
+pipelines, multi-threaded MCU-row encode, optimized (two-pass)
+Huffman tables, restart markers, and custom quantization tables.
+**Encode speed is the headline.**
 
 The decoder is bundled for API symmetry — read your own JPEGs back
 without reaching for another crate — rather than as a speed play.
@@ -73,9 +77,14 @@ per-section breakdown in [BENCH.md](BENCH.md).
 
 | Resolution                  | ours (Apple M) | image (Apple M) | ratio   | ours (Cascade Lake) | image (Cascade Lake) | ratio   |
 | --------------------------- | -------------: | --------------: | ------: | ------------------: | -------------------: | ------: |
-| 1592 × 1124 (session size)  |        5.20 ms |        15.21 ms |  2.93×  |            23.19 ms |             75.32 ms |  3.25×  |
-| 1920 × 1080 (1080p)         |        5.89 ms |        17.18 ms |  2.92×  |            26.51 ms |             86.74 ms |  3.27×  |
-| 3840 × 2160 (4K)            |       23.38 ms |        66.70 ms |  2.85×  |           105.12 ms |            344.80 ms |  3.28×  |
+| 1592 × 1124 (session size)  |        3.42 ms |        15.48 ms |  4.52×  |            21.05 ms |             73.08 ms |  3.47×  |
+| 1920 × 1080 (1080p)         |        3.80 ms |        17.51 ms |  4.60×  |            24.18 ms |             84.21 ms |  3.48×  |
+| 3840 × 2160 (4K)            |       15.20 ms |        68.39 ms |  4.50×  |            95.72 ms |            334.79 ms |  3.50×  |
+
+(0.8.0 4K 4:2:0 vs 0.7.5: Apple M 23.38 → 15.20 ms; Cascade Lake
+105.12 → 95.72 ms. NEON gets four hot-path items, AVX2 gets two —
+see [BENCH.md § Section A](BENCH.md#section-a--encode-pipeline) for
+the per-item breakdown.)
 
 ### vs `image` crate — decode (JPEG → RGB)
 
@@ -135,10 +144,10 @@ counts.
 
 | Host                     | Resolution | threads=1 | threads=auto | speedup |
 | ------------------------ | ---------- | --------: | -----------: | ------: |
-| Apple M (8 cores)        | 1080p      |   5.87 ms |      3.47 ms |   1.69× |
-| Apple M (8 cores)        | 4K         |  23.82 ms |     13.31 ms |   1.79× |
-| Cascade Lake (4 vCPU)    | 1080p      |  18.35 ms |     15.39 ms |   1.19× |
-| Cascade Lake (4 vCPU)    | 4K         |  73.20 ms |     58.88 ms |   1.24× |
+| Apple M (8 cores)        | 1080p      |   4.00 ms |      1.83 ms |   2.19× |
+| Apple M (8 cores)        | 4K         |  15.75 ms |      6.93 ms |   2.27× |
+| Cascade Lake (4 vCPU)    | 1080p      |  16.67 ms |     14.09 ms |   1.18× |
+| Cascade Lake (4 vCPU)    | 4K         |  65.80 ms |     52.99 ms |   1.24× |
 
 `set_optimize_huffman(true)` enables a per-image two-pass Huffman
 build (T.81 K.2/K.3). Typical size reduction ~5% across
@@ -151,7 +160,7 @@ bandwidth matters more than CPU.
 ```toml
 # Cargo.toml
 [dependencies]
-jpeg-rusturbo = "0.7"
+jpeg-rusturbo = "0.8"
 ```
 
 ### Encode
@@ -218,6 +227,20 @@ modes return `DecodeError::Unsupported`.
   `Argb`, `Abgr`, `Rgbx`, `Bgrx` via the generic
   `JpegEncoder::encode` entry point.
 - **Three chroma modes** — 4:4:4, 4:2:2, 4:2:0.
+- **Progressive (SOF2) output** — `set_progressive(true)` emits an
+  8-scan successive-approximation progressive JPEG (DC interleaved
+  first + per-component AC first at `Al=1`, then DC interleaved
+  refine + per-component AC refine at `Al=0`). All four T.81 Annex G
+  scan types implemented. Decodable by every conforming progressive
+  decoder including the one in this crate. Default off — baseline
+  output is bit-identical to pre-0.8.0 when this setter isn't called.
+- **EXIF / ICC metadata pass-through** — `set_exif(Option<Vec<u8>>)`
+  / `set_icc_profile(Option<Vec<u8>>)` route raw blobs through as
+  APP1 / APP2 segments immediately after the JFIF APP0. ICC profiles
+  larger than ~65 KB are split across multiple APP2 segments per
+  the ICC.1 multi-segment embedding convention. Use case: decode →
+  operate → re-encode pipelines that would otherwise drop the
+  camera EXIF / color profile.
 - **Multi-threaded MCU-row encode** — `set_threads(n)` (or `0` =
   `available_parallelism()`) partitions quantize + AC bitmap work
   across rayon workers. Serial when `n == 1`. Bit-identical output
@@ -341,9 +364,22 @@ per-decode plane / output Vec allocations (saved ~5 ms on Cascade
 Lake 4K). Combined effect: 4K 4:2:0 natural-content decode drops
 from 41.8 ms → 22.1 ms on Cascade Lake and 8.6 ms → 5.7 ms on
 Apple M, putting both microarchitectures ahead of `image` /
-`zune-jpeg` on the same fixture. **Trellis quantization** (mozjpeg-style RDO per-block
-search) remains under consideration for a later release, depending
-on demand.
+`zune-jpeg` on the same fixture. **0.8.0 returns focus to the
+encoder**: a four-item hot-path SIMD pass on aarch64 (unsafe
+`drain_high32`, NEON `vqtbl4q` zig-zag scatter, fused AC
+code+magnitude `write_bits`, NEON SIMD precompute of magnitude
+category) lifts 4K 4:2:0 encode from 22.20 ms → 16.90 ms on
+Apple M, taking the vs-`image` ratio past 4× there for the first
+time. The two backend-agnostic items also drop Cascade Lake from
+73.37 ms → 65.68 ms (~10%) — the NEON-only items wait on AVX2
+equivalents in a 0.9.x cycle. The same release adds **progressive
+(SOF2) emit** with the full 4-scan-type successive-approximation
+plan covering the decoder's existing progressive grammar, plus
+**EXIF / ICC pass-through** for re-encode pipelines that would
+otherwise drop their input's metadata. **Trellis quantization**
+(mozjpeg-style RDO per-block search) and an `encode_progressive_optimize`
+path (= optimized-Huffman for SOF2, recovers the per-block-EOB0
+size cost) remain under consideration for a later release.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
