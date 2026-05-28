@@ -299,11 +299,11 @@ impl HuffmanDecodeTable {
 // fits, and only fall back to the two-step path for long codes or
 // codes whose magnitude bits spill past the peek window.
 //
-// The decode_block_baseline scan loop in this module's sibling
-// `baseline.rs` is not yet wired to use this LUT — the AC scan
-// switch lands in a follow-up change. This file builds and exposes
-// the LUT + a stand-alone fast-path lookup so it can be validated
-// against the existing path before any hot-loop substitution.
+// The `decode_block_baseline` scan loop in `baseline.rs` and the
+// AC scans in `progressive.rs` both call `decode_ac_fast` as the
+// primary path, falling through to `BitReader::decode_symbol` only
+// on a LUT miss. This file builds and exposes the LUT plus the
+// stand-alone fast-path lookup function.
 // ---------------------------------------------------------------
 
 /// Width of the LUT key in bits. 10 bits → 1024 entries / 4 KiB.
