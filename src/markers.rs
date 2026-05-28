@@ -37,6 +37,76 @@ pub fn write_app0_jfif<W: Write>(w: &mut W) -> io::Result<()> {
     Ok(())
 }
 
+/// Maximum payload bytes in a single APPn segment. JPEG segment length
+/// is a 16-bit field counting itself + payload, so payload ≤ 65533.
+const APP_PAYLOAD_MAX: usize = 65533;
+
+/// APP1 / EXIF segment. The standard EXIF identifier `"Exif\0\0"` is
+/// prepended; the caller supplies the raw EXIF bytes (typically a TIFF
+/// header followed by IFD entries).
+///
+/// EXIF is permitted to occupy at most one APP1 segment, so the
+/// payload limit is `APP_PAYLOAD_MAX - 6` (= 65527) bytes; oversize
+/// inputs return `InvalidInput`. In practice EXIF blobs from cameras
+/// are a few KB at most, so the limit is theoretical.
+pub fn write_app1_exif<W: Write>(w: &mut W, exif: &[u8]) -> io::Result<()> {
+    const ID: &[u8] = b"Exif\0\0";
+    let payload_len = ID.len() + exif.len();
+    if payload_len > APP_PAYLOAD_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "EXIF payload too large: {} bytes (max {} after Exif\\0\\0 prefix)",
+                exif.len(),
+                APP_PAYLOAD_MAX - ID.len(),
+            ),
+        ));
+    }
+    w.write_all(&[0xFF, 0xE1])?;
+    write_be_u16(w, (2 + payload_len) as u16)?;
+    w.write_all(ID)?;
+    w.write_all(exif)
+}
+
+/// APP2 / ICC profile segment(s). The ICC.1 spec embeds profiles via
+/// the identifier `"ICC_PROFILE\0"` followed by a 1-based
+/// `(sequence_number, total_segments)` byte pair, allowing a profile
+/// to span up to 255 APP2 segments. Small profiles (≤ 65519 bytes,
+/// after subtracting the 14-byte header) fit in one segment.
+///
+/// Returns `InvalidInput` if the profile exceeds the addressable
+/// `255 × max_chunk` capacity (~16.7 MB), which no realistic ICC
+/// profile reaches.
+pub fn write_app2_icc<W: Write>(w: &mut W, icc: &[u8]) -> io::Result<()> {
+    const ID: &[u8] = b"ICC_PROFILE\0";
+    // Per-segment payload after the 12-byte ID + 2-byte (seq, total).
+    const CHUNK_MAX: usize = APP_PAYLOAD_MAX - 12 - 2;
+    let total_segs = icc.len().div_ceil(CHUNK_MAX).max(1);
+    if total_segs > 255 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ICC profile too large: {} bytes needs {} segments (255 max per ICC.1)",
+                icc.len(),
+                total_segs,
+            ),
+        ));
+    }
+    for seg in 0..total_segs {
+        let start = seg * CHUNK_MAX;
+        let end = (start + CHUNK_MAX).min(icc.len());
+        let chunk = &icc[start..end];
+        let payload_len = ID.len() + 2 + chunk.len();
+        w.write_all(&[0xFF, 0xE2])?;
+        write_be_u16(w, (2 + payload_len) as u16)?;
+        w.write_all(ID)?;
+        // Sequence and total are 1-based per ICC.1 § B.4.
+        w.write_all(&[(seg + 1) as u8, total_segs as u8])?;
+        w.write_all(chunk)?;
+    }
+    Ok(())
+}
+
 /// DQT — Define Quantization Table. Writes one 8-bit precision table
 /// at the supplied destination index `tq` (0 or 1). Coefficients are
 /// emitted in zig-zag order. (B.2.4.1)
