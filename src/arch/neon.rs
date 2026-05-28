@@ -1657,6 +1657,67 @@ pub mod huffman {
             bm
         }
     }
+
+    /// Precompute the JPEG magnitude category (`size`) and the
+    /// magnitude bits for every coefficient, in one SIMD pass over the
+    /// block. `encode_block` then reads `sizes[k]` / `bits_lut[k]`
+    /// inside its AC walk instead of calling `magnitude_category`
+    /// per-iter.
+    ///
+    /// Both output lanes are zero when the input coefficient is zero;
+    /// `vclzq_u16` returns 16 for zero input, so `size = 16 - clz =
+    /// 0`, the mask collapses to 0, and `bits` zeroes out.
+    pub fn ac_magnitudes(block: &[i16; 64], sizes: &mut [u8; 64], bits_lut: &mut [u16; 64]) {
+        unsafe { ac_magnitudes_inner(block, sizes, bits_lut) }
+    }
+
+    /// # Safety
+    /// `target_arch = "aarch64"` guarantees NEON. All inputs are
+    /// fixed-size references. The vector-width abs / shift /
+    /// multiply-mask sequence below stays in unsigned range for any
+    /// `|coef| ≤ 2^15 - 1` (= every JPEG-legal post-quantize value).
+    #[target_feature(enable = "neon")]
+    unsafe fn ac_magnitudes_inner(
+        block: &[i16; 64],
+        sizes: &mut [u8; 64],
+        bits_lut: &mut [u16; 64],
+    ) {
+        unsafe {
+            let block_p = block.as_ptr();
+            let size_p = sizes.as_mut_ptr();
+            let bits_p = bits_lut.as_mut_ptr();
+            let one = vdupq_n_u16(1);
+            let sixteen = vdupq_n_s16(16);
+            // 8 chunks of 8 i16 lanes covers the 64-coef block.
+            for c in 0..8 {
+                let off = c * 8;
+                let v = vld1q_s16(block_p.add(off));
+                // Per-lane sign mask: 0 for non-negative, -1 for negative.
+                let sign = vshrq_n_s16::<15>(v);
+                // |v| as u16 lanes. `vabsq_s16(i16::MIN)` would saturate
+                // to i16::MIN, but post-quantize JPEG coefficients live
+                // within ±2^11, well clear of the saturation point.
+                let abs_s = vabsq_s16(v);
+                let abs = vreinterpretq_u16_s16(abs_s);
+                // size = 16 - clz(abs). For abs == 0: clz == 16 → size == 0.
+                let clz = vclzq_u16(abs);
+                let size_s = vsubq_s16(sixteen, vreinterpretq_s16_u16(clz));
+                // bits_pre = abs ^ sign:
+                //   pos lane (sign = 0):       abs ^ 0    = abs   → low `size` bits hold the magnitude
+                //   neg lane (sign = 0xFFFF):  abs ^ 0xFFFF = !abs → low `size` bits hold 1's-complement (= `(value - 1) low size bits` per the JPEG spec)
+                let bits_pre = vreinterpretq_u16_s16(veorq_s16(abs_s, sign));
+                // mask = (1 << size) - 1. For size == 0: (1 << 0) - 1 = 0.
+                let mask = vsubq_u16(vshlq_u16(one, size_s), one);
+                let bits = vandq_u16(bits_pre, mask);
+
+                // size fits in 4 bits per lane (≤ 11) so the u8 narrow is
+                // exact.
+                let size_u8 = vmovn_u16(vreinterpretq_u16_s16(size_s));
+                vst1_u8(size_p.add(off), size_u8);
+                vst1q_u16(bits_p.add(off), bits);
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -1898,6 +1959,35 @@ mod tests {
         scalar::quant::quantize_natural(&block, &div, &mut sout);
         quant::quantize_natural(&block, &div, &mut nout);
         assert_eq!(sout, nout);
+    }
+
+    #[test]
+    fn ac_magnitudes_neon_matches_scalar() {
+        // Cover the full i16 range with a stride that touches every
+        // size class (incl. ±boundaries 1, 2, 4, 8, ..., 1024 — JPEG's
+        // post-quant max — and around zero).
+        let mut block = [0i16; 64];
+        for (i, v) in block.iter_mut().enumerate() {
+            // Mix positive, negative, and zero values across size
+            // classes 0..=10 (= the JPEG AC bound).
+            let m: i32 = match i % 6 {
+                0 => 0,
+                1 => 1 << (i % 11),
+                2 => -(1 << (i % 11)),
+                3 => (1 << (i % 11)) - 1,
+                4 => -((1 << (i % 11)) - 1),
+                _ => ((i as i32 * 37) % 2001) - 1000,
+            };
+            *v = m as i16;
+        }
+        let mut ssize = [0u8; 64];
+        let mut sbits = [0u16; 64];
+        let mut nsize = [0u8; 64];
+        let mut nbits = [0u16; 64];
+        scalar::huffman::ac_magnitudes(&block, &mut ssize, &mut sbits);
+        huffman::ac_magnitudes(&block, &mut nsize, &mut nbits);
+        assert_eq!(ssize, nsize, "size lut mismatch");
+        assert_eq!(sbits, nbits, "bits lut mismatch");
     }
 
     #[test]

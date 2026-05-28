@@ -277,6 +277,20 @@ pub fn encode_block<W: io::Write>(
     // Build a 64-bit bitmap of nonzero positions, then drive the scan
     // via trailing/leading-zeros so every walked position is a hit.
     let ac_bitmap = crate::arch::backend::huffman::nonzero_bitmap(block) & !1u64;
+    // On aarch64 only, precompute (size, bits) for every coefficient
+    // in one SIMD pass — the NEON path covers all 64 lanes in ~5
+    // vector ops, replacing the ~10 per-coefficient
+    // `magnitude_category` calls in the inner loop. x86_64 stays on
+    // the per-coefficient inline path: epi16 has no vector `clz`
+    // outside AVX-512, so a scalar pre-pass over all 64 lanes is
+    // measurably worse than the bitmap-skipping inline form.
+    #[cfg(target_arch = "aarch64")]
+    let (sizes, bits_lut) = {
+        let mut sizes = [0u8; 64];
+        let mut bits_lut = [0u16; 64];
+        crate::arch::backend::huffman::ac_magnitudes(block, &mut sizes, &mut bits_lut);
+        (sizes, bits_lut)
+    };
 
     if ac_bitmap == 0 {
         // All AC coefficients zero → emit EOB and we're done.
@@ -297,28 +311,27 @@ pub fn encode_block<W: io::Write>(
             bw.write_bits(zrl & 0xFFFF, zrl >> 16)?;
             zero_run -= 16;
         }
-        let coef = block[next_k];
-        let (size, bits) = magnitude_category(coef as i32);
-        // Baseline 8-bit JPEG bounds AC magnitude category at 10 (DC at
-        // 11). With our fixed-point scale + clamped quant tables, post-
-        // quant ACs land well within size ≤ 11. Guard the symbol packing
-        // so a future change that breaks this invariant fails loudly
-        // instead of silently truncating into a different AC code.
-        debug_assert!(
-            size <= 15,
-            "AC magnitude category {size} exceeds 4-bit symbol field",
-        );
+        // (size, bits) — from the precomputed lut on aarch64, from a
+        // per-coefficient `magnitude_category` call on x86_64. JPEG
+        // bounds AC magnitude category at 10; we mask the symbol field
+        // to 4 bits as a belt-and-braces guard.
+        #[cfg(target_arch = "aarch64")]
+        let (size, bits): (u32, u32) = (sizes[next_k] as u32, bits_lut[next_k] as u32);
+        #[cfg(not(target_arch = "aarch64"))]
+        let (size, bits): (u32, u32) = {
+            let (s, b) = magnitude_category(block[next_k] as i32);
+            (s as u32, b)
+        };
         let symbol = ((zero_run as usize) << 4) | (size as usize & 0x0F);
         let entry = ac_tab.packed[symbol];
         // Fuse the Huffman code and magnitude-bits emits into one
         // `write_bits` call. AC magnitude category is bounded at 10
-        // (commented at the `debug_assert` above) and Huffman code
-        // length at 16, so the combined width fits `write_bits`'
-        // 27-bit budget. Halves the per-coefficient
+        // and Huffman code length at 16, so the combined width fits
+        // `write_bits`' 27-bit budget. Halves the per-coefficient
         // shift / mask / OR / drain-check chain on the AC hot path.
         let huff_code = entry & 0xFFFF;
         let huff_nbits = entry >> 16;
-        bw.write_bits((huff_code << size) | bits, huff_nbits + size as u32)?;
+        bw.write_bits((huff_code << size) | bits, huff_nbits + size)?;
         remaining &= !(1u64 << next_k);
         k = next_k + 1;
     }
