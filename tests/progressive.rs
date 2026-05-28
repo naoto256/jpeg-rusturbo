@@ -85,7 +85,10 @@ fn count_sos(jpeg: &[u8]) -> usize {
 }
 
 #[test]
-fn progressive_emits_sof2_and_four_scans() {
+fn progressive_emits_sof2_and_full_sa_scan_plan() {
+    // 8-scan successive-approximation plan:
+    //   DC first, AC Y first, AC Cb first, AC Cr first,
+    //   DC refine, AC Y refine, AC Cb refine, AC Cr refine.
     let pixels = gradient_rgb(64, 64);
     let mut out = Vec::new();
     {
@@ -98,7 +101,7 @@ fn progressive_emits_sof2_and_four_scans() {
     let sof0_count = segs.iter().filter(|(m, _)| *m == 0xC0).count();
     assert_eq!(sof2_count, 1, "expected one SOF2");
     assert_eq!(sof0_count, 0, "SOF0 should be absent in progressive output");
-    assert_eq!(count_sos(&out), 4, "expected 4 SOS segments (DC + AC × 3)");
+    assert_eq!(count_sos(&out), 8, "expected 8 SOS segments for SA scan plan");
 }
 
 #[test]
