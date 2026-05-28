@@ -21,8 +21,14 @@ src/
 ├── huffman.rs              — HuffmanTable, BitWriter, encode_block,
 │                             magnitude_category (encode side)
 ├── huffman_optimize.rs     — two-pass optimized Huffman table builder
-├── markers.rs              — JPEG segment writers (SOI, APP0, DQT,
-│                             SOF0, DHT, SOS, EOI)
+├── progressive_encode.rs   — progressive (SOF2) encode-side pipeline:
+│                             8-scan successive-approximation plan
+│                             (DC first / AC first per-component / DC
+│                             refine / AC refine), four encoder kernels
+├── markers.rs              — JPEG segment writers (SOI, APP0, APP1
+│                             EXIF, APP2 ICC multi-segment, DQT,
+│                             SOF0 / SOF2, DHT, SOS / SOS-spectral,
+│                             EOI)
 ├── tables.rs               — JPEG Annex K standard tables + ZIGZAG
 ├── decode/
 │   ├── mod.rs              — public Decoder + decode() entry points,
@@ -206,6 +212,7 @@ backend the host can reach.
 | Quant divisor construction (`compute_reciprocal`) | `src/quant.rs` |
 | Encode-side bit-stuffing, byte-stuffing, Huffman emission | `src/huffman.rs` |
 | Two-pass optimized Huffman table builder | `src/huffman_optimize.rs` |
+| Progressive (SOF2) encode (8-scan SA plan, DC/AC first + refine) | `src/progressive_encode.rs` |
 | Decode entry points (`Decoder`, `decode`) | `src/decode/mod.rs` |
 | Baseline scan, dequant fusion, IDCT dispatch | `src/decode/baseline.rs` |
 | Progressive (multi-scan) decode | `src/decode/progressive.rs` |
