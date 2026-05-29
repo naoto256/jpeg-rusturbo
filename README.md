@@ -64,7 +64,9 @@ fancy chroma upsample, output in any of eight pixel layouts. The
 0.7.5 hot-path changes (entropy + dequant fusion, AVX2 PSHUFB
 RGB interleave, uninit-alloc) are why; the smaller-resolution
 fixed-cost overhead means we still trail by 5–11% at 1592×1124 /
-1080p on Cascade Lake, which is queued for 0.8.x.
+1080p on Cascade Lake. The decoder side wasn't reopened in 0.8.0
+(that cycle was encoder-focused — see Status below) and the
+small-resolution gap on Cascade Lake remains an open item.
 
 ## Performance
 
