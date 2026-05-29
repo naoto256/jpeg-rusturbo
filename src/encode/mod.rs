@@ -23,9 +23,9 @@ use crate::tables::{
 use crate::{ChromaSubsampling, PixelFormat};
 
 use huffman::{BitWriter, HuffmanTable, encode_block};
-use quant::Divisors;
 
 use crate::arch;
+use crate::tables::{Divisors, build_divisors};
 
 /// Run-time `ChromaSubsampling` enum → static `SamplingScheme` type
 /// dispatch. The trait is consumed by generic functions
@@ -259,12 +259,14 @@ impl<W: Write> JpegEncoder<W> {
     /// shape for slow-network photo delivery (browsers, image
     /// galleries).
     ///
-    /// This first cut ships a four-scan **spectral** plan: DC of all
-    /// three components interleaved, then per-component AC at full
-    /// precision. Successive-approximation refinement (which trades
-    /// scan count for additional ~5-10% file-size reduction and
-    /// smoother progressive rendering) is a follow-up; the output is
-    /// already valid progressive JPEG without it.
+    /// This ships the full eight-scan **successive-approximation**
+    /// plan: DC of all three components interleaved first, then
+    /// per-component AC at the first approximation (`Al=1`), followed
+    /// by the DC interleaved refinement and per-component AC
+    /// refinement passes (`Al=0`). That exercises all four T.81 Annex
+    /// G scan types (DC first, AC first, DC refine, AC refine), so the
+    /// output is decodable by every conforming progressive decoder
+    /// (including this crate's).
     ///
     /// Mutually exclusive with the optimized-Huffman two-pass path —
     /// when both are set, progressive wins (the optimized-Huffman
@@ -375,8 +377,8 @@ impl<W: Write> JpegEncoder<W> {
                 scale_quant_table(&STD_CHROMA_QUANT, self.quality),
             ),
         };
-        let div_luma = quant::build_divisors(&luma_q);
-        let div_chroma = quant::build_divisors(&chroma_q);
+        let div_luma = build_divisors(&luma_q);
+        let div_chroma = build_divisors(&chroma_q);
 
         // Progressive (SOF2) takes precedence — it ships its own
         // SOI..EOI shape with multi-scan entropy. Optimized Huffman
@@ -504,8 +506,8 @@ impl<W: Write> JpegEncoder<W> {
         width: u32,
         height: u32,
         layout: PixelLayout,
-        div_luma: &quant::Divisors,
-        div_chroma: &quant::Divisors,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
     ) -> io::Result<()> {
         // Re-derive quant tables for header emission (cheap; matches
         // exactly what the caller computed).
@@ -534,8 +536,8 @@ fn encode_optimized<S: SamplingScheme, W: Write>(
     layout: PixelLayout,
     luma_q: &[u8; 64],
     chroma_q: &[u8; 64],
-    div_luma: &quant::Divisors,
-    div_chroma: &quant::Divisors,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
 ) -> io::Result<()> {
     let mcus_x = width.div_ceil(S::MCU_W);
     let mcus_y = height.div_ceil(S::MCU_H);
