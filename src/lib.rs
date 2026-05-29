@@ -57,17 +57,21 @@
 //! SSE2 on x86_64) are translated from libjpeg-turbo with bit-exact
 //! output guarantees against the scalar reference. Versus the
 //! `image` crate's scalar encoder, jpeg-rusturbo's encoder is
-//! ~4.5× on Apple M and ~3.5× on Cascade Lake at 4K 4:2:0 q=80
+//! ~4.5× on Apple M and ~5.5× on Cascade Lake at 4K 4:2:0 q=80
 //! (up from ~2.9× / ~3.3× in 0.7.5 — the 0.8.0 encoder hot-path
 //! pass added unsafe `BitWriter::drain_high32`, NEON
 //! `vqtbl4q`-based zig-zag scatter, fused AC code+magnitude
-//! `write_bits`, and a one-shot SIMD precompute of the JPEG
-//! magnitude category; the first two help both backends, the
-//! latter two are NEON-only). Opt-in [`JpegEncoder::set_threads`]
-//! adds another 1.2–2.2× on top via MCU-row parallelism; opt-in
+//! `write_bits`, a one-shot SIMD precompute of the JPEG magnitude
+//! category, and an AVX2 3-byte RGB→YCbCr deinterleave kernel; the
+//! `drain_high32` + AC fusion help both backends, the zig-zag
+//! scatter + magnitude precompute are NEON-only, the RGB color
+//! kernel is AVX2-only. The Cascade ratio runs higher than Apple's
+//! mainly because `image`'s scalar encoder is slower on that CPU).
+//! Opt-in [`JpegEncoder::set_threads`] adds another 1.2–2.4× on
+//! top via MCU-row parallelism; opt-in
 //! [`JpegEncoder::set_optimize_huffman`] trims output size ~5%
-//! across subsampling/quality at ~1.5–1.8× encode cost. Encode
-//! speed is the headline.
+//! across subsampling/quality at ~1.7× (AVX2) / ~2.3× (NEON)
+//! encode cost. Encode speed is the headline.
 //!
 //! 0.8.0 also adds two encoder-surface features:
 //! [`JpegEncoder::set_progressive`] for SOF2 output (8-scan
@@ -84,8 +88,8 @@
 //! color convert, and fancy chroma upsample in NEON + AVX2). As of
 //! 0.7.5 (entropy + dequant fusion, AVX2 PSHUFB RGB interleave,
 //! uninit `Vec` allocation) it sits ahead of `image` at 4K on both
-//! microarchitectures and both corpora (~1.06–1.10× on synthetic
-//! Huffman-heavy content, ~1.19–1.21× on natural-content), while
+//! microarchitectures and both corpora (~1.03–1.10× on synthetic
+//! Huffman-heavy content, ~1.18–1.22× on natural-content), while
 //! matching coverage — baseline + progressive Huffman, fancy chroma
 //! upsample, all eight pixel layouts. 0.8.0 doesn't touch the
 //! decoder; the above carries over. The IDCT carries DC-only and
