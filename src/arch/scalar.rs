@@ -531,7 +531,7 @@ pub mod sample {
 // quant: reciprocal-multiply quantize, natural-order output
 // ===========================================================================
 pub mod quant {
-    use crate::encode::quant::Divisors;
+    use crate::tables::Divisors;
 
     /// Quantize a 64-element block using the precomputed divisors, in
     /// natural (DCT) order. The caller applies zig-zag separately —
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn quantize_reciprocal_round_trip_small() {
-        use crate::encode::quant::{Divisors, build_divisors};
+        use crate::tables::{Divisors, build_divisors};
         // For typical small divisors the reciprocal-multiply form must
         // match `(x + d/2) / d` for every x in our coefficient range.
         for d in [1u8, 1, 11, 99, 255] {

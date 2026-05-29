@@ -52,8 +52,8 @@ use crate::{ChromaSubsampling, PixelLayout};
 
 use super::huffman::{BitWriter, HuffmanTable, magnitude_category};
 use super::markers;
-use super::quant::Divisors;
 use super::{JpegEncoder, SamplingScheme, Yuv420Scheme, Yuv422Scheme, Yuv444Scheme};
+use crate::tables::Divisors;
 
 /// Successive-approximation `Al` for first scans. `Al_refine = 0` (=
 /// final precision) is hard-coded — a future minor could expose
