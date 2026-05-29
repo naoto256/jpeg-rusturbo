@@ -281,7 +281,9 @@ fn upsample_chroma_row(
         let nbr_row = &plane.samples[neighbor * plane.stride..neighbor * plane.stride + plane_w];
         arch::backend::sample::h2v2_fancy_vblend(cur_row, nbr_row, vblend, plane_w);
     } else {
-        // v_step > 2 (4:1:1 / 4:4:0 / unusual): box-replicate verbatim.
+        // v_step > 2 (unusual vertical 3:1 / 4:1 subsampling — no
+        // standard layout lands here; 4:4:0 is v_step == 2 above,
+        // 4:1:1 is v_step == 1): box-replicate verbatim.
         let cy = (j_out / v_step).min(plane_h.saturating_sub(1));
         let off = cy * plane.stride;
         vblend[..plane_w].copy_from_slice(&plane.samples[off..off + plane_w]);

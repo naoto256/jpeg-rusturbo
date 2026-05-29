@@ -1,469 +1,324 @@
 # `jpeg-rusturbo` benchmarks
 
-All numbers below come from the unified harness in `src/bin/bench.rs`
-(encode + decode) and `tests/comparison_bench.rs` (vs the `image`
-crate). Methodology is intentionally simple — single timed batch, 50
-measured iterations after a 3-iteration warm-up, no statistical
-filtering. The synthetic XOR-pattern image (`make_image` in
-`bench.rs`) keeps the AC histogram non-degenerate so the entropy
-coder isn't artificially fast, and gives pixel-identical inputs
-across hosts for apples-to-apples comparison.
+All numbers below come from one coherent measurement campaign per host
+on 2026-05-30, driven by the harness in `src/bin/bench.rs` (encode +
+decode) and `tests/comparison_bench.rs` (vs the `image` crate). Both
+hosts ran the identical command sequence, so every table appears as a
+matched pair — one per host, same shape. The rightmost column is always
+the multiplier (speedup or ratio): scan it down a column and the win
+reads at a glance.
 
-Reproduce on any host with:
+Methodology is intentionally simple: a single timed batch, 50 measured
+iterations after a 3-iteration warm-up, no statistical filtering. Two
+synthetic corpora feed the harness:
+
+- **synthetic** (`make_image`): an XOR/multiply pattern where every 8×8
+  block is full-AC. This keeps the entropy coder honest and the IDCT
+  sparse fast paths cold — the Huffman-heavy worst case for both encode
+  and decode. Pixel-identical across hosts.
+- **natural-like** (`make_natural_image`): ~70% smooth gradient (sky /
+  wall), ~20% low-AC texture, ~10% sharp edges. After quantize this
+  produces the DC-dominant + low-AC block mix of real photographic
+  content, and is the fairer proxy for typical web/photo input.
+
+Reproduce the whole campaign on any host with three commands:
 
 ```sh
-cargo run --release --bin bench -- --section all                          # SIMD build
-cargo run --release --features force-scalar --bin bench -- --section all  # scalar fallback
-cargo test  --release --test comparison_bench -- --ignored --nocapture    # vs image crate
+cargo run  --release                         --bin bench -- --section all   # SIMD build
+cargo run  --release --features force-scalar --bin bench -- --section all   # scalar fallback
+cargo test --release --test comparison_bench -- --ignored --nocapture      # vs image crate
 ```
+
+The release profile is `lto = "fat"` + `codegen-units = 1`; all numbers
+are with that profile. Encode timings use the 4-byte RGBA input path
+(the 3-byte RGB path tracks within ~1–2% on both backends as of 0.8.0);
+the vs-`image` comparison feeds 3-byte RGB to both encoders, the fair
+input for `image`. Output bytes are byte-identical across SIMD ↔ scalar,
+across hosts, and across RGB ↔ RGBA input — the bit-exact equivalence
+the crate sets out to preserve, asserted in the unit tests.
 
 ## Hosts
 
-| Label                | CPU                                       | Cores | SIMD floor       |
-| -------------------- | ----------------------------------------- | ----- | ---------------- |
-| Apple M-series       | Apple Silicon (M-series)                  | 8 P+E | NEON (always-on) |
-| Intel Xeon (Cascade Lake) | Xeon Platinum 8272CL @ 2.60 GHz        | 4 vCPU | AVX2 + SSE2  |
+| Label                     | CPU                                | Cores  | SIMD floor       |
+| ------------------------- | ---------------------------------- | ------ | ---------------- |
+| Apple M-series            | Apple Silicon (M-series)           | 8 P+E  | NEON (always-on) |
+| Intel Xeon (Cascade Lake) | Xeon Platinum 8272CL @ 2.60 GHz    | 4 vCPU | AVX2 + SSE2      |
 
-Intel host was a fresh 4-vCPU cloud VM (Ubuntu 24.04, Rust stable).
-The shared-tenant 4-vCPU bucket we use rotates through Broadwell →
-Skylake → Cascade Lake → Ice Lake as the underlying inventory
-changes, so absolute ms numbers aren't directly comparable across
-releases; the SIMD-vs-scalar ratios and the vs-`image`-crate ratios
-are.
+The Cascade Lake host was a 4-vCPU Azure `D4s_v3`. The Apple M host was
+a developer laptop on AC power; background load was light but non-zero,
+so on that host trust the *ratios* a little more than the raw ms.
 
-Apple M was a developer laptop with background chat / IDE running —
-performance-core load was light but non-zero, so trust the *ratios*
-more than the raw ms numbers there.
-
-The release profile in `Cargo.toml` is `lto = "fat"` +
-`codegen-units = 1` (set in 0.6.0); all numbers below are with that
-profile.
+A note on the vs-`image` ratios (third chapter): they reflect *both* our
+speed and `image`'s scalar-encoder baseline on that CPU. `image`'s
+encoder is markedly slower on the Cascade Lake VM than on the Apple M
+laptop, so the Cascade ratios run higher even though our absolute encode
+is slower there. Read each ratio as "vs `image` on this host," not as a
+cross-host hardware comparison.
 
 ---
 
-## Section A — encode pipeline
+# Encode
 
-`q=80`, single thread, optimize-huffman off, baseline (SOF0). Pure
-encode time (`JpegEncoder::encode_rgba`), ms/iter.
+`q=80`, single thread unless noted. All times ms/iter.
 
-### Apple M-series (aarch64)
+## SIMD vs scalar
 
-| Resolution                  | 4:4:4 NEON | 4:2:2 NEON | 4:2:0 NEON |
-| --------------------------- | ---------: | ---------: | ---------: |
-| 1592 × 1124 (session size)  |    7.09 ms |    4.74 ms |    3.65 ms |
-| 1920 × 1080 (1080p)         |    8.21 ms |    5.47 ms |    4.17 ms |
-| 3840 × 2160 (4K)            |   31.19 ms |   21.27 ms |   16.90 ms |
+SIMD build vs `--features force-scalar`, at 4K. Isolates the per-backend
+kernel win. The speedup is essentially scale-invariant (it tracks
+per-pixel work), so the 4K row stands in for every resolution.
 
-vs 0.7.5 at 4K 4:2:0: **22.20 ms → 16.90 ms (-23.9%)** from the
-0.8.0 encoder hot-path pass — unsafe `BitWriter::drain_high32`,
-NEON `vqtbl4q`-based zig-zag scatter, fused AC code+magnitude
-`write_bits`, and a one-shot SIMD precompute of the JPEG
-magnitude category for every coefficient in the block. The first
-three help every backend; the magnitude precompute is NEON-only
-(epi16 has no vector `clz` outside AVX-512).
+**Apple M-series (NEON)**
 
-### Intel Xeon (Cascade Lake) x86_64
+| Subsampling (4K) | SIMD     | scalar   | speedup |
+| ---------------- | -------: | -------: | ------: |
+| 4:4:4            | 29.17 ms | 55.37 ms |   1.90× |
+| 4:2:2            | 19.69 ms | 40.34 ms |   2.05× |
+| 4:2:0            | 16.06 ms | 37.27 ms |   2.32× |
 
-| Resolution                  | 4:4:4 AVX2 | 4:2:2 AVX2 | 4:2:0 AVX2 |
-| --------------------------- | ---------: | ---------: | ---------: |
-| 1592 × 1124 (session size)  |   31.62 ms |   18.12 ms |   14.22 ms |
-| 1920 × 1080 (1080p)         |   36.39 ms |   20.78 ms |   16.44 ms |
-| 3840 × 2160 (4K)            |  144.55 ms |   82.83 ms |   65.68 ms |
+**Intel Xeon (Cascade Lake, AVX2)**
 
-vs 0.7.5 at 4K 4:2:0: **73.37 ms → 65.68 ms (-10.5%)** from the
-two backend-agnostic items in the 0.8.0 encoder pass (`drain_high32`
-+ AC fusion). The NEON-only items (zig-zag scatter, magnitude
-precompute) leave Cascade Lake's AVX2 path untouched — AVX2
-equivalents are queued for 0.9.0 (zig-zag via `vpermd` /
-`vpshufb`, magnitude lookup via PSHUFB-based bit-length table).
+| Subsampling (4K) | SIMD      | scalar    | speedup |
+| ---------------- | --------: | --------: | ------: |
+| 4:4:4            | 145.80 ms | 273.37 ms |   1.88× |
+| 4:2:2            |  83.82 ms | 205.57 ms |   2.45× |
+| 4:2:0            |  65.69 ms | 160.30 ms |   2.44× |
 
-Output bytes are byte-identical across SIMD ↔ scalar and across
-hosts (e.g. 4K 4:2:0 q=80 baseline = `1940692` bytes everywhere).
-This is the bit-exact equivalence we set out to preserve when
-porting libjpeg-turbo's integer LL&M DCT, and is asserted in the
-unit tests.
+The win grows toward 4:2:0 as chroma downsampling shrinks the planes the
+SIMD color + DCT kernels run over. 0.8.0's encoder cycle added an unsafe
+`BitWriter::drain_high32`, fused AC code+magnitude `write_bits`, a NEON
+`vqtbl4q` zig-zag scatter, a NEON magnitude-category precompute, and an
+AVX2 3-byte RGB→YCbCr deinterleave kernel.
 
-### Progressive (SOF2) encode
+## Thread scaling
 
-`q=80`, single thread, 4:2:0, 4K natural-content gradient, Apple M:
+4:2:0, SIMD build. `set_threads(n)` partitions MCU rows across a rayon
+pool; `auto` picks `available_parallelism()`. Output bytes are identical
+across thread counts.
 
-| mode               | encode    | file size |
-| ------------------ | --------: | --------: |
-| baseline (SOF0)    |  11.33 ms |    168 KB |
-| progressive (SOF2) |  27.91 ms |    264 KB |
+**Apple M-series (8 cores)**
 
-The SOF2 path quantizes every block once into a per-component
-buffer (~13 MB at 4K 4:2:0) and then runs the 8-scan successive-
-approximation plan over the stored coefficients. Encode time is
-the spec-bound 2.5× of baseline (one buffer pass + eight scan
-passes). The +57% file size is on us, not the spec: the
-progressive encoder emits `EOB0` per block rather than the
-multi-block `EOBn` runs the format permits, because the Annex K
-reference Huffman tables this crate ships don't carry `EOBn`
-codes for `n ≥ 1`. A future `encode_progressive_optimize` (mirror
-of the existing optimized-Huffman baseline path) can derive
-tables that include the `EOBn` symbols and recover the
-file-size loss, at the cost of a second entropy pass.
+| Resolution | t=1      | t=2      | t=4     | t=8     | auto    | auto vs t=1 |
+| ---------- | -------: | -------: | ------: | ------: | ------: | ----------: |
+| 1080p      |  3.90 ms |  2.63 ms | 2.08 ms | 1.96 ms | 1.90 ms |       2.05× |
+| 4K         | 16.14 ms | 10.03 ms | 7.92 ms | 7.02 ms | 6.85 ms |       2.36× |
 
----
+**Intel Xeon (Cascade Lake, 4 vCPU)**
 
-## Section B — threads scaling
+| Resolution | t=1      | t=2      | t=4      | t=8      | auto     | auto vs t=1 |
+| ---------- | -------: | -------: | -------: | -------: | -------: | ----------: |
+| 1080p      | 16.69 ms | 13.70 ms | 14.40 ms | 14.69 ms | 13.71 ms |       1.22× |
+| 4K         | 66.23 ms | 54.72 ms | 56.11 ms | 53.39 ms | 53.60 ms |       1.24× |
 
-`q=80`, 4:2:0, optimize-huffman off. Threads are MCU-rows partitioned
-across rayon worker pool; `threads=auto` picks
-`available_parallelism()`.
+The 4-vCPU Cascade Lake saturates at 2 threads; the 8-core Apple host
+reaches ~2.4× at 4K.
 
-### Apple M-series (NEON, 8 cores)
+## Optimize-huffman
 
-| Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
-| ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
-| 1920×1080 (1080p)  |   4.00 ms |   2.54 ms |   2.06 ms |   1.92 ms |      1.83 ms |            2.19× |
-| 3840×2160 (4K)     |  15.75 ms |  10.10 ms |   7.93 ms |   7.06 ms |      6.93 ms |            2.27× |
+`set_optimize_huffman(true)` adds a second pass (count frequencies, build
+canonical T.81 K.2/K.3 tables, re-emit). The size reduction is
+host-independent (identical bytes everywhere), so it's one table.
 
-### Intel Xeon (Cascade Lake, AVX2, 4 vCPU)
+| Subsampling | q70    | q80    | q90    |
+| ----------- | -----: | -----: | -----: |
+| 4:4:4       | −5.74% | −5.67% | −5.62% |
+| 4:2:2       | −5.53% | −5.31% | −5.32% |
+| 4:2:0       | −5.29% | −4.89% | −4.58% |
 
-| Resolution         | threads=1 | threads=2 | threads=4 | threads=8 | threads=auto | speedup (auto/1) |
-| ------------------ | --------: | --------: | --------: | --------: | -----------: | ---------------: |
-| 1920×1080 (1080p)  |  16.67 ms |  13.59 ms |  14.74 ms |  14.86 ms |     14.09 ms |            1.18× |
-| 3840×2160 (4K)     |  65.80 ms |  54.34 ms |  53.73 ms |  52.81 ms |     52.99 ms |            1.24× |
+Roughly −5% on synthetic content; 4–10% on natural photos, matching
+`cjpeg -optimize`. The second pass roughly doubles encode wall-clock —
+4K 4:2:0 q=80 costs **2.28×** on Apple M (16.53 → 37.67 ms) and **1.71×**
+on Cascade Lake (65.59 → 112.15 ms); the factor is larger on NEON
+because its faster first pass leaves the second, largely scalar, pass
+weighing more. Opt-in for when bandwidth matters more than CPU.
 
-The 4-vCPU Cascade Lake saturates at 2 threads on 1080p; per-MCU
-work-per-chunk isn't enough to offset rayon's scheduling cost beyond
-that. The 8-core Apple host gets ~2.2× at 4K. Output bytes are
-byte-identical across all thread counts (asserted in
-`tests/threaded.rs`).
+## Progressive (cost of SOF2)
 
----
+This one is a *cost*, not a speedup: `set_progressive(true)` emits SOF2
+instead of baseline. 4:2:0, natural-like content, SIMD build. Rightmost
+columns are the time and size multipliers over baseline.
 
-## Section C — optimized Huffman (size)
+**Apple M-series (NEON)**
 
-`set_optimize_huffman(true)` enables a second pass: count symbol
-frequencies, build canonical Huffman tables (T.81 K.2/K.3), re-emit
-the scan. Size delta is host-independent (it's purely about the
-tables); we show the Apple M-series numbers, the Intel numbers are
-identical to within rounding.
+| Resolution | baseline | progressive | time  | size  |
+| ---------- | -------: | ----------: | ----: | ----: |
+| 1592×1124  |  2.34 ms |     6.06 ms | 2.59× | 1.43× |
+| 1080p      |  2.67 ms |     6.95 ms | 2.60× | 1.44× |
+| 4K         | 11.22 ms |    27.66 ms | 2.46× | 1.48× |
 
-### Size delta vs default tables (4K, all subsamplings × quality)
+**Intel Xeon (Cascade Lake, AVX2)**
 
-| Subsampling | q  | bytes (off) | bytes (on)  | Δ        |
-| ----------- | -- | ----------: | ----------: | -------: |
-| 4:4:4       | 70 |   2,804,405 |   2,644,405 |   −5.71% |
-| 4:4:4       | 80 |   3,701,792 |   3,491,157 |   −5.69% |
-| 4:4:4       | 90 |   5,663,832 |   5,344,940 |   −5.63% |
-| 4:2:2       | 70 |   1,996,329 |   1,886,443 |   −5.50% |
-| 4:2:2       | 80 |   2,618,066 |   2,478,247 |   −5.34% |
-| 4:2:2       | 90 |   3,984,627 |   3,773,697 |   −5.29% |
-| 4:2:0       | 70 |   1,498,562 |   1,419,961 |   −5.25% |
-| 4:2:0       | 80 |   1,940,692 |   1,846,090 |   −4.87% |
-| 4:2:0       | 90 |   2,905,130 |   2,771,322 |   −4.61% |
+| Resolution | baseline | progressive | time  | size  |
+| ---------- | -------: | ----------: | ----: | ----: |
+| 1592×1124  |  7.56 ms |    20.02 ms | 2.65× | 1.43× |
+| 1080p      |  8.44 ms |    23.05 ms | 2.73× | 1.44× |
+| 4K         | 34.64 ms |    92.16 ms | 2.66× | 1.48× |
 
-Roughly a consistent **−5%** across the matrix on synthetic content.
-On natural photographic input the win typically sits in the 4–10%
-range, matching `cjpeg -optimize`.
-
-### Time cost (two-pass)
-
-Two-pass means encode roughly doubles in wall-clock. On 4K 4:2:0 q=80:
-
-| Host                        | off (ms) | on (ms) | factor |
-| --------------------------- | -------: | ------: | -----: |
-| Apple M-series (NEON)       |    23.81 |   42.71 | 1.79×  |
-| Intel Xeon (Cascade Lake AVX2) |  73.65 |  111.94 | 1.52×  |
-
-Worth it when bandwidth matters more than CPU; opt-in by default for
-exactly that trade-off.
+The ~2.5× time is spec-bound (one buffer pass + eight scan passes over
+the stored coefficients). The +43–48% size is on us, not the spec: the
+encoder emits `EOB0` per block rather than the multi-block `EOBn` runs
+the format permits, because the Annex K reference Huffman tables this
+crate ships carry no `EOBn` codes for `n ≥ 1`. A future
+`encode_progressive_optimize` (optimized-Huffman for SOF2) could derive
+tables with the `EOBn` symbols and recover the size. Size factor is
+content-shaped and host-independent.
 
 ---
 
-## Section D — decode pipeline (NEW in 0.6.0)
+# Decode
 
-`q=80`, default knobs. Times decode of the JPEGs that Section A
-emits (same `make_image` source), so a single resolution × subsampling
-cell is comparable across the encode / decode columns.
+The decoder was not reopened in 0.8.0 (an encoder cycle); these are the
+0.7.x decode kernels measured fresh on the new harness. `q=80`, 4K.
 
-### Apple M-series (aarch64)
+## SIMD vs scalar
 
-| Resolution                  | 4:4:4 NEON | 4:4:4 scalar | 4:2:2 NEON | 4:2:2 scalar | 4:2:0 NEON | 4:2:0 scalar |
-| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   10.74 ms |     14.20 ms |    7.51 ms |     12.01 ms |    5.78 ms |     10.10 ms |
-| 1920 × 1080 (1080p)         |   12.47 ms |     16.05 ms |    8.56 ms |     13.57 ms |    6.58 ms |     11.42 ms |
-| 3840 × 2160 (4K)            |   48.84 ms |     64.22 ms |   34.25 ms |     55.12 ms |   25.98 ms |     45.81 ms |
+SIMD build vs `--features force-scalar`, on both corpora. The gap between
+synthetic and natural is the whole point of the sparse / combined-LUT /
+SWAR work: on synthetic (every block full-AC) only the raw SIMD kernels
+fire; on natural the sparse fast paths fire on top.
 
-NEON decode speedup vs `force-scalar`: 1.32× (4:4:4 4K) → **1.76×**
-(4:2:0 4K). Source: IDCT (cycle 1 / DS1 NEON jidctint), color
-convert (cycle 1 / DS3 NEON ycc_row_to_rgb), fancy chroma upsample
-(cycle 2 / DS5 NEON h2v2 + h2 fancy). The 4:4:4 path lacks fancy
-upsample (no chroma downsampling to upsample back), so the speedup
-there comes from IDCT + color only.
+**Apple M-series (NEON)**
 
-### Intel Xeon (Cascade Lake) x86_64
+| Corpus (4K)      | SIMD     | scalar   | speedup |
+| ---------------- | -------: | -------: | ------: |
+| synthetic 4:4:4  | 33.17 ms | 49.52 ms |   1.49× |
+| synthetic 4:2:0  | 18.20 ms | 36.81 ms |   2.02× |
+| natural   4:4:4  |  8.04 ms | 27.16 ms |   3.38× |
+| natural   4:2:0  |  5.75 ms | 26.24 ms |   4.56× |
 
-| Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
-| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   34.09 ms |     48.47 ms |   24.43 ms |     42.88 ms |   19.51 ms |     37.40 ms |
-| 1920 × 1080 (1080p)         |   38.73 ms |     56.62 ms |   28.15 ms |     49.42 ms |   22.39 ms |     43.12 ms |
-| 3840 × 2160 (4K)            |  152.75 ms |    222.94 ms |  110.76 ms |    196.81 ms |   89.32 ms |    170.70 ms |
+**Intel Xeon (Cascade Lake, AVX2)**
 
-AVX2 decode speedup vs `force-scalar`: 1.46× (4:4:4 4K) → **1.91×**
-(4:2:0 4K). AVX2 jidctint + AVX2 ycc_row_to_rgb + AVX2 fancy upsample
-account for the gain on synthetic content. Sparse fast paths and the
-combined Huffman LUT fire near-zero on XOR-pattern blocks, so the
-synthetic numbers move only with the SIMD kernels themselves.
+| Corpus (4K)      | SIMD      | scalar    | speedup |
+| ---------------- | --------: | --------: | ------: |
+| synthetic 4:4:4  | 104.00 ms | 174.08 ms |   1.67× |
+| synthetic 4:2:0  |  58.13 ms | 139.44 ms |   2.40× |
+| natural   4:4:4  |  32.41 ms | 110.19 ms |   3.40× |
+| natural   4:2:0  |  22.51 ms | 107.98 ms |   4.80× |
 
----
-
-## Section D-natural — decode pipeline, natural-like content
-
-The synthetic XOR-pattern image used everywhere above keeps the AC
-histogram non-degenerate, but it has *no* smooth regions — so the
-IDCT sparse fast paths (DC-only, rows-4-7-zero, cols-4-7-zero) which
-fire on flat sky / wall / out-of-focus background blocks in real
-photographs never trigger. Section D-natural runs the same decode
-harness against `make_natural_image` — a procedural mix of smooth
-gradients, low-amplitude noise, and sharp edges that approximates
-the AC distribution of camera content.
-
-Same JPEGs are produced by the same encoder at q=80; the natural-like
-input simply produces JPEGs that are 8–12× smaller and decode 3×
-faster because most blocks have only a few low-frequency coefficients
-to invert.
-
-### Apple M-series (aarch64)
-
-| Resolution                  | 4:4:4 NEON | 4:2:2 NEON | 4:2:0 NEON |
-| --------------------------- | ---------: | ---------: | ---------: |
-| 1592 × 1124 (session size)  |    3.39 ms |    2.43 ms |    2.07 ms |
-| 1920 × 1080 (1080p)         |    3.71 ms |    2.78 ms |    2.38 ms |
-| 3840 × 2160 (4K)            |   14.43 ms |   10.80 ms |    9.10 ms |
-
-### Intel Xeon (Cascade Lake) x86_64
-
-| Resolution                  | 4:4:4 AVX2 | 4:4:4 scalar | 4:2:2 AVX2 | 4:2:2 scalar | 4:2:0 AVX2 | 4:2:0 scalar |
-| --------------------------- | ---------: | -----------: | ---------: | -----------: | ---------: | -----------: |
-| 1592 × 1124 (session size)  |   14.70 ms |     31.31 ms |   11.04 ms |     30.57 ms |    9.64 ms |     28.16 ms |
-| 1920 × 1080 (1080p)         |   16.71 ms |     35.50 ms |   12.41 ms |     35.21 ms |   11.15 ms |     32.71 ms |
-| 3840 × 2160 (4K)            |   65.16 ms |    143.74 ms |   51.52 ms |    143.49 ms |   43.88 ms |    130.69 ms |
-
-AVX2 speedup vs `force-scalar` on natural content: 2.21× (4:4:4 4K) →
-**2.98×** (4:2:0 4K) — wider than on synthetic XOR because both the
-SIMD kernels *and* the sparse fast paths contribute.
-
-### IDCT sparse path — on / off comparison
-
-Toggled by forcing the sparse-detection flags in `arch::backend::dct`
-to `false` at build time (revert pattern, not a runtime knob), so the
-on/off pair is two binaries with otherwise-identical code.
-
-| Subsampling × size | Apple M NEON on | NEON off | NEON gain | Cascade Lake AVX2 on | AVX2 off | AVX2 gain |
-| ------------------ | --------------: | -------: | --------: | -------------------: | -------: | --------: |
-| 4:4:4  1592×1124   |         3.39 ms |  4.00 ms |    +15.3% |             14.70 ms | 16.23 ms |    +10.4% |
-| 4:4:4  1080p       |         3.71 ms |  4.44 ms |    +16.4% |             16.71 ms | 18.76 ms |    +12.3% |
-| 4:4:4  4K          |        14.43 ms | 17.79 ms |    +18.9% |             65.16 ms | 75.43 ms |    +15.8% |
-| 4:2:2  1592×1124   |         2.43 ms |  2.86 ms |    +15.0% |             11.04 ms | 12.32 ms |    +11.6% |
-| 4:2:2  1080p       |         2.78 ms |  3.27 ms |    +15.0% |             12.41 ms | 14.15 ms |    +14.0% |
-| 4:2:2  4K          |        10.80 ms | 13.19 ms |    +18.1% |             51.52 ms | 58.43 ms |    +13.4% |
-| 4:2:0  1592×1124   |         2.07 ms |  2.33 ms |    +11.2% |              9.64 ms | 10.90 ms |    +13.1% |
-| 4:2:0  1080p       |         2.38 ms |  2.68 ms |    +11.2% |             11.15 ms | 12.36 ms |    +10.9% |
-| 4:2:0  4K          |         9.10 ms | 10.55 ms |    +13.7% |             43.88 ms | 49.21 ms |    +12.1% |
-
-The pattern is consistent across both backends: sparse contributes
-~11–19% of decode time on natural content, more at 4:4:4 (no chroma
-upsample diluting IDCT share) and less at 4:2:0 (chroma upsample
-absorbs a larger fraction of the cycle budget so the IDCT
-optimization moves a smaller slice of the total). On the synthetic
-XOR corpus the same on/off swap shows ≤ 2% drift — entirely noise —
-which is why this measurement lives in Section D-natural and not in
-Section D. The sparse paths are bit-exact with the regular kernels;
-cross-check tests in `tests/decode_x86_64.rs` and
-`tests/decode_neon.rs` assert that.
-
-### Combined AC/DC Huffman LUT — on / off comparison
-
-The combined Huffman LUT collapses the AC `(run, size)` lookup and
-DC `size` lookup with the magnitude-bits read into a single peek
-against a precomputed table, replacing the symbol-decode + magnitude
-read split. Toggled by short-circuiting `decode_ac_fast` /
-`decode_dc_fast` to `Ok(None)` at build time, so the on/off pair is
-two binaries with otherwise-identical code.
-
-| Subsampling × size | Cascade Lake AVX2 on | combined-off | gain  |
-| ------------------ | -------------------: | -----------: | ----: |
-| 4:4:4  1592×1124   |             14.70 ms |     14.98 ms | +1.9% |
-| 4:4:4  1080p       |             16.71 ms |     17.37 ms | +3.9% |
-| 4:4:4  4K          |             65.16 ms |     65.24 ms | +0.1% |
-| 4:2:2  1592×1124   |             11.04 ms |     11.16 ms | +1.1% |
-| 4:2:2  1080p       |             12.41 ms |     12.79 ms | +3.0% |
-| 4:2:2  4K          |             51.52 ms |     51.44 ms | −0.2% |
-| 4:2:0  1592×1124   |              9.64 ms |      9.61 ms | −0.3% |
-| 4:2:0  1080p       |             11.15 ms |     10.99 ms | −1.5% |
-| 4:2:0  4K          |             43.88 ms |     44.14 ms | +0.6% |
-
-On Apple M (NEON) the same toggle measured +4.7% at 4K 4:2:0
-natural; on Cascade Lake the effect sits at the noise floor across
-the matrix. The combined LUT was motivated by the entropy-decode
-profile share (37% `decode_symbol` self time, ~50–60% Huffman-related
-in aggregate on Apple M), but in practice both backends'
-straight-line slow paths run well enough on contemporary branch
-predictors that the LUT short-circuit moves the headline only a few
-percent at most. The change is kept — it's bit-exact and adds no
-runtime cost when the table misses — but the realized speedup is
-much smaller than the profile-share-derived ceiling suggested.
-
-### SWAR 32-bit bit-reader refill — on / off comparison
-
-The Huffman `BitReader::fill` path traditionally shifts one byte at
-a time into the 64-bit accumulator, branching on every byte for the
-`0xFF`-stuffed-by-`0x00` JPEG sequence. The SWAR variant peeks
-four bytes ahead, runs a single has-byte-equal-`0xFF` test
-(`(y - 0x0101_0101) & !y & 0x8080_8080`), and shifts all four bytes
-in via a single 32-bit OR when the test is zero; falls back to the
-per-byte path otherwise. Toggle is a build-time revert pair (the
-SWAR fast-path is removed and the loop falls back to the per-byte
-path), so the on/off pair is two binaries with otherwise-identical
-code. Numbers are 4K natural, single-run on Apple M and 5-run median
-on Cascade Lake (variance ~1–2% on both):
-
-| Subsampling × size | Apple M NEON on | NEON off | NEON gain | Cascade Lake AVX2 on | AVX2 off | AVX2 gain |
-| ------------------ | --------------: | -------: | --------: | -------------------: | -------: | --------: |
-| 4:4:4  4K          |        13.92 ms | 15.00 ms |    +7.2%  |             72.55 ms | 76.86 ms |    +5.6%  |
-| 4:2:2  4K          |        10.57 ms | 11.27 ms |    +6.2%  |             57.66 ms | 60.34 ms |    +4.4%  |
-| 4:2:0  4K          |         8.72 ms |  9.41 ms |    +7.3%  |             49.37 ms | 52.00 ms |    +5.1%  |
-
-The SWAR variant is **cross-arch consistent +4–7%** on natural 4K
-content. Unlike the combined LUT (which sits at the noise floor at
-q=80), the SWAR refill amortizes the per-byte branch overhead on
-the dominant non-stuffed path and shows up in real measurements on
-both NEON and AVX2 hosts. The Cascade Lake numbers here were
-collected on a separate run from the Section D-natural matrix above
-(different VM allocation), so the baseline absolute ms don't line
-up exactly with the 43.88 ms in that table — read the *gain*
-column rather than comparing raw ms across subsections. Bit-exact equivalence to the per-byte path is
-asserted by the existing decode cross-check tests.
+Natural-content decode reaches ~4.5–4.8× scalar at 4:2:0 4K — most
+blocks have only a few low-frequency coefficients, and the sparse paths
+skip the rest. On synthetic input the same kernels only manage ~2×.
 
 ---
 
-## vs `image` crate
+# vs `image`
 
-`image` (`v0.25`) is the de-facto Rust image library. It bundles a
-scalar JPEG encoder hardcoded to 4:2:0, and ships a SIMD-accelerated
-JPEG decoder. We bench both sides on the same synthetic content from
-the same harness on each host.
+`image` (`v0.25`) is the de-facto Rust image library: a scalar JPEG
+encoder hardcoded to 4:2:0, and `zune-jpeg` (SIMD) for decode. Both
+sides timed on the same content from the same harness, 3-byte RGB in.
 
-### Encode (RGB → JPEG, q=80)
+## Encode (RGB → JPEG, q=80)
 
-| Host                 | Resolution | ours 4:2:0 | image (4:2:0) | ratio (img/ours) |
-| -------------------- | ---------- | ---------: | ------------: | ---------------: |
-| Apple M-series (NEON) | 1592×1124 |    5.20 ms |      15.21 ms |            2.93× |
-|                      | 1920×1080  |    5.89 ms |      17.18 ms |            2.92× |
-|                      | 3840×2160  |   23.38 ms |      66.70 ms |            2.85× |
-| Cascade Lake (AVX2)  | 1592×1124  |   23.19 ms |      75.32 ms |            3.25× |
-|                      | 1920×1080  |   26.51 ms |      86.74 ms |            3.27× |
-|                      | 3840×2160  |  105.12 ms |     344.80 ms |            3.28× |
+`image` only emits 4:2:0, so that's the apples-to-apples ratio; our
+4K 4:2:2 / 4:4:4 rows are reference (denser chroma, more work).
 
-For reference, our 4:4:4 and 4:2:2 numbers are in Section A above —
-`image` only supports 4:2:0 so the ratio above is the fair encode-
-vs-encode comparison.
+**Apple M-series (NEON)**
 
-### Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
+| Subsampling / resolution | jpeg-rusturbo | image    | ratio |
+| ------------------------ | ------------: | -------: | ----: |
+| 4:2:0  1592×1124         |  3.50 ms | 15.79 ms | 4.51× |
+| 4:2:0  1080p             |  3.94 ms | 17.92 ms | 4.55× |
+| 4:2:0  4K                | 15.64 ms | 69.07 ms | 4.42× |
+| 4:2:2  4K                | 20.41 ms | 68.89 ms | 3.38× |
+| 4:4:4  4K                | 30.33 ms | 69.05 ms | 2.28× |
 
-Both corpora are bench-driven from `tests/comparison_bench.rs`. The
-*synthetic* row is the same XOR pattern used everywhere else in this
-document — every block is full-AC, which is the Huffman-heavy
-worst case for both decoders. The *natural-content* row drives the
-same harness with `make_natural_image` (smooth sky + low-AC texture +
-edge bars), the corpus introduced for Section D-natural; it is the
-fairer proxy for typical web/photo input.
+**Intel Xeon (Cascade Lake, AVX2)**
 
-`image` 0.25 ships `zune-jpeg` as its JPEG decoder (so the "image"
-column below is `zune-jpeg`'s decode path).
+| Subsampling / resolution | jpeg-rusturbo | image     | ratio |
+| ------------------------ | ------------: | --------: | ----: |
+| 4:2:0  1592×1124         |  14.27 ms |  76.90 ms | 5.39× |
+| 4:2:0  1080p             |  16.19 ms |  88.62 ms | 5.48× |
+| 4:2:0  4K                |  63.40 ms | 352.09 ms | 5.55× |
+| 4:2:2  4K                |  81.62 ms | 352.08 ms | 4.31× |
+| 4:4:4  4K                | 144.91 ms | 352.08 ms | 2.43× |
 
-| Host                  | Corpus      | Resolution | ours       | image     | ratio (img/ours) |
-| --------------------- | ----------- | ---------- | ---------: | --------: | ---------------: |
-| Apple M-series (NEON) | synthetic   | 1592×1124  |    3.91 ms |   4.31 ms |            1.10× |
-|                       | synthetic   | 1920×1080  |    4.53 ms |   4.93 ms |            1.09× |
-|                       | synthetic   | 3840×2160  |   18.29 ms |  19.34 ms |            1.06× |
-|                       | natural     | 1592×1124  |    1.33 ms |   1.55 ms |            1.17× |
-|                       | natural     | 1920×1080  |    1.53 ms |   1.85 ms |            1.21× |
-|                       | natural     | 3840×2160  |    5.87 ms |   7.00 ms |            1.19× |
-| Cascade Lake (AVX2)   | synthetic   | 1592×1124  |   12.90 ms |  12.30 ms |            0.95× |
-|                       | synthetic   | 1920×1080  |   14.61 ms |  14.24 ms |            0.97× |
-|                       | synthetic   | 3840×2160  |   62.04 ms |  68.25 ms |            1.10× |
-|                       | natural     | 1592×1124  |    5.10 ms |   4.56 ms |            0.89× |
-|                       | natural     | 1920×1080  |    5.70 ms |   5.29 ms |            0.93× |
-|                       | natural     | 3840×2160  |   26.79 ms |  32.54 ms |            1.21× |
+We lead `image`'s encoder by **4.4–4.6×** on Apple M and **5.4–5.6×** on
+Cascade Lake at 4:2:0. The Cascade ratio is higher because `image`'s
+scalar encoder is much slower on that CPU (see the cross-host note up
+top), and because 0.8.0's AVX2 3-byte RGB→YCbCr kernel removed the
+scalar-color fallback that previously capped the x86 RGB-input ratio at
+~3.7×.
 
-(ratio > 1 means jpeg-rusturbo is faster)
+## Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
 
-Reading the numbers honestly:
+**Apple M-series (NEON)**
 
-- **At 4K** we are ahead of `zune-jpeg` on both microarchitectures
-  and both corpora: ~1.06–1.10× on synthetic Huffman-heavy content,
-  ~1.19–1.21× on natural-content. This is where the 0.7.5 hot-path
-  changes (entropy + dequant fusion, AVX2 PSHUFB interleave,
-  uninit-alloc) show up most cleanly — the amount of per-pixel work
-  is large enough to dominate per-decode fixed-cost overhead.
-- **At smaller resolutions** the picture is mixed on Cascade Lake.
-  At 1592×1124 / 1920×1080 we are 0.89–0.97× of `zune-jpeg`: the
-  per-decode setup (header parse + 3 plane Vec allocations + scratch
-  buffers) is a larger fraction of total time at those sizes, and
-  zune's lower setup overhead shows. Apple M's setup is itself
-  cheap enough that we lead even at smaller resolutions.
-- **vs prior cycles**: 0.6.0 was 0.41× → 0.77× on this fixture;
-  0.7.0 was 0.78× on natural 4K; 0.7.5 brought 4K to 1.19–1.21×
-  and closed the decoder cycle. 0.8.0 doesn't touch the decoder —
-  these numbers carry over unchanged — and instead spends the
-  cycle on the encoder hot path (Section A above) plus two
-  feature additions (progressive (SOF2) emit, EXIF / ICC
-  pass-through).
+| Corpus / resolution  | jpeg-rusturbo | image    | ratio |
+| -------------------- | ------------: | -------: | ----: |
+| synthetic 1592×1124  |  4.22 ms |  4.39 ms | 1.04× |
+| synthetic 1080p      |  4.59 ms |  5.03 ms | 1.10× |
+| synthetic 4K         | 19.06 ms | 19.65 ms | 1.03× |
+| natural   1592×1124  |  1.35 ms |  1.55 ms | 1.15× |
+| natural   1080p      |  1.55 ms |  1.86 ms | 1.20× |
+| natural   4K         |  5.93 ms |  7.00 ms | 1.18× |
+
+**Intel Xeon (Cascade Lake, AVX2)**
+
+| Corpus / resolution  | jpeg-rusturbo | image    | ratio |
+| -------------------- | ------------: | -------: | ----: |
+| synthetic 1592×1124  | 13.12 ms | 12.90 ms | 0.98× |
+| synthetic 1080p      | 14.94 ms | 15.04 ms | 1.01× |
+| synthetic 4K         | 62.94 ms | 69.11 ms | 1.10× |
+| natural   1592×1124  |  5.21 ms |  5.07 ms | 0.97× |
+| natural   1080p      |  5.83 ms |  5.97 ms | 1.02× |
+| natural   4K         | 28.01 ms | 34.26 ms | 1.22× |
+
+(ratio > 1 means jpeg-rusturbo is faster.)
+
+The decoder is at rough parity with `zune-jpeg`: ahead at 4K on both
+microarchitectures (~1.1× synthetic, ~1.18–1.22× natural), within noise
+at smaller resolutions, and within ~2–3% at 1592×1124 on Cascade Lake
+where our per-decode setup (header parse + plane allocations) is a larger
+fraction of total time. The decoder is bundled for API symmetry, not as
+a speed play; this is a "we don't regress on read-back" result, not the
+headline. The encoder is.
 
 ---
 
-## Where the SIMD speedup is
+# Where the time goes
 
 A rough per-stage breakdown for 4K 4:2:0 q=80 (estimated from
 `cargo flamegraph`, not committed to the repo):
 
 ```
 Encode side:
-  Color/downsample      ~25%   NEON ~3.0× / AVX2 ~3.0× / scalar 1.0×
+  Color / downsample    ~25%   NEON ~3.0× / AVX2 ~3.0× / scalar 1.0×
   Forward DCT           ~20%   NEON ~2.5× / AVX2 ~2.7× / scalar 1.0×
-  Quantize+zig-zag      ~10%   NEON ~1.8× / AVX2 ~2.5× / scalar 1.0×
-  Huffman (64-bit acc + bitmap)  ~30%   NEON-bitmap ~1.4× / SSE2-bitmap ~1.4×
-  Marker writes/IO      ~15%   scalar in both
+  Quantize + zig-zag    ~10%   NEON ~1.8× / AVX2 ~2.5× / scalar 1.0×
+  Huffman (64-bit acc + bitmap)  ~30%   NEON/SSE2 bitmap ~1.4×
+  Marker writes / IO    ~15%   scalar in both
 
-Decode side (per-stage SIMD landed in 0.6.0):
-  Entropy decode        ~35%   scalar by design (serial code-length
-                                dependency); 0.7.0 adds combined
-                                AC/DC LUT + SWAR 32-bit refill
-                                (+4–7% on natural across NEON/AVX2)
-  IDCT                  ~25%   NEON ~2.0× / AVX2 ~2.5× / scalar 1.0×
-                                + DC-only / sparse-row fast paths
-                                  (NEON 0.6.0, AVX2 0.7.0; +11–19% of
-                                   total decode on natural content,
-                                   ≈ 0% on synthetic — see Section
-                                   D-natural)
-  Color convert (YCC→RGB) ~20%   NEON ~6.7× / AVX2 ~3.5× / scalar 1.0×
-  Chroma upsample fancy ~15%   NEON ~1.3-14× (kernel-dep) / AVX2 sim.
+Decode side (per-stage SIMD landed in the 0.6.0 / 0.7.x decoder cycles):
+  Entropy decode        ~35%   combined AC/DC LUT + SWAR 32-bit refill
+                                (+4–7% on natural across NEON/AVX2);
+                                otherwise serial by code-length dependency
+  IDCT                  ~25%   NEON ~2.0× / AVX2 ~2.5× + DC-only / sparse-row
+                                fast paths (~11–19% of decode on natural,
+                                ≈0% on synthetic — visible as the
+                                synthetic-vs-natural gap in Decode above)
+  Color convert (YCC→RGB) ~20% NEON ~6.7× / AVX2 ~3.5×
+  Chroma upsample fancy ~15%   NEON ~1.3–14× (kernel-dep) / AVX2 similar
   Marker walk / IO      ~5%    scalar in both
 ```
 
 Per-stage SIMD bodies hit close to expected speedups; whole-pipeline
-numbers are bounded by Amdahl on the (still scalar) Huffman emit /
-decode and the unavoidable serial marker / IO sections.
+numbers are Amdahl-bound on the partly-scalar entropy emit/decode and the
+serial marker / IO sections.
 
-## Out of scope
+# Out of scope
 
-- AVX-512 versions of the four kernels. The server market is
-  bifurcated (Zen 4 yes, Zen 2/3 no, Alder Lake P-cores
-  bin-disabled); AVX2 stays the floor for x86_64 in this crate.
-- Full SIMD AC-symbol-emission on the encoder side. The bitmap is
-  SIMD; the per-nonzero emission stays scalar — it's tight enough
-  that LLVM autovectorizes the bit-writer drain and table lookups
-  don't reshape cleanly into SIMD.
-- Vector-SIMD Huffman *decode*. The bit reader + canonical-Huffman
-  table walk has a serial dependency on per-symbol code length, so
-  vectorizing across symbols isn't tractable. The optimizations that
-  do help are scalar bit-ops: 0.7.0 lands a combined AC/DC LUT
-  (table-driven path, used by baseline and progressive scans) and a
-  SWAR 32-bit bit-reader refill — see the SWAR on/off and combined
-  LUT on/off subsections under Section D-natural.
+- **AVX-512** versions of the kernels. The server market is bifurcated
+  (Zen 4 yes, Zen 2/3 no, Alder Lake P-cores bin-disabled); AVX2 stays
+  the x86_64 floor for this crate.
+- **AVX2 zig-zag scatter + magnitude precompute** on the encode side.
+  These two 0.8.0 hot-path items are NEON-only so far, which is why the
+  x86 encode SIMD-vs-scalar ratio trails NEON's slightly at 4:4:4. AVX2
+  equivalents (zig-zag via `vpermd` / `vpshufb`, magnitude lookup via a
+  PSHUFB bit-length table) are candidates for a later cycle.
+- **Full SIMD AC-symbol emission** on the encoder side. The nonzero
+  bitmap is SIMD; the per-coefficient emission stays scalar — it's tight
+  enough that LLVM autovectorizes the bit-writer drain and the table
+  lookups don't reshape cleanly into SIMD.
+- **Vector-SIMD Huffman decode.** The bit reader + canonical-table walk
+  has a serial dependency on per-symbol code length, so vectorizing
+  across symbols isn't tractable. The optimizations that do help are
+  scalar bit-ops: the combined AC/DC LUT and the SWAR 32-bit refill.
