@@ -944,7 +944,7 @@ pub mod color {
 pub mod quant {
     use core::arch::x86_64::*;
 
-    use crate::quant::Divisors;
+    use crate::encode::quant::Divisors;
 
     /// Quantize 64 i16 coefficients in natural order. Bit-exact
     /// equivalent to `arch::scalar::quant::quantize_natural`.
@@ -2047,7 +2047,7 @@ mod tests {
             return;
         }
 
-        use crate::quant::build_divisors;
+        use crate::encode::quant::build_divisors;
         use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
 
         let mut block = [0i16; 64];
@@ -2381,7 +2381,7 @@ mod tests {
         // to cover are out-of-spec for the i16-workspace IDCT and
         // are intentionally outside its contract (see the scalar
         // reference's docstring at `arch::scalar::dct::idct_islow`).
-        use crate::quant::build_divisors;
+        use crate::encode::quant::build_divisors;
         use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
         let qtab = scale_quant_table(&STD_LUMA_QUANT, 75);
         let div = build_divisors(&qtab);
@@ -2667,7 +2667,7 @@ mod tests {
             return;
         }
 
-        use crate::quant::build_divisors;
+        use crate::encode::quant::build_divisors;
 
         // All-zero block: quantize → all zero on both backends.
         let block_zero = [0i16; 64];

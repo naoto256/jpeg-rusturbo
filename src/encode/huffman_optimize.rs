@@ -15,7 +15,7 @@
 //! symbol added at frequency 1 so the all-ones bit pattern is never
 //! assigned to a real code (the JPEG spec, Annex C, forbids it).
 
-use crate::huffman::magnitude_category;
+use super::huffman::magnitude_category;
 
 /// Walk one quantized + zig-zagged block exactly the way
 /// `huffman::encode_block` would, but instead of emitting bits, count
@@ -235,8 +235,8 @@ pub fn build_optimal_huffman(
 
 #[cfg(test)]
 mod tests {
+    use super::super::huffman::{BitWriter, HuffmanTable, encode_block};
     use super::*;
-    use crate::huffman::{BitWriter, HuffmanTable, encode_block};
     use crate::tables::STD_LUMA_DC;
 
     #[test]

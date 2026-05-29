@@ -1,6 +1,6 @@
 //! Unified micro-benchmark for jpeg-rusturbo.
 //!
-//! Build with `cargo run --release --bin bench -- [--section <name>]`.
+//! Build with `cargo bench --bench pipeline -- [--section <name>]`.
 //! The build label reflects the active arch backend selected at compile
 //! time. Run the same command twice — once normally, once with
 //! `--features force-scalar` — to get the SIMD and scalar numbers that
@@ -16,13 +16,13 @@
 //!   all (default)     : every section above, in order
 //!
 //! Cross-crate comparison vs the `image` crate (encode + decode) lives in
-//! `tests/comparison_bench.rs`:
-//!   cargo test --release --test comparison_bench -- --ignored --nocapture
+//! `benches/vs_image.rs`:
+//!   cargo bench --bench vs_image
 //!
 //! A full symmetric campaign on one host is exactly three commands:
-//!   cargo run  --release                        --bin bench -- --section all
-//!   cargo run  --release --features force-scalar --bin bench -- --section all
-//!   cargo test --release --test comparison_bench -- --ignored --nocapture
+//!   cargo bench --bench pipeline -- --section all
+//!   cargo bench --bench pipeline --features force-scalar -- --section all
+//!   cargo bench --bench vs_image
 
 use std::env;
 use std::time::Instant;
