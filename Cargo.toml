@@ -21,6 +21,16 @@ exclude = [
 [lib]
 path = "src/lib.rs"
 
+# Plain `fn main()` printers (not libtest benches), so disable the
+# standard harness. Run with `cargo bench --bench <name>`.
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "vs_image"
+harness = false
+
 [features]
 # Force the scalar fallback even on aarch64. Used by the bench harness
 # to measure NEON speedup vs scalar without leaving the same binary.

@@ -1,8 +1,8 @@
 # `jpeg-rusturbo` benchmarks
 
 All numbers below come from one coherent measurement campaign per host
-on 2026-05-30, driven by the harness in `src/bin/bench.rs` (encode +
-decode) and `tests/comparison_bench.rs` (vs the `image` crate). Both
+on 2026-05-30, driven by the harness in `benches/pipeline.rs` (encode +
+decode) and `benches/vs_image.rs` (vs the `image` crate). Both
 hosts ran the identical command sequence, so every table appears as a
 matched pair — one per host, same shape. The rightmost column is always
 the multiplier (speedup or ratio): scan it down a column and the win
@@ -24,9 +24,9 @@ synthetic corpora feed the harness:
 Reproduce the whole campaign on any host with three commands:
 
 ```sh
-cargo run  --release                         --bin bench -- --section all   # SIMD build
-cargo run  --release --features force-scalar --bin bench -- --section all   # scalar fallback
-cargo test --release --test comparison_bench -- --ignored --nocapture      # vs image crate
+cargo bench --bench pipeline -- --section all                    # SIMD build
+cargo bench --bench pipeline --features force-scalar -- --section all  # scalar fallback
+cargo bench --bench vs_image                                     # vs image crate
 ```
 
 The release profile is `lto = "fat"` + `codegen-units = 1`; all numbers

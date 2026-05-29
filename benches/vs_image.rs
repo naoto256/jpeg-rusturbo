@@ -4,13 +4,12 @@
 //! Run with:
 //!
 //! ```text
-//! cargo test --release --test comparison_bench -- --ignored --nocapture
+//! cargo bench --bench vs_image
 //! ```
 //!
-//! Gated by `#[ignore]` so it doesn't run on default `cargo test` (would add
-//! ~10 seconds per invocation). The output is intentionally human-readable
-//! plaintext rather than the usual `assert_*!` test failure mode — this is
-//! the harness we cite in BENCH.md and the README.
+//! A plain `fn main()` printer (harness disabled in `Cargo.toml`) rather
+//! than a libtest bench — the output is intentionally human-readable
+//! plaintext that we cite in BENCH.md and the README.
 
 use image::ImageEncoder;
 use image::codecs::jpeg::JpegEncoder as ImageJpegEncoder;
@@ -38,7 +37,7 @@ fn make_image(w: u32, h: u32) -> Vec<u8> {
 /// Natural-like content: smooth sky region (DC-dominant blocks),
 /// a textured mid band (low-AC), and bottom solid bars (DC blocks
 /// with strong edges between them). Mirrors `make_natural_image` in
-/// `src/bin/bench.rs` but emits 3-byte RGB (no alpha) so it can feed
+/// `benches/pipeline.rs` but emits 3-byte RGB (no alpha) so it can feed
 /// `encode_rgb` directly. See `BENCH.md` Section D-natural for the
 /// design rationale.
 fn make_natural_image(w: u32, h: u32) -> Vec<u8> {
@@ -123,9 +122,7 @@ fn decode_with_image(jpeg: &[u8]) -> Vec<u8> {
     img.into_raw()
 }
 
-#[test]
-#[ignore]
-fn comparison_print() {
+fn main() {
     let cases = [
         ("1592x1124 (session)", 1592u32, 1124u32),
         ("1920x1080 (1080p)", 1920, 1080),
