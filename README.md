@@ -71,8 +71,8 @@ gap remains an open item.
 
 ## Performance
 
-50-iteration single-batch timings from `src/bin/bench.rs` and
-`tests/comparison_bench.rs`, q=80, 4:2:0. Two hosts: Apple M-series
+50-iteration single-batch timings from `benches/pipeline.rs` and
+`benches/vs_image.rs`, q=80, 4:2:0. Two hosts: Apple M-series
 (NEON) and Intel Xeon Platinum 8272CL (Cascade Lake, AVX2). Full
 per-section breakdown in [BENCH.md](BENCH.md).
 
@@ -82,7 +82,7 @@ per-section breakdown in [BENCH.md](BENCH.md).
 runs SIMD across the whole encode front end — color convert, forward
 DCT, quantize + zig-zag, chroma downsample — plus a SIMD nonzero-bitmap
 Huffman path. Both encoders are fed identical 3-byte RGB and timed on
-the same harness (`tests/comparison_bench.rs`). That structural
+the same harness (`benches/vs_image.rs`). That structural
 difference — vectorized pipeline vs scalar — is the gap below.
 
 **Apple M-series (NEON)**
@@ -127,7 +127,7 @@ PSHUFB shuffle kernel, and skips zero-fill on the per-decode
 plane / output Vec allocations.
 
 Both decoders are timed on the same harness
-(`tests/comparison_bench.rs`) against two corpora: the synthetic
+(`benches/vs_image.rs`) against two corpora: the synthetic
 XOR pattern used everywhere else in the docs (Huffman-heavy worst
 case — every block is full-AC) and a procedural natural-content
 image (smooth sky + low-AC texture + edge bars) that is the fairer

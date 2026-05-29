@@ -44,17 +44,16 @@
 
 use std::io::{self, Write};
 
-use crate::huffman::{BitWriter, HuffmanTable, magnitude_category};
-use crate::markers;
-use crate::quant::Divisors;
 use crate::tables::{
     STD_CHROMA_AC, STD_CHROMA_DC, STD_CHROMA_QUANT, STD_LUMA_AC, STD_LUMA_DC, STD_LUMA_QUANT,
     scale_quant_table,
 };
-use crate::{
-    ChromaSubsampling, JpegEncoder, PixelLayout, SamplingScheme, Yuv420Scheme, Yuv422Scheme,
-    Yuv444Scheme,
-};
+use crate::{ChromaSubsampling, PixelLayout};
+
+use super::huffman::{BitWriter, HuffmanTable, magnitude_category};
+use super::markers;
+use super::quant::Divisors;
+use super::{JpegEncoder, SamplingScheme, Yuv420Scheme, Yuv422Scheme, Yuv444Scheme};
 
 /// Successive-approximation `Al` for first scans. `Al_refine = 0` (=
 /// final precision) is hard-coded — a future minor could expose

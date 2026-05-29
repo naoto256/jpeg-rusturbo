@@ -621,7 +621,7 @@ pub fn decode_dc_fast(
 
 /// Convert a magnitude-category encoded value back to its signed
 /// integer. Inverse of `magnitude_category` in the encoder
-/// (`crate::huffman::magnitude_category`).
+/// (`crate::encode::huffman::magnitude_category`).
 ///
 /// Given the size category `s` (1..=16) and the `s`-bit `bits` payload:
 /// - If the top bit of `bits` is 1, the original value was positive,

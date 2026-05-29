@@ -11,21 +11,24 @@ backends shared between them.
 
 ```
 src/
-├── lib.rs                  — public API (JpegEncoder, PixelFormat),
-│                             encode-side pipeline orchestration,
-│                             SamplingScheme trait + Yuv444 / Yuv422 /
-│                             Yuv420 impls
+├── lib.rs                  — public API (JpegEncoder re-export,
+│                             PixelFormat, ChromaSubsampling, the
+│                             PixelFormat → PixelLayout bridge)
 ├── color.rs                — block / MCU extraction with edge replication
-├── quant.rs                — Divisors, build_divisors,
-│                             compute_reciprocal, zig-zag wrapper
-├── huffman.rs              — HuffmanTable, BitWriter, encode_block,
-│                             magnitude_category (encode side)
-├── huffman_optimize.rs     — two-pass optimized Huffman table builder
-├── progressive_encode.rs   — progressive (SOF2) encode-side pipeline:
-│                             8-scan successive-approximation plan
-│                             (DC first / AC first per-component / DC
-│                             refine / AC refine), four encoder kernels
-├── markers.rs              — JPEG segment writers (SOI, APP0, APP1
+├── encode/
+│   ├── mod.rs              — JpegEncoder + encode-side pipeline
+│   │                         orchestration, SamplingScheme trait +
+│   │                         Yuv444 / Yuv422 / Yuv420 impls
+│   ├── quant.rs            — Divisors, build_divisors,
+│   │                         compute_reciprocal, zig-zag wrapper
+│   ├── huffman.rs          — HuffmanTable, BitWriter, encode_block,
+│   │                         magnitude_category (encode side)
+│   ├── huffman_optimize.rs — two-pass optimized Huffman table builder
+│   ├── progressive.rs      — progressive (SOF2) encode-side pipeline:
+│   │                         8-scan successive-approximation plan
+│   │                         (DC first / AC first per-component / DC
+│   │                         refine / AC refine), four encoder kernels
+│   └── markers.rs          — JPEG segment writers (SOI, APP0, APP1
 │                             EXIF, APP2 ICC multi-segment, DQT,
 │                             SOF0 / SOF2, DHT, SOS / SOS-spectral,
 │                             EOI)
@@ -39,13 +42,17 @@ src/
 │   │                         AC/DC LUTs, SWAR refill
 │   ├── markers.rs          — JPEG marker parser (header chain)
 │   └── error.rs            — DecodeError / Result
-├── arch/
-│   ├── mod.rs              — cfg dispatch hub, picks the active backend
-│   ├── scalar.rs           — bit-exact scalar reference for every
-│   │                         hot kernel (always compiled)
-│   ├── neon.rs             — AArch64 NEON kernels (compiled on aarch64)
-│   └── x86_64.rs           — x86_64 AVX2 kernels (compiled on x86_64)
-└── bin/bench.rs            — bench harness used to produce BENCH.md
+└── arch/
+    ├── mod.rs              — cfg dispatch hub, picks the active backend
+    ├── scalar.rs           — bit-exact scalar reference for every
+    │                         hot kernel (always compiled)
+    ├── neon.rs             — AArch64 NEON kernels (compiled on aarch64)
+    └── x86_64.rs           — x86_64 AVX2 kernels (compiled on x86_64)
+
+benches/
+├── pipeline.rs            — encode + decode micro-bench harness used
+│                            to produce BENCH.md
+└── vs_image.rs            — cross-crate comparison vs the `image` crate
 ```
 
 Each `arch::<backend>` exposes five inline modules — `color`, `dct`,
@@ -207,17 +214,17 @@ backend the host can reach.
 | Want to change … | File |
 |---|---|
 | Quality scaling, standard tables | `src/tables.rs` |
-| Encode MCU iteration, scan-level dispatch | `src/lib.rs` |
+| Encode MCU iteration, scan-level dispatch | `src/encode/mod.rs` |
 | 8x8 / 16x16 block extraction, padding, level shift | `src/color.rs` |
-| Quant divisor construction (`compute_reciprocal`) | `src/quant.rs` |
-| Encode-side bit-stuffing, byte-stuffing, Huffman emission | `src/huffman.rs` |
-| Two-pass optimized Huffman table builder | `src/huffman_optimize.rs` |
-| Progressive (SOF2) encode (8-scan SA plan, DC/AC first + refine) | `src/progressive_encode.rs` |
+| Quant divisor construction (`compute_reciprocal`) | `src/encode/quant.rs` |
+| Encode-side bit-stuffing, byte-stuffing, Huffman emission | `src/encode/huffman.rs` |
+| Two-pass optimized Huffman table builder | `src/encode/huffman_optimize.rs` |
+| Progressive (SOF2) encode (8-scan SA plan, DC/AC first + refine) | `src/encode/progressive.rs` |
 | Decode entry points (`Decoder`, `decode`) | `src/decode/mod.rs` |
 | Baseline scan, dequant fusion, IDCT dispatch | `src/decode/baseline.rs` |
 | Progressive (multi-scan) decode | `src/decode/progressive.rs` |
 | Decode-side BitReader, combined AC/DC LUTs, SWAR refill | `src/decode/huffman.rs` |
 | Header chain parser (SOI / DQT / DHT / SOF / SOS / EOI) | `src/decode/markers.rs` |
 | Per-arch hot kernels (5 modules: color / dct / quant / huffman / sample) | `src/arch/{scalar,neon,x86_64}.rs` |
-| JPEG segment writers (encode side) | `src/markers.rs` |
-| Benchmark harness output / labels | `src/bin/bench.rs` |
+| JPEG segment writers (encode side) | `src/encode/markers.rs` |
+| Benchmark harness output / labels | `benches/pipeline.rs` |

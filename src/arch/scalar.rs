@@ -531,7 +531,7 @@ pub mod sample {
 // quant: reciprocal-multiply quantize, natural-order output
 // ===========================================================================
 pub mod quant {
-    use crate::quant::Divisors;
+    use crate::encode::quant::Divisors;
 
     /// Quantize a 64-element block using the precomputed divisors, in
     /// natural (DCT) order. The caller applies zig-zag separately —
@@ -617,7 +617,7 @@ pub mod huffman {
     /// 4-vector pass.
     pub fn ac_magnitudes(block: &[i16; 64], sizes: &mut [u8; 64], bits_lut: &mut [u16; 64]) {
         for (k, &v) in block.iter().enumerate() {
-            let (sz, b) = crate::huffman::magnitude_category(v as i32);
+            let (sz, b) = crate::encode::huffman::magnitude_category(v as i32);
             sizes[k] = sz;
             bits_lut[k] = b as u16;
         }
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn quantize_reciprocal_round_trip_small() {
-        use crate::quant::{Divisors, build_divisors};
+        use crate::encode::quant::{Divisors, build_divisors};
         // For typical small divisors the reciprocal-multiply form must
         // match `(x + d/2) / d` for every x in our coefficient range.
         for d in [1u8, 1, 11, 99, 255] {

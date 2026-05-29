@@ -1,4 +1,4 @@
-//! JPEG marker stream reader (inverse of `crate::markers`).
+//! JPEG marker stream reader (inverse of `crate::encode::markers`).
 //!
 //! Walks the byte stream from SOI to SOS extracting headers (DQT,
 //! DHT, SOF, SOS, DRI); the SOS step hands control over to the
