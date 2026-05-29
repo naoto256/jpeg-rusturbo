@@ -1460,7 +1460,7 @@ pub mod sample {
 pub mod quant {
     use core::arch::aarch64::*;
 
-    use crate::encode::quant::Divisors;
+    use crate::tables::Divisors;
 
     /// Quantize a 64-element block using the precomputed divisors, in
     /// natural (DCT) order. Bit-exact equivalent to
@@ -1942,7 +1942,7 @@ mod tests {
 
     #[test]
     fn quant_neon_matches_scalar() {
-        use crate::encode::quant::build_divisors;
+        use crate::tables::build_divisors;
         use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
 
         let mut block = [0i16; 64];
@@ -2184,7 +2184,7 @@ mod tests {
         // dequantize. The resulting block matches the post-dequant
         // distribution that the decoder feeds into the IDCT. This is
         // the input shape libjpeg-turbo's NEON kernel was tuned for.
-        use crate::encode::quant::build_divisors;
+        use crate::tables::build_divisors;
         use crate::tables::{STD_LUMA_QUANT, scale_quant_table};
         let qtab = scale_quant_table(&STD_LUMA_QUANT, 75);
         let div = build_divisors(&qtab);
