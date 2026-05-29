@@ -46,10 +46,18 @@ features. Default-off behaviour is bit-identical to 0.7.5.
 
 ### Changed
 
-- Benchmark harness (`src/bin/bench.rs`) rebuilt with descriptive
-  section names, a progressive baseline-vs-SOF2 section, and a
-  RGB/RGBA input split; `BENCH.md` rebuilt from a single coherent
-  two-host campaign (Apple M-series NEON + Intel Cascade Lake AVX2).
+- **Source tree reorganized** to mirror the encode/decode symmetry: the
+  encoder modules + `JpegEncoder` moved into `src/encode/` (sibling to
+  `src/decode/`), leaving `lib.rs` a thin crate root; `color.rs` /
+  `tables.rs` / `arch/` remain the shared core. Both benchmark
+  entrypoints moved to `benches/` (`pipeline.rs`, was `src/bin/bench.rs`;
+  `vs_image.rs`, was `tests/comparison_bench.rs`, now a `harness = false`
+  bench). No behaviour change — public API and output bytes are
+  identical, verified perf-neutral on NEON and AVX2.
+- Benchmark harness rebuilt with descriptive section names, a
+  progressive baseline-vs-SOF2 section, and a RGB/RGBA input split;
+  `BENCH.md` rebuilt from a single coherent two-host campaign (Apple
+  M-series NEON + Intel Cascade Lake AVX2).
 
 ## [0.7.5] — 2026-05-28
 

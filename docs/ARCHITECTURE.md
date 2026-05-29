@@ -1,11 +1,14 @@
 # Architecture
 
-`jpeg-rusturbo` is a baseline JPEG encoder + baseline-and-progressive
-decoder. The public surface stays small (`JpegEncoder` /
-`ChromaSubsampling` on the encode side, `Decoder` / `decode` /
-`PixelFormat` / `ImageInfo` on the decode side); the rest of the
-crate is the encode + decode pipelines plus per-architecture kernel
-backends shared between them.
+`jpeg-rusturbo` is a baseline + progressive (SOF2) JPEG encoder — with
+EXIF / ICC metadata pass-through — and a baseline + progressive decoder.
+The public surface stays small (`JpegEncoder` / `ChromaSubsampling` /
+`PixelFormat` on the encode side, `Decoder` / `decode` / `PixelFormat` /
+`ImageInfo` on the decode side); the rest of the crate is the `encode`
+and `decode` pipelines plus per-architecture kernel backends shared
+between them. The two pipelines mirror each other: `src/encode/` and
+`src/decode/` are sibling module trees, with `color.rs` / `tables.rs`
+and `arch/` as the shared core between them.
 
 ## File layout
 
@@ -14,7 +17,10 @@ src/
 ├── lib.rs                  — public API (JpegEncoder re-export,
 │                             PixelFormat, ChromaSubsampling, the
 │                             PixelFormat → PixelLayout bridge)
-├── color.rs                — block / MCU extraction with edge replication
+├── color.rs                — shared: colour constants + PixelLayout;
+│                             encode-side block / MCU extraction (edge
+│                             replication). Used by encode, decode, arch.
+├── tables.rs               — shared: JPEG Annex K standard tables + ZIGZAG
 ├── encode/
 │   ├── mod.rs              — JpegEncoder + encode-side pipeline
 │   │                         orchestration, SamplingScheme trait +
@@ -32,7 +38,6 @@ src/
 │                             EXIF, APP2 ICC multi-segment, DQT,
 │                             SOF0 / SOF2, DHT, SOS / SOS-spectral,
 │                             EOI)
-├── tables.rs               — JPEG Annex K standard tables + ZIGZAG
 ├── decode/
 │   ├── mod.rs              — public Decoder + decode() entry points,
 │   │                         compose_output (plane → RGB)
@@ -86,11 +91,13 @@ entropy-coded bytes (with 0xFF → 0xFF 0x00 stuffing)
 ```
 
 Top-level orchestration happens in `JpegEncoder::encode_inner`
-(`lib.rs`). It validates dimensions, builds the per-component quant
-divisors and Huffman tables, writes the marker prologue (SOI / APP0 /
-DQT / SOF0 / DHT / SOS), then dispatches the entropy-coded segment to
-the right `SamplingScheme` impl. After the scan it flushes the
-bitwriter and writes EOI.
+(`src/encode/mod.rs`). It validates dimensions, builds the per-component
+quant divisors and Huffman tables, writes the marker prologue (SOI /
+APP0 / optional APP1 EXIF + APP2 ICC / DQT / SOF0 / DHT / SOS), then
+dispatches the entropy-coded segment to the right `SamplingScheme`
+impl. After the scan it flushes the bitwriter and writes EOI. When
+progressive output is requested the SOF2 multi-scan plan in
+`src/encode/progressive.rs` takes over after the shared prologue.
 
 The hot kernels live behind `arch::backend::*` and are addressed
 by name: `color::rgb_row_to_ycc`, `color::ycc_row_to_rgb` (decoder
@@ -167,7 +174,7 @@ functions into one MCU loop. Adding a new scheme is:
 2. Declare the module in `arch/mod.rs` under the appropriate
    `#[cfg(target_arch = "...")]`.
 3. Add a `pub use <name> as backend;` cfg arm so it gets selected.
-4. Update `bin/bench.rs`'s `arch` label to print the right string.
+4. Update `benches/pipeline.rs`'s `arch` label to print the right string.
 5. Mirror the cross-check tests pattern from `arch::neon::tests` /
    `arch::x86_64::tests` (compare each kernel against scalar on a
    panel of inputs).
