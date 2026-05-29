@@ -5,8 +5,8 @@
 //!
 //! - `quant` — AVX2
 //! - `dct` — AVX2
-//! - `color::rgb_row_to_ycc` — AVX2 for n=16 RGBA (4:2:0 hot path);
-//!   scalar fallback for n=8 / RGB / non-AVX2
+//! - `color::rgb_row_to_ycc` — AVX2 for n=16 (4-byte RGBA-family and
+//!   3-byte RGB/BGR); scalar fallback for n=8 / non-AVX2
 //! - `color::h2v2_downsample` — AVX2
 //! - `color::h2v1_downsample` — AVX2
 //! - `huffman::nonzero_bitmap` — SSE2 (`pcmpeqw + packsswb + pmovmskb`,
@@ -146,9 +146,9 @@ pub mod color {
 
     /// Per-row RGB(A) → YCbCr converter.
     ///
-    /// AVX2 fast path: `n == 16 && layout.bpp == 4` (any of RGBA / BGRA
-    /// / ARGB / ABGR / RGBX / BGRX). All other widths and 3-byte input
-    /// layouts fall through to the scalar reference.
+    /// AVX2 fast path: `n == 16` for both 4-byte layouts (RGBA / BGRA /
+    /// ARGB / ABGR / RGBX / BGRX) and 3-byte layouts (RGB / BGR). All
+    /// other widths fall through to the scalar reference.
     pub fn rgb_row_to_ycc(
         pixels: &[u8],
         layout: PixelLayout,
@@ -160,15 +160,29 @@ pub mod color {
         debug_assert!(n == 8 || n == 16);
         debug_assert!(y.len() >= n && cb.len() >= n && cr.len() >= n);
         debug_assert!(pixels.len() >= n * layout.bpp);
-        if n == 16 && layout.bpp == 4 && std::arch::is_x86_feature_detected!("avx2") {
-            unsafe {
-                rgba16_avx2(
-                    pixels.as_ptr(),
-                    layout,
-                    y.as_mut_ptr(),
-                    cb.as_mut_ptr(),
-                    cr.as_mut_ptr(),
-                )
+        if n == 16 && std::arch::is_x86_feature_detected!("avx2") {
+            if layout.bpp == 4 {
+                unsafe {
+                    rgba16_avx2(
+                        pixels.as_ptr(),
+                        layout,
+                        y.as_mut_ptr(),
+                        cb.as_mut_ptr(),
+                        cr.as_mut_ptr(),
+                    )
+                }
+            } else if layout.bpp == 3 {
+                unsafe {
+                    rgb24_16_avx2(
+                        pixels.as_ptr(),
+                        layout,
+                        y.as_mut_ptr(),
+                        cb.as_mut_ptr(),
+                        cr.as_mut_ptr(),
+                    )
+                }
+            } else {
+                crate::arch::scalar::color::rgb_row_to_ycc(pixels, layout, n, y, cb, cr)
             }
         } else {
             crate::arch::scalar::color::rgb_row_to_ycc(pixels, layout, n, y, cb, cr)
@@ -433,6 +447,31 @@ pub mod color {
 
             let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
 
+            ycc_from_rgb16(r_u16, g_u16, b_u16, y, cb, cr);
+
+            _mm256_zeroupper();
+        }
+    }
+
+    /// Shared post-deinterleave math: given 16 R/G/B samples (each a
+    /// `__m256i` of 16 u16 lanes), compute Y/Cb/Cr and store 16 u8 each.
+    /// Used by both the 4-byte (`rgba16_avx2`) and 3-byte (`rgb24_16_avx2`)
+    /// paths so the color transform lives in exactly one place.
+    ///
+    /// # Safety
+    /// - Caller must have AVX2 enabled (relies on inlining into a
+    ///   `#[target_feature(enable = "avx2")]` function).
+    /// - `y`, `cb`, `cr` must each be writable for at least 16 bytes.
+    #[inline(always)]
+    unsafe fn ycc_from_rgb16(
+        r_u16: __m256i,
+        g_u16: __m256i,
+        b_u16: __m256i,
+        y: *mut u8,
+        cb: *mut u8,
+        cr: *mut u8,
+    ) {
+        unsafe {
             // Build interleaved-pair ymm registers used by every component.
             let rg_lo = _mm256_unpacklo_epi16(r_u16, g_u16);
             let rg_hi = _mm256_unpackhi_epi16(r_u16, g_u16);
@@ -473,6 +512,63 @@ pub mod color {
             pack_and_store_u16x16(y_u16, y);
             pack_and_store_u16x16(cb_u16, cb);
             pack_and_store_u16x16(cr_u16, cr);
+        }
+    }
+
+    /// # Safety
+    /// - AVX2 must be available (the runtime gate in `rgb_row_to_ycc`
+    ///   checks; `target_feature` enforces the compile-time half).
+    /// - `pixels` must be readable for at least 48 bytes (16 3-byte pixels).
+    /// - `y`, `cb`, `cr` must each be writable for at least 16 bytes.
+    /// - `layout.bpp` must be 3.
+    #[target_feature(enable = "avx2")]
+    unsafe fn rgb24_16_avx2(
+        pixels: *const u8,
+        layout: PixelLayout,
+        y: *mut u8,
+        cb: *mut u8,
+        cr: *mut u8,
+    ) {
+        unsafe {
+            // Expand 16 packed RGB24 pixels (48 bytes) into two ymm in
+            // 4-byte RGBA order (pad byte = 0). Each 128-bit lane holds
+            // 4 pixels; the per-lane shuffle maps 12 input bytes → 16
+            // output bytes, inserting a zero pad after every triple.
+            // 0x80 in a vpshufb index zeroes the destination byte.
+            #[rustfmt::skip]
+            let m_a = _mm_setr_epi8(
+                0, 1, 2, -128, 3, 4, 5, -128,
+                6, 7, 8, -128, 9, 10, 11, -128,
+            );
+            #[rustfmt::skip]
+            let m_b = _mm_setr_epi8(
+                4, 5, 6, -128, 7, 8, 9, -128,
+                10, 11, 12, -128, 13, 14, 15, -128,
+            );
+
+            // p0 = pixels 0..7. lane0 ← src bytes 0..11 (pixels 0..3),
+            // lane1 ← src bytes 12..23 (pixels 4..7).
+            let lo0 = _mm_loadu_si128(pixels as *const __m128i); // src 0..15
+            let hi0 = _mm_loadu_si128(pixels.add(12) as *const __m128i); // src 12..27
+            let v0 = _mm256_set_m128i(hi0, lo0);
+            let p0 = _mm256_shuffle_epi8(v0, _mm256_set_m128i(m_a, m_a));
+
+            // p1 = pixels 8..15. lo1 starts at src 24, hi1 at src 32.
+            // lane0 ← src 24..35 (pixels 8..11) via M_A; lane1 ←
+            // src 36..47 (pixels 12..15), which sit at bytes 4..15 of
+            // hi1 (base 32), via M_B.
+            let lo1 = _mm_loadu_si128(pixels.add(24) as *const __m128i); // src 24..39
+            let hi1 = _mm_loadu_si128(pixels.add(32) as *const __m128i); // src 32..47
+            let v1 = _mm256_set_m128i(hi1, lo1);
+            let p1 = _mm256_shuffle_epi8(v1, _mm256_set_m128i(m_b, m_a));
+
+            // Pass the original 3-byte layout: deinterleave_pixels16 reads
+            // only r_off/g_off/b_off (0/1/2 for RGB, 2/1/0 for BGR) and
+            // derives the pad slot a = 6 - r - g - b = 3, which is the
+            // zero pad we inserted and gets dropped.
+            let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
+
+            ycc_from_rgb16(r_u16, g_u16, b_u16, y, cb, cr);
 
             _mm256_zeroupper();
         }
@@ -2468,6 +2564,100 @@ mod tests {
             let mut cr_a = [0u8; 16];
             color::rgb_row_to_ycc(&pixels, RGBA, 16, &mut y_a, &mut cb_a, &mut cr_a);
             assert_eq!((y_s, cb_s, cr_s), (y_a, cb_a, cr_a));
+        }
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgb24_random() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::{BGR, RGB};
+        for layout in [RGB, BGR] {
+            let mut pixels = [0u8; 16 * 3];
+            for i in 0..16 {
+                pixels[i * 3] = ((i * 17) % 256) as u8;
+                pixels[i * 3 + 1] = ((i * 23 + 7) % 256) as u8;
+                pixels[i * 3 + 2] = ((i * 31 + 13) % 256) as u8;
+            }
+            let mut y_s = [0u8; 16];
+            let mut cb_s = [0u8; 16];
+            let mut cr_s = [0u8; 16];
+            scalar::color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_s, &mut cb_s, &mut cr_s);
+
+            let mut y_a = [0u8; 16];
+            let mut cb_a = [0u8; 16];
+            let mut cr_a = [0u8; 16];
+            color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_a, &mut cb_a, &mut cr_a);
+
+            assert_eq!(y_s, y_a, "y mismatch for {layout:?}");
+            assert_eq!(cb_s, cb_a, "cb mismatch for {layout:?}");
+            assert_eq!(cr_s, cr_a, "cr mismatch for {layout:?}");
+        }
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgb24_extremes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::{BGR, RGB};
+        let panels: [[u8; 3]; 5] = [
+            [0, 0, 0],       // black
+            [255, 255, 255], // white
+            [255, 0, 0],     // red
+            [0, 255, 0],     // green
+            [0, 0, 255],     // blue
+        ];
+        for layout in [RGB, BGR] {
+            for color in &panels {
+                let mut pixels = [0u8; 16 * 3];
+                for i in 0..16 {
+                    pixels[i * 3..i * 3 + 3].copy_from_slice(color);
+                }
+                let mut y_s = [0u8; 16];
+                let mut cb_s = [0u8; 16];
+                let mut cr_s = [0u8; 16];
+                scalar::color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_s, &mut cb_s, &mut cr_s);
+                let mut y_a = [0u8; 16];
+                let mut cb_a = [0u8; 16];
+                let mut cr_a = [0u8; 16];
+                color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_a, &mut cb_a, &mut cr_a);
+                assert_eq!(y_s, y_a, "y mismatch for {layout:?} {color:?}");
+                assert_eq!(cb_s, cb_a, "cb mismatch for {layout:?} {color:?}");
+                assert_eq!(cr_s, cr_a, "cr mismatch for {layout:?} {color:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn color_avx2_matches_scalar_rgb24_full_range() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::color::{BGR, RGB};
+        for layout in [RGB, BGR] {
+            let mut state: u64 = 0xC0DE;
+            for _ in 0..30 {
+                let mut pixels = [0u8; 16 * 3];
+                for i in 0..16 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    pixels[i * 3] = (state >> 24) as u8;
+                    pixels[i * 3 + 1] = (state >> 32) as u8;
+                    pixels[i * 3 + 2] = (state >> 40) as u8;
+                }
+                let mut y_s = [0u8; 16];
+                let mut cb_s = [0u8; 16];
+                let mut cr_s = [0u8; 16];
+                scalar::color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_s, &mut cb_s, &mut cr_s);
+                let mut y_a = [0u8; 16];
+                let mut cb_a = [0u8; 16];
+                let mut cr_a = [0u8; 16];
+                color::rgb_row_to_ycc(&pixels, layout, 16, &mut y_a, &mut cb_a, &mut cr_a);
+                assert_eq!((y_s, cb_s, cr_s), (y_a, cb_a, cr_a), "{layout:?}");
+            }
         }
     }
 
