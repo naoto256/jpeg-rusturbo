@@ -268,11 +268,14 @@ impl<W: Write> JpegEncoder<W> {
     /// output is decodable by every conforming progressive decoder
     /// (including this crate's).
     ///
-    /// Mutually exclusive with the optimized-Huffman two-pass path —
-    /// when both are set, progressive wins (the optimized-Huffman
-    /// path doesn't yet know how to build per-scan tables). Default
-    /// is `false` (= baseline SOF0, byte-identical to a build that
-    /// doesn't know about this setter).
+    /// Composes with [`set_optimize_huffman`](Self::set_optimize_huffman):
+    /// when both are set, the encoder runs a count-then-emit pass per
+    /// scan, builds per-scan optimal Huffman tables (including the
+    /// `EOBn` symbols absent from the Annex K reference tables), and
+    /// emits multi-block end-of-band runs. That collapses the file-
+    /// size cost progressive normally carries vs baseline-SOF0 on
+    /// natural content. Default is `false` (= baseline SOF0, byte-
+    /// identical to a build that doesn't know about this setter).
     pub fn set_progressive(&mut self, on: bool) {
         self.progressive = on;
     }
@@ -381,8 +384,9 @@ impl<W: Write> JpegEncoder<W> {
         let div_chroma = build_divisors(&chroma_q);
 
         // Progressive (SOF2) takes precedence — it ships its own
-        // SOI..EOI shape with multi-scan entropy. Optimized Huffman
-        // for progressive is a follow-up.
+        // SOI..EOI shape with multi-scan entropy. The progressive
+        // path internally honors `optimize_huffman` to switch to its
+        // per-scan EOBn-aware two-pass plan.
         if self.progressive {
             return progressive::encode_progressive_inner(
                 self,
