@@ -1042,7 +1042,6 @@ fn walk_ac_refine(
     Ok(())
 }
 
-/// One block's contribution to an AC-refine scan under the EOBn-aware
 /// LSB of `|coef| >> al` — the refinement bit a previously-significant
 /// coefficient contributes in an AC-refine scan (`Ah > 0`, `Al == Ah - 1`).
 #[inline]
@@ -1050,6 +1049,7 @@ fn refine_bit(coef: i16, al: u8) -> u32 {
     ((coef.unsigned_abs() >> al) & 1) as u32
 }
 
+/// One block's contribution to an AC-refine scan under the EOBn-aware
 /// strategy. Mirrors `encode_ac_refine_block_eob0` but defers
 /// "no-new-significant" blocks into `state` for run-packing.
 ///
