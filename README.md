@@ -224,12 +224,22 @@ fn save_bgra(path: &str, bgra: &[u8], w: u32, h: u32) -> std::io::Result<()> {
     let mut enc = JpegEncoder::new_with_quality(f, 80);
     enc.encode(bgra, w, h, PixelFormat::Bgra)
 }
+
+// Single-component (grayscale) input — 1 byte/pixel, no chroma planes.
+fn save_gray(path: &str, gray: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode_grayscale(gray, w, h)
+}
 ```
 
-The encoder accepts `&[u8]` in any of eight pixel layouts — `Rgb`,
-`Bgr`, `Rgba`, `Bgra`, `Argb`, `Abgr`, `Rgbx`, `Bgrx` (alpha or pad
-byte dropped). Quality is clamped to `1..=100`; subsampling defaults
-to 4:2:0, with 4:2:2 and 4:4:4 available via `set_subsampling`.
+The encoder accepts `&[u8]` in any of eight color pixel layouts —
+`Rgb`, `Bgr`, `Rgba`, `Bgra`, `Argb`, `Abgr`, `Rgbx`, `Bgrx` (alpha
+or pad byte dropped) — plus single-byte grayscale via
+`encode_grayscale` (or `PixelFormat::Gray` through the generic
+`encode`). Quality is clamped to `1..=100`; subsampling defaults to
+4:2:0, with 4:2:2 and 4:4:4 available via `set_subsampling`
+(no-op on grayscale, which has no chroma to subsample).
 
 ### Decode
 
@@ -268,6 +278,13 @@ modes return `DecodeError::Unsupported`.
   `Argb`, `Abgr`, `Rgbx`, `Bgrx` via the generic
   `JpegEncoder::encode` entry point.
 - **Three chroma modes** — 4:4:4, 4:2:2, 4:2:0.
+- **Grayscale (1-component) encode** — `encode_grayscale` takes a
+  single-byte-per-pixel buffer and emits a luma-only JPEG (no chroma
+  DQT / DHT / SOF / SOS overhead, no RGB→YCbCr step). Composes with
+  optimized Huffman, restart markers, custom quant tables, EXIF / ICC
+  pass-through. `PixelFormat::Gray` is also accepted by the generic
+  `encode`. Progressive grayscale is not yet implemented (returns
+  `Unsupported` if combined with `set_progressive(true)`).
 - **Progressive (SOF2) output** — `set_progressive(true)` emits an
   8-scan successive-approximation progressive JPEG (DC interleaved
   first + per-component AC first at `Al=1`, then DC interleaved

@@ -93,6 +93,17 @@ pub const BGRX: PixelLayout = PixelLayout {
     g_off: 1,
     b_off: 0,
 };
+/// Single-byte grayscale layout. The one byte per pixel **is** Y
+/// (level-shifted by the caller for the encoder; written verbatim by
+/// the decoder). The R/G/B offsets are placeholders — code that runs
+/// the YCbCr→RGB color path must branch on `bpp == 1` first; this
+/// layout is never passed to the per-arch color kernels.
+pub const GRAY: PixelLayout = PixelLayout {
+    bpp: 1,
+    r_off: 0,
+    g_off: 0,
+    b_off: 0,
+};
 
 /// Build an 8- or 16-wide RGB scratch row with edge replication, starting
 /// at pixel column `x0` and source row `sy`. Source row is clamped to
@@ -301,4 +312,34 @@ pub fn extract_mcu_422(
 
     arch::backend::color::h2v1_downsample(&cb_full, cb_block);
     arch::backend::color::h2v1_downsample(&cr_full, cr_block);
+}
+
+/// Extract an 8x8 block of Y samples from a 1-byte/pixel grayscale
+/// buffer, level-shifted to centered i16. Edge-replicates on the right
+/// and bottom borders (the encoder always feeds 8-pixel-aligned MCUs
+/// even when the image is not a multiple of 8).
+///
+/// Unlike [`extract_block_ycbcr`], this fn skips the RGB→YCbCr SIMD
+/// kernel entirely — the input byte already *is* Y.
+pub fn extract_block_gray(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    x0: u32,
+    y0: u32,
+    y_block: &mut [i16; 64],
+) {
+    let max_x = (width - 1) as usize;
+    let max_y = (height - 1) as usize;
+    let stride = width as usize;
+    for j in 0..8 {
+        let sy = (y0 as usize + j).min(max_y);
+        let row_off = sy * stride;
+        for i in 0..8 {
+            let sx = (x0 as usize + i).min(max_x);
+            // Level-shift unsigned [0,255] to signed [-128,127] for the
+            // forward DCT (T.81 A.3.1).
+            y_block[j * 8 + i] = (pixels[row_off + sx] as i16) - 128;
+        }
+    }
 }

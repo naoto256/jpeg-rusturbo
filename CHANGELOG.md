@@ -15,6 +15,22 @@ Filling in the non-perf coverage gaps from the 0.8.0 encoder cycle.
 
 ### Added
 
+- **Grayscale encode** — new `JpegEncoder::encode_grayscale` convenience
+  entry point (and new `PixelFormat::Gray` accepted by the generic
+  `encode`) takes a single-byte-per-pixel buffer and emits a
+  1-component (luma-only) JPEG with no chroma DQT / DHT / SOF / SOS
+  overhead and no RGB→YCbCr conversion. Composes with
+  `set_optimize_huffman`, custom quant tables, restart markers, EXIF /
+  ICC pass-through. `set_subsampling` and `set_threads` are silently
+  ignored on the grayscale path (no chroma to subsample; serial-only
+  for now). `set_progressive(true)` combined with `encode_grayscale`
+  returns `io::ErrorKind::Unsupported` — progressive grayscale is not
+  yet implemented. On the decode side, `PixelFormat::Gray` now extracts
+  the Y plane directly with no upsample / no color convert, working
+  for both 1-component grayscale sources and 3-component color sources
+  (Cb/Cr discarded). Default behaviour for the existing 8 color pixel
+  formats is byte-identical to 0.8.0.
+
 - **Optimized-Huffman progressive (SOF2) encode** — `set_optimize_huffman(true)`
   now composes with `set_progressive(true)`. A two-pass encode counts the
   symbol frequencies of each progressive scan (including the `EOBn`
