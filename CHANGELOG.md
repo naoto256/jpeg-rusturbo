@@ -9,6 +9,25 @@ do not).
 Performance figures are summarized per release; the reproducible
 breakdown lives in [BENCH.md](BENCH.md).
 
+## [Unreleased — 0.9.0]
+
+Filling in the non-perf coverage gaps from the 0.8.0 encoder cycle.
+
+### Added
+
+- **Optimized-Huffman progressive (SOF2) encode** — `set_optimize_huffman(true)`
+  now composes with `set_progressive(true)`. A two-pass encode counts the
+  symbol frequencies of each progressive scan (including the `EOBn`
+  symbols its EOBRUN emission strategy produces), builds optimal
+  per-scan T.81 K.3 length-limited Huffman tables, emits a DHT segment
+  before each SOS, and packs multi-block end-of-band runs. Bit-exact
+  decode equivalence with the non-optimize progressive path; collapses
+  the size cost progressive normally carries vs baseline SOF0
+  (natural-like 4:2:0 q=80: 4K progressive 364 KB → 148 KB, **−40% vs
+  the corresponding baseline-SOF0 248 KB**; 1080p −37%; 1592×1124 −37%).
+  Default-off behaviour is unchanged — without `set_optimize_huffman`,
+  progressive output is bit-identical to 0.8.0.
+
 ## [0.8.0] — 2026-05-30
 
 The encoder cycle: a hot-path SIMD pass plus two new encoder-surface
