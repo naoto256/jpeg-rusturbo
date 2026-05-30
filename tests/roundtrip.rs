@@ -225,6 +225,11 @@ fn rgb_to_format(rgb: &[u8], format: PixelFormat) -> Vec<u8> {
                 out[p + 2] = r;
                 out[p + 3] = 0xAA;
             }
+            PixelFormat::Gray => {
+                // This helper is RGB-only by design; grayscale has its
+                // own dedicated tests in `tests/grayscale.rs`.
+                unreachable!("rgb_to_format does not synthesize grayscale");
+            }
         }
     }
     out

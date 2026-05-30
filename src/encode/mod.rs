@@ -276,6 +276,11 @@ impl<W: Write> JpegEncoder<W> {
     /// size cost progressive normally carries vs baseline-SOF0 on
     /// natural content. Default is `false` (= baseline SOF0, byte-
     /// identical to a build that doesn't know about this setter).
+    ///
+    /// Does **not** compose with
+    /// [`encode_grayscale`](Self::encode_grayscale) — setting both
+    /// returns [`io::ErrorKind::Unsupported`] at encode time
+    /// (progressive grayscale is not currently implemented).
     pub fn set_progressive(&mut self, on: bool) {
         self.progressive = on;
     }
@@ -314,8 +319,10 @@ impl<W: Write> JpegEncoder<W> {
     }
 
     /// Encode an arbitrary [`PixelFormat`] pixel buffer. Generic entry
-    /// point covering all eight supported byte layouts (RGB / BGR /
-    /// RGBA / BGRA / ARGB / ABGR / RGBX / BGRX).
+    /// point covering all eight color byte layouts (RGB / BGR / RGBA /
+    /// BGRA / ARGB / ABGR / RGBX / BGRX) plus single-byte grayscale
+    /// ([`PixelFormat::Gray`]). For `Gray` this dispatches to the same
+    /// single-component path as [`encode_grayscale`](Self::encode_grayscale).
     ///
     /// # Errors
     /// Same shape as [`encode_rgb`](Self::encode_rgb) / [`encode_rgba`](Self::encode_rgba),
@@ -328,6 +335,55 @@ impl<W: Write> JpegEncoder<W> {
         format: PixelFormat,
     ) -> io::Result<()> {
         self.encode_inner(pixels, width, height, format.into())
+    }
+
+    /// Encode a grayscale (single-byte-per-pixel) buffer as a
+    /// **1-component (luma-only) JPEG**. The byte in `pixels` is
+    /// treated as Y directly — no RGB→YCbCr conversion, no chroma
+    /// planes, no chroma DQT / DHT / SOF / SOS overhead. Output is
+    /// roughly **a third of the size** of a Y-channel-only re-encode
+    /// of the same content through the 4:2:0 RGB path.
+    ///
+    /// `pixels` is `width * height` bytes in row-major order. Trailing
+    /// bytes past `width * height` are ignored.
+    ///
+    /// Composes with [`set_optimize_huffman`](Self::set_optimize_huffman),
+    /// [`set_quality`-equivalent quant settings](Self::set_quant_tables),
+    /// [`set_restart_interval`](Self::set_restart_interval),
+    /// [`set_exif`](Self::set_exif) / [`set_icc_profile`](Self::set_icc_profile).
+    ///
+    /// **Does not** compose with [`set_progressive`](Self::set_progressive)
+    /// — calling that with `true` and then `encode_grayscale` returns
+    /// [`io::ErrorKind::Unsupported`].
+    ///
+    /// [`set_subsampling`](Self::set_subsampling) is silently ignored
+    /// — there is no chroma to subsample on a 1-component image.
+    ///
+    /// [`set_threads`](Self::set_threads) is silently treated as 1 —
+    /// the grayscale path is currently serial-only. Bytes are
+    /// identical regardless of the configured thread count.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`encode_rgb`](Self::encode_rgb), but with the
+    /// size requirement `width * height`. Returns
+    /// [`io::ErrorKind::Unsupported`] if `set_progressive(true)` was
+    /// previously called.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use jpeg_rusturbo::JpegEncoder;
+    ///
+    /// let pixels = vec![200u8; 16 * 16]; // 16x16 light-gray
+    /// let mut out: Vec<u8> = Vec::new();
+    /// let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+    /// enc.encode_grayscale(&pixels, 16, 16)?;
+    /// assert_eq!(&out[..2], &[0xFF, 0xD8]); // SOI marker
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn encode_grayscale(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
+        self.encode_inner(pixels, width, height, color::GRAY)
     }
 
     fn encode_inner(
@@ -369,6 +425,13 @@ impl<W: Write> JpegEncoder<W> {
                     layout.bpp
                 ),
             ));
+        }
+
+        // Grayscale takes a dedicated single-component path: no
+        // chroma DQT / DHT / SOF / SOS overhead, no RGB→YCbCr
+        // conversion (the input byte already *is* Y).
+        if layout.bpp == 1 {
+            return self.encode_grayscale_inner(pixels, width, height);
         }
 
         // Quant tables (8-bit, scaled by quality, OR user-supplied via
@@ -525,6 +588,168 @@ impl<W: Write> JpegEncoder<W> {
         dispatch_scheme!(self.subsampling, S => encode_optimized::<S, _>(
             self, pixels, width, height, layout, &luma_q, &chroma_q, div_luma, div_chroma,
         ))
+    }
+
+    /// Single-component (grayscale, T.81 1-component frame) encode
+    /// path. Branches off `encode_inner` before any chroma-aware
+    /// dispatch — emits SOI/APP0[/APP1][/APP2]/DQT(luma)/SOF0(1 comp)/
+    /// DHT(luma DC + AC)/[DRI]/SOS(1 comp)/entropy/EOI.
+    ///
+    /// `set_subsampling` and `set_threads` are ignored (no-ops for a
+    /// 1-component image); `set_progressive(true)` returns
+    /// `Unsupported`. Other knobs (custom quant, optimize-Huffman,
+    /// restart interval, EXIF, ICC) compose normally.
+    fn encode_grayscale_inner(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
+        if self.progressive {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "progressive grayscale encode is not implemented; \
+                 use baseline by calling set_progressive(false), \
+                 or open an issue",
+            ));
+        }
+
+        let luma_q = match &self.custom_quant {
+            Some((l, _)) => **l,
+            None => scale_quant_table(&STD_LUMA_QUANT, self.quality),
+        };
+        let div_luma = build_divisors(&luma_q);
+
+        let mcus_x = width.div_ceil(8);
+        let mcus_y = height.div_ceil(8);
+        let total_mcus = (mcus_x as usize) * (mcus_y as usize);
+
+        if self.optimize_huffman {
+            // Pass 1: DCT + quantize every 8×8 block into a buffer and
+            // count the symbol frequencies the standard tables would
+            // have produced (restart-interval-aware DC reset).
+            let mut blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus);
+            for my in 0..mcus_y {
+                for mx in 0..mcus_x {
+                    let mut blk = [0i16; 64];
+                    color::extract_block_gray(pixels, width, height, mx * 8, my * 8, &mut blk);
+                    arch::backend::dct::fdct_islow(&mut blk);
+                    blocks.push(quant::quantize_and_zigzag(&blk, &div_luma));
+                }
+            }
+
+            let mut dc_freq = [0u32; 257];
+            let mut ac_freq = [0u32; 257];
+            {
+                let restart = self.restart_interval as u32;
+                let mut prev_dc: i16 = 0;
+                let mut mcus_since_rst: u32 = 0;
+                for blk in blocks.iter() {
+                    if restart > 0 && mcus_since_rst == restart {
+                        prev_dc = 0;
+                        mcus_since_rst = 0;
+                    }
+                    prev_dc =
+                        huffman_optimize::count_block(blk, prev_dc, &mut dc_freq, &mut ac_freq);
+                    mcus_since_rst += 1;
+                }
+            }
+
+            let opt_dc = huffman_optimize::build_optimal_huffman(
+                &dc_freq,
+                &STD_LUMA_DC.bits,
+                STD_LUMA_DC.values,
+            );
+            let opt_ac = huffman_optimize::build_optimal_huffman(
+                &ac_freq,
+                &STD_LUMA_AC.bits,
+                STD_LUMA_AC.values,
+            );
+            let dc_tab = HuffmanTable::from_bits_values(&opt_dc.bits, &opt_dc.values);
+            let ac_tab = HuffmanTable::from_bits_values(&opt_ac.bits, &opt_ac.values);
+
+            // Header.
+            markers::write_soi(&mut self.out)?;
+            markers::write_app0_jfif(&mut self.out)?;
+            if let Some(exif) = self.exif.as_deref() {
+                markers::write_app1_exif(&mut self.out, exif)?;
+            }
+            if let Some(icc) = self.icc_profile.as_deref() {
+                markers::write_app2_icc(&mut self.out, icc)?;
+            }
+            markers::write_dqt(&mut self.out, 0, &luma_q)?;
+            markers::write_sof0(&mut self.out, width as u16, height as u16, &[(1, 1, 1, 0)])?;
+            markers::write_dht_bits_values(&mut self.out, 0, 0, &opt_dc.bits, &opt_dc.values)?;
+            markers::write_dht_bits_values(&mut self.out, 1, 0, &opt_ac.bits, &opt_ac.values)?;
+            if self.restart_interval > 0 {
+                markers::write_dri(&mut self.out, self.restart_interval)?;
+            }
+            markers::write_sos(&mut self.out, &[(1, 0, 0)])?;
+
+            // Pass 2: entropy-code the buffered blocks.
+            let mut bw = BitWriter::new(&mut self.out);
+            bw.reserve(total_mcus * 32);
+            let restart = self.restart_interval as u32;
+            let mut prev_dc: i16 = 0;
+            let mut mcus_since_rst: u32 = 0;
+            let mut next_rst: u8 = 0;
+            for (idx, blk) in blocks.iter().enumerate() {
+                if restart > 0 && mcus_since_rst == restart && idx < total_mcus {
+                    bw.write_restart(next_rst)?;
+                    next_rst = (next_rst + 1) & 7;
+                    mcus_since_rst = 0;
+                    prev_dc = 0;
+                }
+                prev_dc = encode_block(&mut bw, blk, prev_dc, &dc_tab, &ac_tab)?;
+                mcus_since_rst += 1;
+            }
+            bw.flush_to_byte_boundary()?;
+            markers::write_eoi(&mut self.out)?;
+            return Ok(());
+        }
+
+        // ---- Standard-tables path ----
+        let dc_tab = HuffmanTable::from_std(&STD_LUMA_DC);
+        let ac_tab = HuffmanTable::from_std(&STD_LUMA_AC);
+
+        markers::write_soi(&mut self.out)?;
+        markers::write_app0_jfif(&mut self.out)?;
+        if let Some(exif) = self.exif.as_deref() {
+            markers::write_app1_exif(&mut self.out, exif)?;
+        }
+        if let Some(icc) = self.icc_profile.as_deref() {
+            markers::write_app2_icc(&mut self.out, icc)?;
+        }
+        markers::write_dqt(&mut self.out, 0, &luma_q)?;
+        markers::write_sof0(&mut self.out, width as u16, height as u16, &[(1, 1, 1, 0)])?;
+        markers::write_dht(&mut self.out, 0, 0, &STD_LUMA_DC)?;
+        markers::write_dht(&mut self.out, 1, 0, &STD_LUMA_AC)?;
+        if self.restart_interval > 0 {
+            markers::write_dri(&mut self.out, self.restart_interval)?;
+        }
+        markers::write_sos(&mut self.out, &[(1, 0, 0)])?;
+
+        let mut bw = BitWriter::new(&mut self.out);
+        bw.reserve((width as usize) * (height as usize));
+        let restart = self.restart_interval as u32;
+        let mut prev_dc: i16 = 0;
+        let mut mcus_since_rst: u32 = 0;
+        let mut next_rst: u8 = 0;
+        let mut mcu_idx: usize = 0;
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if restart > 0 && mcus_since_rst == restart && mcu_idx < total_mcus {
+                    bw.write_restart(next_rst)?;
+                    next_rst = (next_rst + 1) & 7;
+                    mcus_since_rst = 0;
+                    prev_dc = 0;
+                }
+                let mut blk = [0i16; 64];
+                color::extract_block_gray(pixels, width, height, mx * 8, my * 8, &mut blk);
+                prev_dc =
+                    encode_one_block(&mut bw, &mut blk, &div_luma, prev_dc, &dc_tab, &ac_tab)?;
+                mcus_since_rst += 1;
+                mcu_idx += 1;
+            }
+        }
+        bw.flush_to_byte_boundary()?;
+        markers::write_eoi(&mut self.out)?;
+        Ok(())
     }
 }
 

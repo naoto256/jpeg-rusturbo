@@ -126,6 +126,43 @@ fn compose_output(
     let h_max = frame.h_max() as usize;
     let v_max = frame.v_max() as usize;
 
+    // Single-byte Y output: copy the luma plane directly with no
+    // chroma upsample and no color convert. Works for 1-component
+    // (grayscale) sources AND 3-component color sources (in the color
+    // case, Cb/Cr are discarded — a fast Y-extraction shortcut).
+    // Branches *before* the kernel dispatch because the per-arch color
+    // kernels are not built to write 1-byte-per-pixel output.
+    if bpp == 1 {
+        if planes.components.is_empty() {
+            return Err(DecodeError::Unsupported("no components in frame"));
+        }
+        if planes.components.len() == 4 {
+            return Err(DecodeError::Unsupported("4-component (CMYK) decode"));
+        }
+        // Y is always component[0]: ITU-T T.81 places Y at
+        // declaration index 0 for both 1-comp and 3-comp JPEGs, and
+        // the encoder side enforces id=1 → index 0.
+        let y_plane = &planes.components[0];
+        for j in 0..height {
+            let sj = j.min(y_plane.plane_height.saturating_sub(1));
+            let src_off = sj * y_plane.stride;
+            let take = width.min(y_plane.plane_width);
+            let dst_off = j * width;
+            out[dst_off..dst_off + take].copy_from_slice(&y_plane.samples[src_off..src_off + take]);
+            if take < width {
+                // Right-edge fill: replicate the last available column
+                // — matches the encoder's edge-replication contract.
+                let last = if take == 0 {
+                    0
+                } else {
+                    out[dst_off + take - 1]
+                };
+                out[dst_off + take..dst_off + width].fill(last);
+            }
+        }
+        return Ok(out);
+    }
+
     match planes.components.len() {
         1 => {
             // Single-component (grayscale) image: replicate Y across

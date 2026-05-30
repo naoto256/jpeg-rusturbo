@@ -165,7 +165,7 @@ pub mod decode;
 mod encode;
 mod tables;
 
-use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, PixelLayout, RGB, RGBA, RGBX};
+use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, GRAY, PixelLayout, RGB, RGBA, RGBX};
 
 pub use crate::encode::JpegEncoder;
 
@@ -197,11 +197,20 @@ pub enum ChromaSubsampling {
     Yuv420,
 }
 
-/// Source pixel format for the generic [`JpegEncoder::encode`] entry
-/// point.
+/// Pixel format used at both the encode-input and decode-output
+/// boundary.
 ///
-/// JPEG stores Y/Cb/Cr internally, so the alpha or pad byte in 4-byte
-/// formats is read and then discarded by the encoder.
+/// For the 3- / 4-byte color formats, JPEG stores Y/Cb/Cr internally,
+/// so the alpha or pad byte in 4-byte formats is read and then
+/// discarded by the encoder (and synthesized as `0xFF` opaque by the
+/// decoder, when requested).
+///
+/// [`PixelFormat::Gray`] is single-byte (1 bpp): the byte *is* Y. As
+/// an encoder input it produces a single-component (luma-only) JPEG —
+/// see [`JpegEncoder::encode_grayscale`]. As a decoder output it
+/// returns the Y plane verbatim, regardless of whether the source
+/// JPEG was 1-component grayscale or 3-component color (in the color
+/// case, chroma is discarded — a fast Y-extraction shortcut).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 3 bytes per pixel, in order (R, G, B).
@@ -220,6 +229,17 @@ pub enum PixelFormat {
     Rgbx,
     /// 4 bytes per pixel, in order (B, G, R, X). Pad byte ignored.
     Bgrx,
+    /// 1 byte per pixel — the byte is Y (luma) directly.
+    ///
+    /// On the encode side, see [`JpegEncoder::encode_grayscale`] —
+    /// produces a 1-component (luma-only) JPEG, no chroma DQT / DHT /
+    /// SOF / SOS overhead.
+    ///
+    /// On the decode side, returns the Y plane verbatim with no
+    /// chroma upsample and no color convert — works for both
+    /// 1-component grayscale source JPEGs and 3-component color
+    /// sources (in the color case, Cb/Cr are simply discarded).
+    Gray,
 }
 
 impl From<PixelFormat> for PixelLayout {
@@ -233,6 +253,7 @@ impl From<PixelFormat> for PixelLayout {
             PixelFormat::Abgr => ABGR,
             PixelFormat::Rgbx => RGBX,
             PixelFormat::Bgrx => BGRX,
+            PixelFormat::Gray => GRAY,
         }
     }
 }
