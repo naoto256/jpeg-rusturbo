@@ -306,19 +306,49 @@ serial marker / IO sections.
 
 # Out of scope
 
-- **AVX-512** versions of the kernels. The server market is bifurcated
-  (Zen 4 yes, Zen 2/3 no, Alder Lake P-cores bin-disabled); AVX2 stays
-  the x86_64 floor for this crate.
-- **AVX2 zig-zag scatter + magnitude precompute** on the encode side.
-  These two 0.8.0 hot-path items are NEON-only so far, which is why the
-  x86 encode SIMD-vs-scalar ratio trails NEON's slightly at 4:4:4. AVX2
-  equivalents (zig-zag via `vpermd` / `vpshufb`, magnitude lookup via a
-  PSHUFB bit-length table) are candidates for a later cycle.
-- **Full SIMD AC-symbol emission** on the encoder side. The nonzero
-  bitmap is SIMD; the per-coefficient emission stays scalar — it's tight
-  enough that LLVM autovectorizes the bit-writer drain and the table
-  lookups don't reshape cleanly into SIMD.
+Two buckets: things tried and measured not worth it, and things never
+planned. The first bucket is recorded so it isn't re-investigated every
+cycle.
+
+## Investigated — measured no gain, not pursued
+
+- **AVX2 zig-zag scatter** (encode). NEON ships a `vqtbl4q` (4-register,
+  64-byte table-lookup) zig-zag scatter; AVX2 has no equivalent — the
+  reorder needs clunky cross-128-bit-lane word permutes, while the x86
+  scalar zig-zag is already cheap (it stays hot in L1 / the store
+  buffer). Low-to-no expected gain; left scalar on x86. (This is the one
+  0.8.0 hot-path item that is NEON-only, and why the x86 encode
+  SIMD-vs-scalar ratio trails NEON's slightly at 4:4:4.)
+- **AVX2 `ac_magnitudes` precompute** (encode). Ported and bit-exact,
+  but measured a *wash* (≤~1.5%, within run-to-run noise) on a Broadwell
+  Xeon. AVX2 lacks per-16-bit-lane CLZ and 16-bit variable shift
+  (`vpsllvw` is AVX-512), so synthesizing them (float-exponent
+  bit-length + 32-bit-widen `vpsllvd` mask) costs about what it saves;
+  the kernel isn't a hot-enough share of encode self-time, and LLVM
+  already auto-vectorizes the scalar. Left scalar on x86.
+- **Decode dequantize skip-zero + zig-zag-folded quant table.** Profiled
+  as a possible +2–3 ms; a same-thermal A/B showed a *net regression* on
+  both backends (NEON auto-vectorizes the original loop; the x86
+  variant's branch overhead offset the SSE pack). Reverted. (Distinct
+  from the dequant→entropy-loop fusion that did ship in 0.7.5.)
+- **Combined AC/DC Huffman LUT as a *speed* play.** It sits at the noise
+  floor at q=80 (the common case). Retained as a bit-exact,
+  zero-cost-on-miss, table-driven foundation — the canonical approach in
+  libjpeg-turbo / zune-jpeg — but it is not a headline speedup.
+
+General rule learned: an encode-side micro-kernel below a few percent of
+self-time rarely beats LLVM-auto-vectorized scalar once you pay the
+ISA-synthesis cost for a NEON op that has no AVX2 equivalent.
+
+## By design (never planned)
+
+- **AVX-512 / SVE** versions of the kernels. The x86 server market is
+  bifurcated (Zen 4 yes, Zen 2/3 no, Alder Lake P-cores bin-disabled);
+  AVX2 stays the x86_64 floor, NEON the aarch64 baseline.
+- **Full SIMD AC-symbol emission** (encode). The nonzero bitmap is SIMD;
+  per-coefficient emission stays scalar — LLVM autovectorizes the
+  bit-writer drain and the table lookups don't reshape cleanly into SIMD.
 - **Vector-SIMD Huffman decode.** The bit reader + canonical-table walk
-  has a serial dependency on per-symbol code length, so vectorizing
-  across symbols isn't tractable. The optimizations that do help are
-  scalar bit-ops: the combined AC/DC LUT and the SWAR 32-bit refill.
+  has a serial per-symbol code-length dependency, so vectorizing across
+  symbols isn't tractable. The wins are scalar bit-ops: the combined
+  AC/DC LUT and the SWAR 32-bit refill.
