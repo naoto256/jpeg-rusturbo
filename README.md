@@ -472,6 +472,13 @@ Still under consideration for a later release: **trellis quantization**
 out of scope — the bit-reader + canonical-table walk has a serial
 per-symbol code-length dependency that doesn't vectorize.
 
+A few SIMD micro-optimizations were tried and **measured no gain**, so
+they were not shipped (and aren't pending work): AVX2 ports of the
+encode-side zig-zag scatter and `ac_magnitudes` precompute (NEON's
+`vqtbl4q` / per-lane CLZ have no AVX2 equivalent, and the kernels aren't
+a hot-enough share of encode time), and a decode-side dequant skip-zero
+pass. See [BENCH.md](BENCH.md) "Out of scope" for the measurements.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
 ## License
