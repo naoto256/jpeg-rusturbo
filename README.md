@@ -366,7 +366,10 @@ modes return `DecodeError::Unsupported`.
   bit-exact, zero runtime cost on misses, and the canonical
   approach used by libjpeg-turbo and zune-jpeg.
 - **Eight output pixel layouts** via the same `PixelFormat` enum the
-  encoder accepts.
+  encoder accepts, plus `PixelFormat::Gray` (1 byte/pixel) — extracts
+  the Y plane directly, skipping chroma upsample and color convert.
+  Works for both grayscale source JPEGs and color source JPEGs (a
+  fast Luma-extraction shortcut).
 - **Cross-decoder validation** — `tests/comparison_progressive.rs`
   asserts per-channel agreement with `image`'s decoder (≤ 3 / channel,
   ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,
@@ -385,8 +388,9 @@ for the per-stage breakdown.
 
 The crate's surface is intentionally small. Encode side:
 `JpegEncoder`, `ChromaSubsampling`, `PixelFormat`, `encode`,
-`encode_rgb`, `encode_rgba`. Decode side: `decode::Decoder`,
-`decode::decode`, `decode::ImageInfo`, `decode::DecodeError`.
+`encode_rgb`, `encode_rgba`, `encode_grayscale`. Decode side:
+`decode::Decoder`, `decode::decode`, `decode::ImageInfo`,
+`decode::DecodeError`.
 Per-architecture kernels live behind `arch::backend::*`, selected at
 compile time:
 
