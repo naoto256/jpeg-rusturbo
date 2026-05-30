@@ -275,6 +275,10 @@ modes return `DecodeError::Unsupported`.
   scan types implemented. Decodable by every conforming progressive
   decoder including the one in this crate. Default off — baseline
   output is bit-identical to pre-0.8.0 when this setter isn't called.
+  Composes with `set_optimize_huffman(true)`: enabling both turns on
+  EOBn run-packing + per-scan custom Huffman tables, eliminating the
+  size cost the standard-tables progressive path normally carries vs
+  baseline SOF0.
 - **EXIF / ICC metadata pass-through** — `set_exif(Option<Vec<u8>>)`
   / `set_icc_profile(Option<Vec<u8>>)` route raw blobs through as
   APP1 / APP2 segments immediately after the JFIF APP0. ICC profiles
