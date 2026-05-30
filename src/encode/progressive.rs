@@ -269,8 +269,8 @@ fn encode_progressive_scans_standard<S: SamplingScheme, W: Write>(
         out, y_blocks, cb_blocks, cr_blocks, &dc_luma, &dc_chroma, AL_FIRST,
     )?;
 
-    // Scans 2-4: AC first per component. Standard tables → no EOBn,
-    // we pass `allow_eobn = false` so each block self-terminates.
+    // Scans 2-4: AC first per component. Standard Annex K tables have
+    // no EOBn symbols, so each block self-terminates with EOB0.
     encode_ac_first_scan_indexed(
         out,
         y_blocks,
@@ -281,17 +281,17 @@ fn encode_progressive_scans_standard<S: SamplingScheme, W: Write>(
         1,
         63,
         AL_FIRST,
-        false,
     )?;
-    encode_ac_first_scan(out, cb_blocks, &ac_chroma, 2, 1, 1, 63, AL_FIRST, false)?;
-    encode_ac_first_scan(out, cr_blocks, &ac_chroma, 3, 1, 1, 63, AL_FIRST, false)?;
+    encode_ac_first_scan(out, cb_blocks, &ac_chroma, 2, 1, 1, 63, AL_FIRST)?;
+    encode_ac_first_scan(out, cr_blocks, &ac_chroma, 3, 1, 1, 63, AL_FIRST)?;
 
     // Scan 5: DC interleaved refine.
     encode_dc_interleaved_refine::<S, _>(
         out, y_blocks, cb_blocks, cr_blocks, AH_REFINE, AL_REFINE,
     )?;
 
-    // Scans 6-8: AC refine per component.
+    // Scans 6-8: AC refine per component. Same Annex K tables → EOB0
+    // per block, matching the AC-first scans above.
     encode_ac_refine_scan_indexed(
         out,
         y_blocks,
@@ -303,13 +303,12 @@ fn encode_progressive_scans_standard<S: SamplingScheme, W: Write>(
         63,
         AH_REFINE,
         AL_REFINE,
-        false,
     )?;
     encode_ac_refine_scan(
-        out, cb_blocks, &ac_chroma, 2, 1, 1, 63, AH_REFINE, AL_REFINE, false,
+        out, cb_blocks, &ac_chroma, 2, 1, 1, 63, AH_REFINE, AL_REFINE,
     )?;
     encode_ac_refine_scan(
-        out, cr_blocks, &ac_chroma, 3, 1, 1, 63, AH_REFINE, AL_REFINE, false,
+        out, cr_blocks, &ac_chroma, 3, 1, 1, 63, AH_REFINE, AL_REFINE,
     )?;
     Ok(())
 }
@@ -717,9 +716,10 @@ fn encode_one_ac_first_scan<W: Write>(
 }
 
 /// Standard-tables variant: walk blocks in scan order and emit
-/// per-block contributions with `allow_eobn = false` so end-of-band is
-/// always signalled as `EOB0` (no run extension). This is what keeps
-/// the default progressive output byte-identical to 0.8.0.
+/// per-block contributions with `EOB0` per block (no run extension);
+/// the EOBn-packing emitter is the separate `encode_one_ac_first_scan`
+/// used by the optimize path. This is what keeps the default
+/// progressive output byte-identical to 0.8.0.
 #[allow(clippy::too_many_arguments)]
 fn encode_ac_first_scan_indexed<W: Write>(
     out: &mut W,
@@ -731,31 +731,12 @@ fn encode_ac_first_scan_indexed<W: Write>(
     ss: u8,
     se: u8,
     al: u8,
-    allow_eobn: bool,
 ) -> io::Result<()> {
     markers::write_sos_spectral(out, &[(component_id, 0, ac_tab_id)], ss, se, 0, al)?;
     let mut bw = BitWriter::new(out);
     bw.reserve(blocks.len() * 8);
-    if allow_eobn {
-        let mut sink = EmitSink {
-            bw: &mut bw,
-            ac_tab,
-        };
-        let mut state = EobrunState::default();
-        walk_ac_first(
-            blocks,
-            Some(raster_indices),
-            ss,
-            se,
-            al,
-            &mut sink,
-            &mut state,
-        )?;
-        flush_eobrun(&mut sink, &mut state)?;
-    } else {
-        for &idx in raster_indices {
-            encode_ac_first_eob0(&mut bw, &blocks[idx], ss, se, ac_tab, al)?;
-        }
+    for &idx in raster_indices {
+        encode_ac_first_eob0(&mut bw, &blocks[idx], ss, se, ac_tab, al)?;
     }
     bw.flush_to_byte_boundary()
 }
@@ -770,23 +751,12 @@ fn encode_ac_first_scan<W: Write>(
     ss: u8,
     se: u8,
     al: u8,
-    allow_eobn: bool,
 ) -> io::Result<()> {
     markers::write_sos_spectral(out, &[(component_id, 0, ac_tab_id)], ss, se, 0, al)?;
     let mut bw = BitWriter::new(out);
     bw.reserve(blocks.len() * 8);
-    if allow_eobn {
-        let mut sink = EmitSink {
-            bw: &mut bw,
-            ac_tab,
-        };
-        let mut state = EobrunState::default();
-        walk_ac_first(blocks, None, ss, se, al, &mut sink, &mut state)?;
-        flush_eobrun(&mut sink, &mut state)?;
-    } else {
-        for block in blocks {
-            encode_ac_first_eob0(&mut bw, block, ss, se, ac_tab, al)?;
-        }
+    for block in blocks {
+        encode_ac_first_eob0(&mut bw, block, ss, se, ac_tab, al)?;
     }
     bw.flush_to_byte_boundary()
 }
@@ -877,8 +847,8 @@ fn ac_first_one_block(
 }
 
 /// Standard-tables (no EOBn) AC-first per-block emitter. Mirrors the
-/// 0.8.0 behavior exactly so the byte stream is unchanged when
-/// `allow_eobn = false`.
+/// 0.8.0 behavior exactly so the byte stream is unchanged on the
+/// standard-tables path.
 fn encode_ac_first_eob0<W: Write>(
     bw: &mut BitWriter<W>,
     block: &[i16; 64],
@@ -1006,7 +976,9 @@ fn encode_one_ac_refine_scan<W: Write>(
     bw.flush_to_byte_boundary()
 }
 
-/// Standard-tables variants: keep the per-block `EOB0` strategy.
+/// Standard-tables variants: keep the per-block `EOB0` strategy. The
+/// EOBn-packing emitter is the separate `encode_one_ac_refine_scan`
+/// used by the optimize path.
 #[allow(clippy::too_many_arguments)]
 fn encode_ac_refine_scan_indexed<W: Write>(
     out: &mut W,
@@ -1019,32 +991,12 @@ fn encode_ac_refine_scan_indexed<W: Write>(
     se: u8,
     ah: u8,
     al: u8,
-    allow_eobn: bool,
 ) -> io::Result<()> {
     markers::write_sos_spectral(out, &[(component_id, 0, ac_tab_id)], ss, se, ah, al)?;
     let mut bw = BitWriter::new(out);
     bw.reserve(blocks.len() * 4);
-    if allow_eobn {
-        let mut sink = EmitSink {
-            bw: &mut bw,
-            ac_tab,
-        };
-        let mut state = EobrunState::default();
-        walk_ac_refine(
-            blocks,
-            Some(raster_indices),
-            ss,
-            se,
-            ah,
-            al,
-            &mut sink,
-            &mut state,
-        )?;
-        flush_eobrun(&mut sink, &mut state)?;
-    } else {
-        for &idx in raster_indices {
-            encode_ac_refine_block_eob0(&mut bw, &blocks[idx], ss, se, ah, al, ac_tab)?;
-        }
+    for &idx in raster_indices {
+        encode_ac_refine_block_eob0(&mut bw, &blocks[idx], ss, se, ah, al, ac_tab)?;
     }
     bw.flush_to_byte_boundary()
 }
@@ -1060,23 +1012,12 @@ fn encode_ac_refine_scan<W: Write>(
     se: u8,
     ah: u8,
     al: u8,
-    allow_eobn: bool,
 ) -> io::Result<()> {
     markers::write_sos_spectral(out, &[(component_id, 0, ac_tab_id)], ss, se, ah, al)?;
     let mut bw = BitWriter::new(out);
     bw.reserve(blocks.len() * 4);
-    if allow_eobn {
-        let mut sink = EmitSink {
-            bw: &mut bw,
-            ac_tab,
-        };
-        let mut state = EobrunState::default();
-        walk_ac_refine(blocks, None, ss, se, ah, al, &mut sink, &mut state)?;
-        flush_eobrun(&mut sink, &mut state)?;
-    } else {
-        for block in blocks {
-            encode_ac_refine_block_eob0(&mut bw, block, ss, se, ah, al, ac_tab)?;
-        }
+    for block in blocks {
+        encode_ac_refine_block_eob0(&mut bw, block, ss, se, ah, al, ac_tab)?;
     }
     bw.flush_to_byte_boundary()
 }
@@ -1102,6 +1043,13 @@ fn walk_ac_refine(
 }
 
 /// One block's contribution to an AC-refine scan under the EOBn-aware
+/// LSB of `|coef| >> al` — the refinement bit a previously-significant
+/// coefficient contributes in an AC-refine scan (`Ah > 0`, `Al == Ah - 1`).
+#[inline]
+fn refine_bit(coef: i16, al: u8) -> u32 {
+    ((coef.unsigned_abs() >> al) & 1) as u32
+}
+
 /// strategy. Mirrors `encode_ac_refine_block_eob0` but defers
 /// "no-new-significant" blocks into `state` for run-packing.
 ///
@@ -1141,8 +1089,7 @@ fn ac_refine_one_block(
         state.extend();
         for k in ss..=se {
             if prev_sig(k) {
-                let bit = ((block[k].unsigned_abs() >> al) & 1) as u32;
-                state.push_ref_bit(bit);
+                state.push_ref_bit(refine_bit(block[k], al));
             }
         }
         return Ok(());
@@ -1184,8 +1131,7 @@ fn ac_refine_one_block(
                 sink.ac_symbol(0xF0)?;
                 for r in s..p {
                     if prev_sig(r) {
-                        let bit = ((block[r].unsigned_abs() >> al) & 1) as u32;
-                        sink.raw_bits(bit, 1)?;
+                        sink.raw_bits(refine_bit(block[r], al), 1)?;
                     }
                 }
                 s = p;
@@ -1197,8 +1143,7 @@ fn ac_refine_one_block(
             sink.raw_bits(sign, 1)?;
             for r in s..k {
                 if prev_sig(r) {
-                    let bit = ((block[r].unsigned_abs() >> al) & 1) as u32;
-                    sink.raw_bits(bit, 1)?;
+                    sink.raw_bits(refine_bit(block[r], al), 1)?;
                 }
             }
             sub_k = k + 1;
@@ -1216,8 +1161,7 @@ fn ac_refine_one_block(
         state.extend();
         for r in sub_k..=se {
             if prev_sig(r) {
-                let bit = ((block[r].unsigned_abs() >> al) & 1) as u32;
-                state.push_ref_bit(bit);
+                state.push_ref_bit(refine_bit(block[r], al));
             }
         }
     }
@@ -1226,8 +1170,8 @@ fn ac_refine_one_block(
 }
 
 /// Standard-tables (no EOBn) AC-refine per-block emitter. Mirrors the
-/// 0.8.0 behavior exactly so the byte stream is unchanged when
-/// `allow_eobn = false`.
+/// 0.8.0 behavior exactly so the byte stream is unchanged on the
+/// standard-tables path.
 #[allow(clippy::needless_range_loop)]
 fn encode_ac_refine_block_eob0<W: Write>(
     bw: &mut BitWriter<W>,
@@ -1253,8 +1197,7 @@ fn encode_ac_refine_block_eob0<W: Write>(
         emit_eob0(bw, ac_tab)?;
         for k in ss..=se {
             if prev_sig(k) {
-                let bit = (block[k].unsigned_abs() >> al) & 1;
-                bw.write_bits(bit as u32, 1)?;
+                bw.write_bits(refine_bit(block[k], al), 1)?;
             }
         }
         return Ok(());
@@ -1290,8 +1233,7 @@ fn encode_ac_refine_block_eob0<W: Write>(
                 bw.write_bits(zrl & 0xFFFF, zrl >> 16)?;
                 for r in s..p {
                     if prev_sig(r) {
-                        let bit = (block[r].unsigned_abs() >> al) & 1;
-                        bw.write_bits(bit as u32, 1)?;
+                        bw.write_bits(refine_bit(block[r], al), 1)?;
                     }
                 }
                 s = p;
@@ -1306,8 +1248,7 @@ fn encode_ac_refine_block_eob0<W: Write>(
             bw.write_bits(sign, 1)?;
             for r in s..k {
                 if prev_sig(r) {
-                    let bit = (block[r].unsigned_abs() >> al) & 1;
-                    bw.write_bits(bit as u32, 1)?;
+                    bw.write_bits(refine_bit(block[r], al), 1)?;
                 }
             }
             sub_k = k + 1;
@@ -1319,8 +1260,7 @@ fn encode_ac_refine_block_eob0<W: Write>(
         emit_eob0(bw, ac_tab)?;
         for r in sub_k..=se {
             if prev_sig(r) {
-                let bit = (block[r].unsigned_abs() >> al) & 1;
-                bw.write_bits(bit as u32, 1)?;
+                bw.write_bits(refine_bit(block[r], al), 1)?;
             }
         }
     }
