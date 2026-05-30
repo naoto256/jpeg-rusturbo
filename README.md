@@ -290,6 +290,12 @@ modes return `DecodeError::Unsupported`.
   builds canonical Huffman tables (T.81 K.2/K.3) from per-image
   symbol frequencies. Typical ~5% (synthetic) / 4–10% (natural)
   size reduction at ~1.7× (AVX2) / ~2.3× (NEON) encode cost.
+  Composes with `set_progressive(true)`: in progressive mode the
+  count-then-emit pass runs per scan, builds per-scan custom tables
+  (including the `EOBn` symbols absent from the Annex K reference),
+  emits per-scan DHT segments, and packs multi-block end-of-band
+  runs — collapsing the size cost progressive normally carries vs
+  baseline SOF0.
 - **Restart markers** — `set_restart_interval(n)` emits RSTm every
   `n` MCUs (DRI segment + interleaved RSTm), for error resilience or
   parallel decode by downstream readers.
@@ -389,11 +395,9 @@ pass-through. The 0.6.0 / 0.7.x cycles before it built out the decoder
 SIMD path. Full per-release history is in [CHANGELOG.md](CHANGELOG.md).
 
 Still under consideration for a later release: **trellis quantization**
-(mozjpeg-style RDO per-block search) and an `encode_progressive_optimize`
-path (optimized-Huffman for SOF2, to recover the per-block-EOB0 size
-cost). Vector-SIMD Huffman decode stays out of scope — the bit-reader +
-canonical-table walk has a serial per-symbol code-length dependency that
-doesn't vectorize.
+(mozjpeg-style RDO per-block search). Vector-SIMD Huffman decode stays
+out of scope — the bit-reader + canonical-table walk has a serial
+per-symbol code-length dependency that doesn't vectorize.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
 
