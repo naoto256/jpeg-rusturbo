@@ -17,7 +17,7 @@ pub use error::{DecodeError, Result};
 
 use crate::PixelFormat;
 use crate::arch;
-use crate::color::PixelLayout;
+use crate::color::{PixelClass, PixelLayout};
 
 use baseline::{DecodedPlane, DecodedPlanes};
 use markers::{DecoderHeaders, MarkerReader, ScanHeader};
@@ -126,45 +126,50 @@ fn compose_output(
     let h_max = frame.h_max() as usize;
     let v_max = frame.v_max() as usize;
 
-    // CMYK pass-through output (4-byte C/M/Y/K). Branches before the
-    // bpp==1 / RGB paths because the 4-byte CMYK layout shares its
-    // bpp with the 8 existing RGB-flavoured 4-byte layouts. Requires
-    // a 4-component source — decoding a 3-component (YCbCr) source
-    // into CMYK is not in scope and returns `Unsupported`.
-    if layout.is_cmyk {
-        if planes.components.len() != 4 {
-            return Err(DecodeError::Unsupported(
-                "PixelFormat::Cmyk requires a 4-component source JPEG",
-            ));
-        }
-        for j in 0..height {
-            let dst_off = j * width * 4;
-            for ch in 0..4 {
-                let plane = &planes.components[ch];
-                let sj = j.min(plane.plane_height.saturating_sub(1));
-                let src_off = sj * plane.stride;
-                let take = width.min(plane.plane_width);
-                // Stride one channel byte per output pixel; row by
-                // row, channel by channel. CMYK is fixed at H=V=1 in
-                // our encoder so plane_width == width in the common
-                // case; the .min(plane_width) guard handles unusual
-                // encoders that wrote sampling factors > 1.
-                for i in 0..take {
-                    out[dst_off + i * 4 + ch] = plane.samples[src_off + i];
-                }
-                if take < width {
-                    let last = if take == 0 {
-                        0
-                    } else {
-                        out[dst_off + (take - 1) * 4 + ch]
-                    };
-                    for i in take..width {
-                        out[dst_off + i * 4 + ch] = last;
+    // Dispatch on the layout category. The Cmyk and Gray arms handle
+    // their own output shape and return; Rgb falls through to the
+    // chroma-upsample + color-convert path below. The per-arch color
+    // kernels are only reachable from the Rgb arm.
+    match layout.class() {
+        PixelClass::Cmyk => {
+            // CMYK pass-through output (4-byte C/M/Y/K). Requires a
+            // 4-component source — decoding a 3-component (YCbCr)
+            // source into CMYK is not in scope.
+            if planes.components.len() != 4 {
+                return Err(DecodeError::Unsupported(
+                    "PixelFormat::Cmyk requires a 4-component source JPEG",
+                ));
+            }
+            for j in 0..height {
+                let dst_off = j * width * 4;
+                for ch in 0..4 {
+                    let plane = &planes.components[ch];
+                    let sj = j.min(plane.plane_height.saturating_sub(1));
+                    let src_off = sj * plane.stride;
+                    let take = width.min(plane.plane_width);
+                    // Stride one channel byte per output pixel; row by
+                    // row, channel by channel. CMYK is fixed at H=V=1
+                    // in our encoder so plane_width == width in the
+                    // common case; the .min(plane_width) guard handles
+                    // unusual encoders that wrote sampling factors > 1.
+                    for i in 0..take {
+                        out[dst_off + i * 4 + ch] = plane.samples[src_off + i];
+                    }
+                    if take < width {
+                        let last = if take == 0 {
+                            0
+                        } else {
+                            out[dst_off + (take - 1) * 4 + ch]
+                        };
+                        for i in take..width {
+                            out[dst_off + i * 4 + ch] = last;
+                        }
                     }
                 }
             }
+            return Ok(out);
         }
-        return Ok(out);
+        PixelClass::Gray | PixelClass::Rgb => {}
     }
 
     // Reject non-CMYK PixelFormats on a 4-component (CMYK) source:
@@ -184,7 +189,7 @@ fn compose_output(
     // case, Cb/Cr are discarded — a fast Y-extraction shortcut).
     // Branches *before* the kernel dispatch because the per-arch color
     // kernels are not built to write 1-byte-per-pixel output.
-    if bpp == 1 {
+    if layout.class() == PixelClass::Gray {
         if planes.components.is_empty() {
             return Err(DecodeError::Unsupported("no components in frame"));
         }
@@ -292,7 +297,7 @@ fn compose_output(
             }
         }
         _ => {
-            // 4-component (CMYK) is handled by the `layout.is_cmyk`
+            // 4-component (CMYK) is handled by the `PixelClass::Cmyk`
             // / mismatched-pixelformat guards above. Anything else
             // (2-component, 5+) is not a real-world JPEG shape.
             return Err(DecodeError::Unsupported("unsupported component count"));
