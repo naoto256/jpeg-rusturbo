@@ -126,6 +126,58 @@ fn compose_output(
     let h_max = frame.h_max() as usize;
     let v_max = frame.v_max() as usize;
 
+    // CMYK pass-through output (4-byte C/M/Y/K). Branches before the
+    // bpp==1 / RGB paths because the 4-byte CMYK layout shares its
+    // bpp with the 8 existing RGB-flavoured 4-byte layouts. Requires
+    // a 4-component source — decoding a 3-component (YCbCr) source
+    // into CMYK is not in scope and returns `Unsupported`.
+    if layout.is_cmyk {
+        if planes.components.len() != 4 {
+            return Err(DecodeError::Unsupported(
+                "PixelFormat::Cmyk requires a 4-component source JPEG",
+            ));
+        }
+        for j in 0..height {
+            let dst_off = j * width * 4;
+            for ch in 0..4 {
+                let plane = &planes.components[ch];
+                let sj = j.min(plane.plane_height.saturating_sub(1));
+                let src_off = sj * plane.stride;
+                let take = width.min(plane.plane_width);
+                // Stride one channel byte per output pixel; row by
+                // row, channel by channel. CMYK is fixed at H=V=1 in
+                // our encoder so plane_width == width in the common
+                // case; the .min(plane_width) guard handles unusual
+                // encoders that wrote sampling factors > 1.
+                for i in 0..take {
+                    out[dst_off + i * 4 + ch] = plane.samples[src_off + i];
+                }
+                if take < width {
+                    let last = if take == 0 {
+                        0
+                    } else {
+                        out[dst_off + (take - 1) * 4 + ch]
+                    };
+                    for i in take..width {
+                        out[dst_off + i * 4 + ch] = last;
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    // Reject non-CMYK PixelFormats on a 4-component (CMYK) source:
+    // this crate does not perform CMYK→RGB conversion. Callers that
+    // need RGB out of a CMYK JPEG should request `PixelFormat::Cmyk`
+    // and convert downstream (e.g. via the `image` crate).
+    if planes.components.len() == 4 {
+        return Err(DecodeError::Unsupported(
+            "CMYK source can only be decoded as PixelFormat::Cmyk; \
+             this crate does not perform CMYK→RGB conversion",
+        ));
+    }
+
     // Single-byte Y output: copy the luma plane directly with no
     // chroma upsample and no color convert. Works for 1-component
     // (grayscale) sources AND 3-component color sources (in the color
@@ -135,9 +187,6 @@ fn compose_output(
     if bpp == 1 {
         if planes.components.is_empty() {
             return Err(DecodeError::Unsupported("no components in frame"));
-        }
-        if planes.components.len() == 4 {
-            return Err(DecodeError::Unsupported("4-component (CMYK) decode"));
         }
         // Y is always component[0]: ITU-T T.81 places Y at
         // declaration index 0 for both 1-comp and 3-comp JPEGs, and
@@ -242,12 +291,11 @@ fn compose_output(
                 );
             }
         }
-        n => {
-            return Err(DecodeError::Unsupported(if n == 4 {
-                "4-component (CMYK) decode"
-            } else {
-                "unsupported component count"
-            }));
+        _ => {
+            // 4-component (CMYK) is handled by the `layout.is_cmyk`
+            // / mismatched-pixelformat guards above. Anything else
+            // (2-component, 5+) is not a real-world JPEG shape.
+            return Err(DecodeError::Unsupported("unsupported component count"));
         }
     }
 
