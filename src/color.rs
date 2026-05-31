@@ -166,7 +166,7 @@ pub const GRAY: PixelLayout = PixelLayout {
 /// CMYK↔RGB transform; the decoder reads such a JPEG back into the
 /// same byte order. The R/G/B offsets are placeholders — like
 /// [`GRAY`], CMYK never reaches the per-arch color kernels. Callers
-/// detect this layout via [`PixelLayout::is_cmyk`].
+/// detect this layout via [`PixelLayout::class`].
 pub const CMYK: PixelLayout = PixelLayout {
     bpp: 4,
     r_off: 0,
