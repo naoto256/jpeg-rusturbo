@@ -15,7 +15,7 @@ use std::io::{self, Write};
 
 use rayon::prelude::*;
 
-use crate::color::{self, PixelLayout, RGB, RGBA};
+use crate::color::{self, PixelClass, PixelLayout, RGB, RGBA};
 use crate::tables::{
     STD_CHROMA_AC, STD_CHROMA_DC, STD_CHROMA_QUANT, STD_LUMA_AC, STD_LUMA_DC, STD_LUMA_QUANT,
     scale_quant_table,
@@ -492,19 +492,15 @@ impl<W: Write> JpegEncoder<W> {
             ));
         }
 
-        // Grayscale takes a dedicated single-component path: no
-        // chroma DQT / DHT / SOF / SOS overhead, no RGB→YCbCr
-        // conversion (the input byte already *is* Y).
-        if layout.bpp == 1 {
-            return self.encode_grayscale_inner(pixels, width, height);
-        }
-
-        // CMYK (4-component pass-through): no RGB→YCbCr, no
-        // subsampling, all 4 channels share the luma quant + Huffman
-        // tables. Branches before the chroma-aware quant table
-        // derivation below because CMYK never touches a chroma table.
-        if layout.is_cmyk {
-            return self.encode_cmyk_inner(pixels, width, height);
+        // Dispatch on the layout category. Non-RGB categories use
+        // dedicated single-or-non-RGB-component pipelines that skip the
+        // chroma DQT / DHT / SOF / SOS overhead and the RGB→YCbCr
+        // conversion entirely. The RGB arm falls through to the
+        // 3-component baseline pipeline below.
+        match layout.class() {
+            PixelClass::Gray => return self.encode_grayscale_inner(pixels, width, height),
+            PixelClass::Cmyk => return self.encode_cmyk_inner(pixels, width, height),
+            PixelClass::Rgb => {}
         }
 
         // Quant tables (8-bit, scaled by quality, OR user-supplied via
