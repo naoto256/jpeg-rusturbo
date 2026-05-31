@@ -62,7 +62,9 @@ decoder over 0.7.x; **as of 0.7.5 we are faster than `image` at 4K
 on both microarchitectures and both corpora** (~1.03–1.10× on
 synthetic Huffman-heavy content, ~1.18–1.22× on natural-content),
 while matching coverage — baseline + progressive Huffman with
-fancy chroma upsample, output in any of eight pixel layouts. The
+fancy chroma upsample, output in any of ten pixel layouts (the
+eight RGB-flavoured layouts plus single-byte `Gray` and 4-byte
+`Cmyk` pass-through, both added in 0.9.0). The
 smaller-resolution fixed-cost overhead means we trail by only
 ~2–3% at 1592×1124 on Cascade Lake (at parity or ahead from 1080p
 up). The decoder side wasn't reopened in 0.8.0 (that cycle was

@@ -47,10 +47,49 @@ pub struct PixelLayout {
     /// `bpp == 4 && is_cmyk == true` (raw C/M/Y/K — no RGB↔YCbCr
     /// conversion) from the eight existing 4-byte color layouts
     /// (RGBA / BGRA / ARGB / ABGR / RGBX / BGRX), which all carry RGB
-    /// in some byte order. The encode + decode CMYK branches check
-    /// this flag before any color-kernel dispatch; the kernels
-    /// themselves never see a CMYK layout.
+    /// in some byte order. Callers should branch through
+    /// [`PixelLayout::class`] rather than reading this field directly.
     pub is_cmyk: bool,
+}
+
+/// High-level category of a [`PixelLayout`]. The encode and decode
+/// pipelines branch on this single discriminator before any
+/// color-kernel dispatch; the per-arch color kernels only ever see
+/// [`PixelClass::Rgb`] layouts.
+///
+/// Derived from the (bpp, is_cmyk) fields of [`PixelLayout`] rather
+/// than stored separately, so each pixel-layout constant remains the
+/// single source of truth for its category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelClass {
+    /// Standard 3- or 4-byte RGB-flavoured layouts: RGB, BGR, RGBA,
+    /// BGRA, ARGB, ABGR, RGBX, BGRX. Goes through the YCbCr color
+    /// path (with alpha/pad bytes dropped).
+    Rgb,
+    /// Single-byte luma (the byte **is** Y). Skips color convert and
+    /// chroma upsample entirely.
+    Gray,
+    /// 4-byte CMYK pass-through (C, M, Y, K). No RGB↔YCbCr transform
+    /// is performed in either direction.
+    Cmyk,
+}
+
+impl PixelLayout {
+    /// Single discriminator over the three layout categories. Use this
+    /// (typically via `match layout.class()`) when the encode or decode
+    /// pipeline needs to branch on category — keeps callers from
+    /// reading the (bpp, is_cmyk) fields directly and centralises the
+    /// "which kernel path do we take" decision in one place.
+    #[inline]
+    pub fn class(&self) -> PixelClass {
+        if self.bpp == 1 {
+            PixelClass::Gray
+        } else if self.is_cmyk {
+            PixelClass::Cmyk
+        } else {
+            PixelClass::Rgb
+        }
+    }
 }
 
 pub const RGB: PixelLayout = PixelLayout {
