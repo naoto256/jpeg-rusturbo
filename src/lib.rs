@@ -165,7 +165,7 @@ pub mod decode;
 mod encode;
 mod tables;
 
-use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, GRAY, PixelLayout, RGB, RGBA, RGBX};
+use crate::color::{ABGR, ARGB, BGR, BGRA, BGRX, CMYK, GRAY, PixelLayout, RGB, RGBA, RGBX};
 
 pub use crate::encode::JpegEncoder;
 
@@ -211,6 +211,17 @@ pub enum ChromaSubsampling {
 /// returns the Y plane verbatim, regardless of whether the source
 /// JPEG was 1-component grayscale or 3-component color (in the color
 /// case, chroma is discarded — a fast Y-extraction shortcut).
+///
+/// [`PixelFormat::Cmyk`] is 4 bytes/pixel (C, M, Y, K) and is a
+/// **pass-through**: the encoder takes raw CMYK bytes and emits a
+/// 4-component baseline JPEG without any CMYK↔RGB conversion (no
+/// per-channel transform of any kind); the decoder reads such a JPEG
+/// back into the same C/M/Y/K byte order. Decoding a 4-component
+/// (CMYK) source into any other [`PixelFormat`] is rejected with
+/// `Unsupported` — this crate does not perform CMYK→RGB conversion.
+/// Adobe-flavoured YCCK (signalled via APP14) is intentionally out of
+/// scope and treated as plain CMYK regardless of the APP14 transform
+/// byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 3 bytes per pixel, in order (R, G, B).
@@ -240,6 +251,20 @@ pub enum PixelFormat {
     /// 1-component grayscale source JPEGs and 3-component color
     /// sources (in the color case, Cb/Cr are simply discarded).
     Gray,
+    /// 4 bytes per pixel — raw (C, M, Y, K), pass-through.
+    ///
+    /// On the encode side, see [`JpegEncoder::encode_cmyk`] —
+    /// produces a 4-component baseline JPEG with no CMYK↔RGB
+    /// conversion, no APP14 marker, and no Adobe YCCK transform.
+    ///
+    /// On the decode side, accepted only against a 4-component
+    /// (CMYK) source JPEG; decoding a CMYK source into any non-CMYK
+    /// `PixelFormat` returns `DecodeError::Unsupported`, and
+    /// decoding a 3-component source into `PixelFormat::Cmyk`
+    /// likewise returns `Unsupported`. APP14-flagged YCCK files are
+    /// read as plain CMYK (the YCCK transform is intentionally not
+    /// applied).
+    Cmyk,
 }
 
 impl From<PixelFormat> for PixelLayout {
@@ -254,6 +279,7 @@ impl From<PixelFormat> for PixelLayout {
             PixelFormat::Rgbx => RGBX,
             PixelFormat::Bgrx => BGRX,
             PixelFormat::Gray => GRAY,
+            PixelFormat::Cmyk => CMYK,
         }
     }
 }

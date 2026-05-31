@@ -230,6 +230,10 @@ fn rgb_to_format(rgb: &[u8], format: PixelFormat) -> Vec<u8> {
                 // own dedicated tests in `tests/grayscale.rs`.
                 unreachable!("rgb_to_format does not synthesize grayscale");
             }
+            PixelFormat::Cmyk => {
+                // CMYK pass-through has its own tests in `tests/cmyk.rs`.
+                unreachable!("rgb_to_format does not synthesize CMYK");
+            }
         }
     }
     out

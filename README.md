@@ -231,15 +231,25 @@ fn save_gray(path: &str, gray: &[u8], w: u32, h: u32) -> std::io::Result<()> {
     let mut enc = JpegEncoder::new_with_quality(f, 80);
     enc.encode_grayscale(gray, w, h)
 }
+
+// CMYK pass-through input — 4 bytes/pixel (C, M, Y, K), 4-component
+// JPEG output. No CMYK↔RGB conversion is performed.
+fn save_cmyk(path: &str, cmyk: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode_cmyk(cmyk, w, h)
+}
 ```
 
 The encoder accepts `&[u8]` in any of eight color pixel layouts —
 `Rgb`, `Bgr`, `Rgba`, `Bgra`, `Argb`, `Abgr`, `Rgbx`, `Bgrx` (alpha
 or pad byte dropped) — plus single-byte grayscale via
 `encode_grayscale` (or `PixelFormat::Gray` through the generic
-`encode`). Quality is clamped to `1..=100`; subsampling defaults to
-4:2:0, with 4:2:2 and 4:4:4 available via `set_subsampling`
-(no-op on grayscale, which has no chroma to subsample).
+`encode`), plus 4-byte CMYK pass-through via `encode_cmyk` (or
+`PixelFormat::Cmyk` through the generic `encode`). Quality is
+clamped to `1..=100`; subsampling defaults to 4:2:0, with 4:2:2 and
+4:4:4 available via `set_subsampling` (no-op on grayscale and CMYK,
+neither of which has chroma to subsample).
 
 ### Decode
 
@@ -257,10 +267,15 @@ println!("{}x{}, {} components", info.width, info.height, info.components);
 let pixels = dec.decode(PixelFormat::Rgba)?;
 ```
 
-Output can be requested in any of the eight pixel layouts. Both
+Output can be requested in any of the eight color pixel layouts,
+plus `PixelFormat::Gray` (1 byte/pixel luma extraction from either
+1- or 3-component sources) and `PixelFormat::Cmyk` (4 bytes/pixel
+pass-through, only against a 4-component CMYK source). Both
 **baseline (SOF0) and progressive (SOF2)** Huffman streams are
 accepted; arithmetic-coded (SOF9-15), hierarchical, and lossless
-modes return `DecodeError::Unsupported`.
+modes return `DecodeError::Unsupported`. Decoding a CMYK source
+into any non-CMYK `PixelFormat` likewise returns `Unsupported` —
+this crate does not perform CMYK→RGB conversion.
 
 ## Features
 
@@ -285,6 +300,19 @@ modes return `DecodeError::Unsupported`.
   pass-through. `PixelFormat::Gray` is also accepted by the generic
   `encode`. Progressive grayscale is not yet implemented (returns
   `Unsupported` if combined with `set_progressive(true)`).
+- **CMYK (4-component) encode** — `encode_cmyk` takes a
+  4-byte-per-pixel (C, M, Y, K) buffer and emits a plain (non-Adobe-
+  YCCK) 4-component baseline JPEG with sampling 1:1:1:1, all four
+  channels sharing the luma quantization table and one luma-DC +
+  one luma-AC Huffman table. Pass-through, **not** CMYK↔RGB
+  conversion — that transform is downstream responsibility. No APP14
+  marker is emitted. Composes with optimized Huffman (one shared
+  optimal DC + one shared optimal AC table), restart markers,
+  custom quant (luma only — chroma argument silently ignored),
+  EXIF / ICC pass-through. `set_subsampling` and `set_threads` are
+  silently no-ops on the CMYK path. Progressive CMYK is not
+  implemented (returns `Unsupported` if combined with
+  `set_progressive(true)`).
 - **Progressive (SOF2) output** — `set_progressive(true)` emits an
   8-scan successive-approximation progressive JPEG (DC interleaved
   first + per-component AC first at `Al=1`, then DC interleaved
@@ -369,7 +397,12 @@ modes return `DecodeError::Unsupported`.
   encoder accepts, plus `PixelFormat::Gray` (1 byte/pixel) — extracts
   the Y plane directly, skipping chroma upsample and color convert.
   Works for both grayscale source JPEGs and color source JPEGs (a
-  fast Luma-extraction shortcut).
+  fast Luma-extraction shortcut). Plus `PixelFormat::Cmyk` (4
+  bytes/pixel) — pass-through C/M/Y/K read-back from a 4-component
+  source JPEG, no CMYK→RGB conversion (out of scope; convert
+  downstream if needed). Adobe-flavoured YCCK (APP14-signalled) is
+  intentionally treated as plain CMYK regardless of the APP14
+  transform byte.
 - **Cross-decoder validation** — `tests/comparison_progressive.rs`
   asserts per-channel agreement with `image`'s decoder (≤ 3 / channel,
   ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,
@@ -388,7 +421,7 @@ for the per-stage breakdown.
 
 The crate's surface is intentionally small. Encode side:
 `JpegEncoder`, `ChromaSubsampling`, `PixelFormat`, `encode`,
-`encode_rgb`, `encode_rgba`, `encode_grayscale`. Decode side:
+`encode_rgb`, `encode_rgba`, `encode_grayscale`, `encode_cmyk`. Decode side:
 `decode::Decoder`, `decode::decode`, `decode::ImageInfo`,
 `decode::DecodeError`.
 Per-architecture kernels live behind `arch::backend::*`, selected at

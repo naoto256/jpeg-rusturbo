@@ -386,6 +386,71 @@ impl<W: Write> JpegEncoder<W> {
         self.encode_inner(pixels, width, height, color::GRAY)
     }
 
+    /// Encode a CMYK pixel buffer (4 bytes/pixel: C, M, Y, K) as a
+    /// **4-component baseline JPEG**, pass-through.
+    ///
+    /// Each of the four channels becomes an independent JPEG
+    /// component (sampling factor 1:1:1:1, all four sharing the luma
+    /// quantization table and one luma DC + one luma AC Huffman
+    /// table). No CMYK↔RGB conversion of any kind is performed; the
+    /// bytes go through the standard DCT / quantize / entropy chain
+    /// one channel at a time. The output carries no APP14 Adobe
+    /// marker — it is a plain (non-YCCK) CMYK stream that any
+    /// conforming JPEG decoder reads back as four raw components.
+    ///
+    /// `pixels` is `width * height * 4` bytes in row-major order
+    /// (`C, M, Y, K, C, M, Y, K, …`). Trailing bytes past
+    /// `width * height * 4` are ignored.
+    ///
+    /// Composes with [`set_optimize_huffman`](Self::set_optimize_huffman)
+    /// — the two-pass machinery counts all four components' symbols
+    /// into one luma-DC + one luma-AC frequency table and emits one
+    /// optimal DC table + one optimal AC table shared across the
+    /// scan. Also composes with [`set_restart_interval`](Self::set_restart_interval),
+    /// [`set_exif`](Self::set_exif) / [`set_icc_profile`](Self::set_icc_profile)
+    /// (ICC is especially useful for print pipelines).
+    ///
+    /// [`set_subsampling`](Self::set_subsampling) is silently ignored
+    /// — CMYK encode is fixed at 1:1:1:1, with no chroma analog.
+    ///
+    /// [`set_threads`](Self::set_threads) is silently treated as 1 —
+    /// the CMYK path is currently serial-only.
+    ///
+    /// [`set_quant_tables`](Self::set_quant_tables): only the luma
+    /// table is consulted on the CMYK path (a single DQT segment is
+    /// emitted, shared across all four components). The chroma table
+    /// is silently ignored.
+    ///
+    /// **Does not** compose with [`set_progressive`](Self::set_progressive)
+    /// — combining the two returns [`io::ErrorKind::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`encode_rgb`](Self::encode_rgb), but with the
+    /// size requirement `width * height * 4`. Returns
+    /// [`io::ErrorKind::Unsupported`] if `set_progressive(true)` was
+    /// previously called.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use jpeg_rusturbo::JpegEncoder;
+    ///
+    /// // 16x16 of pure cyan ink (C=255, M=Y=K=0).
+    /// let mut cmyk = Vec::with_capacity(16 * 16 * 4);
+    /// for _ in 0..(16 * 16) {
+    ///     cmyk.extend_from_slice(&[255, 0, 0, 0]);
+    /// }
+    /// let mut out: Vec<u8> = Vec::new();
+    /// let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+    /// enc.encode_cmyk(&cmyk, 16, 16)?;
+    /// assert_eq!(&out[..2], &[0xFF, 0xD8]); // SOI marker
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn encode_cmyk(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
+        self.encode_inner(pixels, width, height, color::CMYK)
+    }
+
     fn encode_inner(
         &mut self,
         pixels: &[u8],
@@ -432,6 +497,14 @@ impl<W: Write> JpegEncoder<W> {
         // conversion (the input byte already *is* Y).
         if layout.bpp == 1 {
             return self.encode_grayscale_inner(pixels, width, height);
+        }
+
+        // CMYK (4-component pass-through): no RGB→YCbCr, no
+        // subsampling, all 4 channels share the luma quant + Huffman
+        // tables. Branches before the chroma-aware quant table
+        // derivation below because CMYK never touches a chroma table.
+        if layout.is_cmyk {
+            return self.encode_cmyk_inner(pixels, width, height);
         }
 
         // Quant tables (8-bit, scaled by quality, OR user-supplied via
@@ -743,6 +816,215 @@ impl<W: Write> JpegEncoder<W> {
                 color::extract_block_gray(pixels, width, height, mx * 8, my * 8, &mut blk);
                 prev_dc =
                     encode_one_block(&mut bw, &mut blk, &div_luma, prev_dc, &dc_tab, &ac_tab)?;
+                mcus_since_rst += 1;
+                mcu_idx += 1;
+            }
+        }
+        bw.flush_to_byte_boundary()?;
+        markers::write_eoi(&mut self.out)?;
+        Ok(())
+    }
+
+    /// Four-component (CMYK) baseline encode path. Treats each of the
+    /// four input channels as an independent JPEG component, sampling
+    /// factor 1:1:1:1, all four sharing the luma quant table and one
+    /// luma-DC + one luma-AC Huffman table. No APP14 marker is
+    /// emitted — output is plain (non-YCCK) CMYK. Mirrors the shape
+    /// of `encode_grayscale_inner` (single DQT, single DHT pair,
+    /// optimize-Huffman composes via shared frequency tables).
+    fn encode_cmyk_inner(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
+        if self.progressive {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "progressive CMYK encode is not implemented; \
+                 use baseline by calling set_progressive(false), \
+                 or open an issue",
+            ));
+        }
+
+        // Only the luma quant table participates on the CMYK path.
+        // A user-supplied chroma table (via `set_quant_tables`) is
+        // silently ignored — there is no chroma to quantize.
+        let luma_q = match &self.custom_quant {
+            Some((l, _)) => **l,
+            None => scale_quant_table(&STD_LUMA_QUANT, self.quality),
+        };
+        let div_luma = build_divisors(&luma_q);
+
+        let mcus_x = width.div_ceil(8);
+        let mcus_y = height.div_ceil(8);
+        let total_mcus = (mcus_x as usize) * (mcus_y as usize);
+
+        if self.optimize_huffman {
+            // Pass 1: DCT + quantize all 4 channels of every MCU into
+            // a flat per-MCU buffer of 4 zigzag blocks (C, M, Y, K
+            // order). Per-component DC predictors are tracked across
+            // restart boundaries the same way the chroma path does
+            // for Y/Cb/Cr.
+            let mut blocks: Vec<[i16; 64]> = Vec::with_capacity(total_mcus * 4);
+            for my in 0..mcus_y {
+                for mx in 0..mcus_x {
+                    for ch in 0..4 {
+                        let mut blk = [0i16; 64];
+                        color::extract_block_cmyk(
+                            pixels,
+                            width,
+                            height,
+                            mx * 8,
+                            my * 8,
+                            ch,
+                            &mut blk,
+                        );
+                        arch::backend::dct::fdct_islow(&mut blk);
+                        blocks.push(quant::quantize_and_zigzag(&blk, &div_luma));
+                    }
+                }
+            }
+
+            // Count all 4 components into one luma DC + one luma AC
+            // frequency histogram (shared tables on emit).
+            let mut dc_freq = [0u32; 257];
+            let mut ac_freq = [0u32; 257];
+            {
+                let restart = self.restart_interval as u32;
+                let mut prev_dc = [0i16; 4];
+                let mut mcus_since_rst: u32 = 0;
+                for mcu in blocks.chunks_exact(4) {
+                    if restart > 0 && mcus_since_rst == restart {
+                        prev_dc = [0; 4];
+                        mcus_since_rst = 0;
+                    }
+                    for (ch, blk) in mcu.iter().enumerate() {
+                        prev_dc[ch] = huffman_optimize::count_block(
+                            blk,
+                            prev_dc[ch],
+                            &mut dc_freq,
+                            &mut ac_freq,
+                        );
+                    }
+                    mcus_since_rst += 1;
+                }
+            }
+
+            let opt_dc = huffman_optimize::build_optimal_huffman(
+                &dc_freq,
+                &STD_LUMA_DC.bits,
+                STD_LUMA_DC.values,
+            );
+            let opt_ac = huffman_optimize::build_optimal_huffman(
+                &ac_freq,
+                &STD_LUMA_AC.bits,
+                STD_LUMA_AC.values,
+            );
+            let dc_tab = HuffmanTable::from_bits_values(&opt_dc.bits, &opt_dc.values);
+            let ac_tab = HuffmanTable::from_bits_values(&opt_ac.bits, &opt_ac.values);
+
+            // Header.
+            markers::write_soi(&mut self.out)?;
+            markers::write_app0_jfif(&mut self.out)?;
+            if let Some(exif) = self.exif.as_deref() {
+                markers::write_app1_exif(&mut self.out, exif)?;
+            }
+            if let Some(icc) = self.icc_profile.as_deref() {
+                markers::write_app2_icc(&mut self.out, icc)?;
+            }
+            markers::write_dqt(&mut self.out, 0, &luma_q)?;
+            markers::write_sof0(
+                &mut self.out,
+                width as u16,
+                height as u16,
+                &[
+                    (1, 1, 1, 0), // C
+                    (2, 1, 1, 0), // M
+                    (3, 1, 1, 0), // Y
+                    (4, 1, 1, 0), // K
+                ],
+            )?;
+            markers::write_dht_bits_values(&mut self.out, 0, 0, &opt_dc.bits, &opt_dc.values)?;
+            markers::write_dht_bits_values(&mut self.out, 1, 0, &opt_ac.bits, &opt_ac.values)?;
+            if self.restart_interval > 0 {
+                markers::write_dri(&mut self.out, self.restart_interval)?;
+            }
+            markers::write_sos(
+                &mut self.out,
+                &[
+                    (1, 0, 0), // C → DC0/AC0
+                    (2, 0, 0), // M → DC0/AC0
+                    (3, 0, 0), // Y → DC0/AC0
+                    (4, 0, 0), // K → DC0/AC0
+                ],
+            )?;
+
+            // Pass 2: entropy-code the buffered blocks.
+            let mut bw = BitWriter::new(&mut self.out);
+            bw.reserve(total_mcus * 64);
+            let restart = self.restart_interval as u32;
+            let mut prev_dc = [0i16; 4];
+            let mut mcus_since_rst: u32 = 0;
+            let mut next_rst: u8 = 0;
+            for (mcu_idx, mcu) in blocks.chunks_exact(4).enumerate() {
+                if restart > 0 && mcus_since_rst == restart && mcu_idx < total_mcus {
+                    bw.write_restart(next_rst)?;
+                    next_rst = (next_rst + 1) & 7;
+                    mcus_since_rst = 0;
+                    prev_dc = [0; 4];
+                }
+                for (ch, blk) in mcu.iter().enumerate() {
+                    prev_dc[ch] = encode_block(&mut bw, blk, prev_dc[ch], &dc_tab, &ac_tab)?;
+                }
+                mcus_since_rst += 1;
+            }
+            bw.flush_to_byte_boundary()?;
+            markers::write_eoi(&mut self.out)?;
+            return Ok(());
+        }
+
+        // ---- Standard-tables path ----
+        let dc_tab = HuffmanTable::from_std(&STD_LUMA_DC);
+        let ac_tab = HuffmanTable::from_std(&STD_LUMA_AC);
+
+        markers::write_soi(&mut self.out)?;
+        markers::write_app0_jfif(&mut self.out)?;
+        if let Some(exif) = self.exif.as_deref() {
+            markers::write_app1_exif(&mut self.out, exif)?;
+        }
+        if let Some(icc) = self.icc_profile.as_deref() {
+            markers::write_app2_icc(&mut self.out, icc)?;
+        }
+        markers::write_dqt(&mut self.out, 0, &luma_q)?;
+        markers::write_sof0(
+            &mut self.out,
+            width as u16,
+            height as u16,
+            &[(1, 1, 1, 0), (2, 1, 1, 0), (3, 1, 1, 0), (4, 1, 1, 0)],
+        )?;
+        markers::write_dht(&mut self.out, 0, 0, &STD_LUMA_DC)?;
+        markers::write_dht(&mut self.out, 1, 0, &STD_LUMA_AC)?;
+        if self.restart_interval > 0 {
+            markers::write_dri(&mut self.out, self.restart_interval)?;
+        }
+        markers::write_sos(&mut self.out, &[(1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)])?;
+
+        let mut bw = BitWriter::new(&mut self.out);
+        bw.reserve((width as usize) * (height as usize) * 4);
+        let restart = self.restart_interval as u32;
+        let mut prev_dc = [0i16; 4];
+        let mut mcus_since_rst: u32 = 0;
+        let mut next_rst: u8 = 0;
+        let mut mcu_idx: usize = 0;
+        for my in 0..mcus_y {
+            for mx in 0..mcus_x {
+                if restart > 0 && mcus_since_rst == restart && mcu_idx < total_mcus {
+                    bw.write_restart(next_rst)?;
+                    next_rst = (next_rst + 1) & 7;
+                    mcus_since_rst = 0;
+                    prev_dc = [0; 4];
+                }
+                for (ch, dc) in prev_dc.iter_mut().enumerate() {
+                    let mut blk = [0i16; 64];
+                    color::extract_block_cmyk(pixels, width, height, mx * 8, my * 8, ch, &mut blk);
+                    *dc = encode_one_block(&mut bw, &mut blk, &div_luma, *dc, &dc_tab, &ac_tab)?;
+                }
                 mcus_since_rst += 1;
                 mcu_idx += 1;
             }

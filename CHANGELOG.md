@@ -15,6 +15,30 @@ Filling in the non-perf coverage gaps from the 0.8.0 encoder cycle.
 
 ### Added
 
+- **CMYK (4-component) encode + decode** — new
+  `JpegEncoder::encode_cmyk` convenience entry point (and new
+  `PixelFormat::Cmyk` accepted by the generic `encode` AND by the
+  decoder) takes a 4-byte-per-pixel (C, M, Y, K) buffer and emits a
+  plain (non-Adobe-YCCK) 4-component baseline JPEG with sampling
+  1:1:1:1, one DQT (luma) shared across all four components, and
+  one luma-DC + one luma-AC Huffman table shared across the scan.
+  Pass-through — no CMYK↔RGB conversion is performed; that
+  transform is downstream responsibility. No APP14 marker is
+  emitted. The decoder accepts `PixelFormat::Cmyk` against a
+  4-component source JPEG and reads the four planes back into
+  interleaved C/M/Y/K bytes; decoding a CMYK source into any other
+  `PixelFormat` returns `Unsupported`. APP14 Adobe markers on
+  decode are consumed and intentionally ignored — YCCK is not
+  applied. Composes with `set_optimize_huffman` (single shared
+  optimal DC + AC table built from all four components' frequencies),
+  `set_restart_interval`, `set_exif` / `set_icc_profile` (ICC is
+  especially useful for print pipelines), and `set_quant_tables`
+  (luma table only; chroma argument silently ignored).
+  `set_subsampling` and `set_threads` are silently no-ops on the
+  CMYK path. `set_progressive(true) + encode_cmyk` returns
+  `Unsupported`. Default behaviour for the existing 8 color pixel
+  formats and grayscale is byte-identical to the prior 0.9.0 HEAD.
+
 - **Grayscale encode** — new `JpegEncoder::encode_grayscale` convenience
   entry point (and new `PixelFormat::Gray` accepted by the generic
   `encode`) takes a single-byte-per-pixel buffer and emits a
