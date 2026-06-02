@@ -49,9 +49,13 @@ four NEON items plus a new AVX2 3-byte RGB→YCbCr kernel — pushes
 both well past 4×, the Intel figure further because `image`'s
 scalar encoder is slower on that CPU). It supports
 4:4:4 / 4:2:2 / 4:2:0, **progressive (SOF2) output**
-alongside baseline, **EXIF / ICC pass-through** for re-encode
-pipelines, multi-threaded MCU-row encode, optimized (two-pass)
-Huffman tables, restart markers, and custom quantization tables.
+alongside baseline, **single-byte grayscale and 4-byte CMYK
+pass-through** alongside the eight RGB-family pixel formats,
+**EXIF / ICC pass-through** for re-encode pipelines,
+multi-threaded MCU-row encode, optimized (two-pass) Huffman tables
+(composes with progressive — `EOBn` run-packing + per-scan custom
+tables make optimized-progressive output smaller than the baseline
+SOF0 equivalent), restart markers, and custom quantization tables.
 **Encode speed is the headline.**
 
 The decoder is bundled for API symmetry — read your own JPEGs back
@@ -64,12 +68,14 @@ synthetic Huffman-heavy content, ~1.18–1.22× on natural-content),
 while matching coverage — baseline + progressive Huffman with
 fancy chroma upsample, output in any of ten pixel layouts (the
 eight RGB-flavoured layouts plus single-byte `Gray` and 4-byte
-`Cmyk` pass-through, both added in 0.9.0). The
+`Cmyk` pass-through, both added in 0.9.0), and the same EXIF / ICC
+**retrieval** API as the encoder's pass-through — the 0.9.0 cycle
+closed the decode → operate → re-encode loop both ways. The
 smaller-resolution fixed-cost overhead means we trail by only
 ~2–3% at 1592×1124 on Cascade Lake (at parity or ahead from 1080p
-up). The decoder side wasn't reopened in 0.8.0 (that cycle was
-encoder-focused — see Status below) and the small Cascade Lake
-gap remains an open item.
+up). The decoder side wasn't reopened in 0.8.0 (the encoder cycle)
+and the small Cascade Lake gap remains an open item; 0.9.0 added
+coverage, not new decode SIMD.
 
 ## Performance
 
@@ -461,11 +467,19 @@ progressive Huffman JPEGs that conform to ITU-T T.81 (verified against
 `image`'s decoder on a vendored fixture corpus). Public API has
 settled but `0.x` reserves the right to evolve before `1.0`.
 
-The current release, **0.8.0**, closes the encoder cycle: a hot-path
-SIMD pass (~4.5× / ~5.5× vs `image` at 4:2:0 on Apple Silicon /
-Cascade Lake) plus progressive (SOF2) output and EXIF / ICC
-pass-through. The 0.6.0 / 0.7.x cycles before it built out the decoder
-SIMD path. Full per-release history is in [CHANGELOG.md](CHANGELOG.md).
+The current release, **0.9.0**, is the coverage cycle on top of 0.8.0's
+encoder hot-path pass: optimized-Huffman composes with progressive
+(EOBn run-packing + per-scan custom tables collapse the size cost the
+standard-tables SOF2 path normally carries vs baseline SOF0), grayscale
+encode and CMYK encode + decode land as first-class pixel formats
+(`PixelFormat::Gray` / `PixelFormat::Cmyk`), and decode-side
+`Decoder::exif()` / `icc_profile()` accessors close the
+decode → operate → re-encode loop with the 0.8.0 encoder-side
+`set_exif` / `set_icc_profile`. No perf regression — the 4.5× / 5.5× vs
+`image` at 4:2:0 from 0.8.0 carries forward unchanged for the existing
+RGB-family layouts; default behaviour is byte-identical to 0.8.0. The
+0.6.0 / 0.7.x cycles before that built out the decoder SIMD path. Full
+per-release history is in [CHANGELOG.md](CHANGELOG.md).
 
 Still under consideration for a later release: **trellis quantization**
 (mozjpeg-style RDO per-block search). Vector-SIMD Huffman decode stays

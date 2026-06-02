@@ -1,10 +1,10 @@
 [package]
 name = "jpeg-rusturbo"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"   # edition 2024 stabilized in Rust 1.85.
 license = "MIT OR Apache-2.0"
-description = "SIMD-accelerated JPEG encoder (baseline + progressive, EXIF / ICC pass-through) and Huffman decoder."
+description = "SIMD-accelerated JPEG encoder (baseline + progressive SOF2, RGB / grayscale / CMYK, EXIF / ICC pass-through) and Huffman decoder with EXIF / ICC retrieval."
 repository = "https://github.com/naoto256/jpeg-rusturbo"
 readme = "README.md"
 keywords = ["jpeg", "encoder", "decoder", "simd", "neon"]

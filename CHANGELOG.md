@@ -9,9 +9,12 @@ do not).
 Performance figures are summarized per release; the reproducible
 breakdown lives in [BENCH.md](BENCH.md).
 
-## [Unreleased — 0.9.0]
+## [0.9.0] — 2026-06-02
 
-Filling in the non-perf coverage gaps from the 0.8.0 encoder cycle.
+The coverage cycle — filling in the non-perf gaps left by the 0.8.0
+encoder cycle. Four feat additions, no kernel changes; default
+behaviour for the existing 8 RGB-family pixel formats is byte-identical
+to 0.8.0.
 
 ### Added
 
@@ -302,6 +305,7 @@ scalar reference.
   project docs (README, CONTRIBUTING, `docs/ARCHITECTURE.md`, NOTICE).
 - Rust 2024 edition with unsafe-block enforcement.
 
+[0.9.0]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.9.0
 [0.8.0]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.8.0
 [0.7.5]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.7.5
 [0.7.0]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.7.0
