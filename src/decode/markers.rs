@@ -10,6 +10,9 @@
 
 use super::error::{DecodeError, Result};
 
+use std::collections::BTreeMap;
+use std::ops::Range;
+
 // ---- Marker code constants (ITU-T T.81 B.1.1) ----
 
 pub const M_SOI: u8 = 0xD8;
@@ -127,6 +130,32 @@ pub struct DecoderHeaders {
     pub quant: Vec<QuantTable>,
     pub huffman: Vec<HuffmanTableSpec>,
     pub restart_interval: u16,
+    pub metadata: DecoderMetadata,
+}
+
+/// Pass-through metadata collected from APP1 / APP2 segments during
+/// the marker walk. Bytes are stored as ranges into the original JPEG
+/// source buffer so EXIF retrieval is zero-copy; ICC needs reassembly
+/// of one or more chunks at access time.
+///
+/// Per the EXIF spec there is at most one APP1 `Exif\0\0` segment per
+/// file; if multiple are present the first one wins. Other APP1 flavours
+/// (XMP "http://ns.adobe.com/xap/1.0/\0" etc.) are intentionally ignored
+/// here — the bytes are still consumed without error, but `exif` stays
+/// `None`. Surfacing XMP would need a separate accessor.
+#[derive(Clone, Debug, Default)]
+pub struct DecoderMetadata {
+    /// Range into the source buffer pointing at the EXIF payload AFTER
+    /// the 6-byte `Exif\0\0` identifier.
+    pub exif: Option<Range<usize>>,
+    /// `seq_num` (1-based) → range into the source buffer pointing at
+    /// the per-segment chunk AFTER the 14-byte `ICC_PROFILE\0` +
+    /// `seq` + `total` header. Duplicate `seq_num` values: first wins.
+    pub icc_chunks: BTreeMap<u8, Range<usize>>,
+    /// Value of the `total_segments` byte from the first ICC segment
+    /// seen. Subsequent segments with a different `total` are ignored
+    /// (treated as malformed mid-stream metadata).
+    pub icc_total: Option<u8>,
 }
 
 /// Cursor over the JPEG byte stream.
@@ -230,6 +259,7 @@ impl<'a> MarkerReader<'a> {
         let mut quant: Vec<QuantTable> = Vec::new();
         let mut huffman: Vec<HuffmanTableSpec> = Vec::new();
         let mut restart_interval: u16 = 0;
+        let mut metadata = DecoderMetadata::default();
 
         loop {
             let marker = self.read_marker()?;
@@ -256,13 +286,20 @@ impl<'a> MarkerReader<'a> {
                             quant,
                             huffman,
                             restart_interval,
+                            metadata,
                         },
                         scan,
                     ));
                 }
                 M_EOI => return Err(DecodeError::Malformed("EOI before SOS")),
-                M_COM | 0xE0..=0xEF => {
-                    // Comment / APPn — skip the payload.
+                0xE1 => self.parse_app1(&mut metadata)?,
+                0xE2 => self.parse_app2(&mut metadata)?,
+                M_COM | 0xE0 | 0xE3..=0xEF => {
+                    // Comment / APP0 (JFIF, handled elsewhere) / other
+                    // APPn (Adobe XMP / Photoshop IRB / etc.) — skip
+                    // the payload. APP1 EXIF and APP2 ICC are retained
+                    // above; other APP1 / APP2 flavours fall through
+                    // their own handlers as a no-op skip.
                     let len = self.read_u16()?;
                     if len < 2 {
                         return Err(DecodeError::Malformed("bad segment length"));
@@ -339,6 +376,70 @@ impl<'a> MarkerReader<'a> {
                 }
             }
         }
+    }
+
+    /// APP1 segment dispatcher. Retains the payload as EXIF if the
+    /// 6-byte `Exif\0\0` identifier prefix is present; otherwise (XMP,
+    /// other Adobe namespaces) consumes the bytes without recording.
+    /// At most one EXIF segment is retained — first-wins per the spec.
+    fn parse_app1(&mut self, metadata: &mut DecoderMetadata) -> Result<()> {
+        const ID: &[u8] = b"Exif\0\0";
+        let len = self.read_u16()? as usize;
+        if len < 2 {
+            return Err(DecodeError::Malformed("bad APP1 length"));
+        }
+        let payload_len = len - 2;
+        let payload_start = self.pos;
+        let payload = self.read_slice(payload_len)?;
+        if metadata.exif.is_none() && payload.len() >= ID.len() && payload.starts_with(ID) {
+            metadata.exif = Some(payload_start + ID.len()..payload_start + payload.len());
+        }
+        Ok(())
+    }
+
+    /// APP2 segment dispatcher. Retains the chunk as part of an ICC
+    /// profile if the 12-byte `ICC_PROFILE\0` identifier + (seq, total)
+    /// header is present; otherwise consumes the bytes without
+    /// recording. Multi-segment ICC profiles arrive in one APP2 per
+    /// segment; assembly is deferred to access time in `Decoder`.
+    fn parse_app2(&mut self, metadata: &mut DecoderMetadata) -> Result<()> {
+        const ID: &[u8] = b"ICC_PROFILE\0";
+        // ID (12) + seq (1) + total (1) = 14
+        const HEADER_LEN: usize = 14;
+        let len = self.read_u16()? as usize;
+        if len < 2 {
+            return Err(DecodeError::Malformed("bad APP2 length"));
+        }
+        let payload_len = len - 2;
+        let payload_start = self.pos;
+        let payload = self.read_slice(payload_len)?;
+        if payload.len() < HEADER_LEN || !payload.starts_with(ID) {
+            return Ok(());
+        }
+        let seq = payload[12];
+        let total = payload[13];
+        // Record the per-segment chunk range AFTER the 14-byte header.
+        let chunk_start = payload_start + HEADER_LEN;
+        let chunk_end = payload_start + payload.len();
+        match metadata.icc_total {
+            None => metadata.icc_total = Some(total),
+            Some(prev) if prev != total => {
+                // Inconsistent `total` across segments: mid-stream
+                // disagreement is malformed. Leave the data captured so
+                // far in place; `icc_profile()` will detect the gap /
+                // mismatch at access time and return `None`. Skip
+                // recording this segment so a single bad sender can't
+                // overwrite a valid chunk.
+                return Ok(());
+            }
+            _ => {}
+        }
+        // First-wins on duplicate seq.
+        metadata
+            .icc_chunks
+            .entry(seq)
+            .or_insert(chunk_start..chunk_end);
+        Ok(())
     }
 
     fn parse_sof(&mut self, progressive: bool) -> Result<FrameHeader> {

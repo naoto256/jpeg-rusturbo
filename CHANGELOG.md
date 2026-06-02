@@ -15,6 +15,23 @@ Filling in the non-perf coverage gaps from the 0.8.0 encoder cycle.
 
 ### Added
 
+- **Decode-side EXIF / ICC metadata retrieval** — two new accessors on
+  `decode::Decoder`: `exif() -> Option<&[u8]>` returns the raw EXIF
+  payload (with the 6-byte `Exif\0\0` identifier stripped) borrowed
+  zero-copy from the source buffer, and `icc_profile() -> Option<&[u8]>`
+  returns the reassembled ICC profile bytes (per-segment APP2 chunks
+  concatenated in `seq_num` order with the 14-byte `ICC_PROFILE\0` +
+  seq + total header stripped). Closes the decode → operate →
+  re-encode loop with the 0.8.0 encoder-side `JpegEncoder::set_exif` /
+  `set_icc_profile`. Multi-segment ICC reassembly is lazy and cached on
+  first access. Malformed metadata (missing seq, mismatched `total`,
+  seq = 0, seq > total) returns `None` from the accessor; pixel decode
+  is unaffected. Other APP1 flavours (Adobe XMP etc.) and APP3..APP15 /
+  COM segments are intentionally out of scope — they are still
+  consumed without error, but produce no accessor output. Default
+  behaviour for callers that don't invoke the new accessors is
+  byte-identical to release/0.9.0 HEAD.
+
 - **CMYK (4-component) encode + decode** — new
   `JpegEncoder::encode_cmyk` convenience entry point (and new
   `PixelFormat::Cmyk` accepted by the generic `encode` AND by the
