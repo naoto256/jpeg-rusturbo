@@ -155,12 +155,20 @@ columns are the time and size multipliers over baseline.
 
 The ~2.5× time is spec-bound (one buffer pass + eight scan passes over
 the stored coefficients). The +43–48% size is on us, not the spec: the
-encoder emits `EOB0` per block rather than the multi-block `EOBn` runs
-the format permits, because the Annex K reference Huffman tables this
-crate ships carry no `EOBn` codes for `n ≥ 1`. A future
-`encode_progressive_optimize` (optimized-Huffman for SOF2) could derive
-tables with the `EOBn` symbols and recover the size. Size factor is
-content-shaped and host-independent.
+standard-tables encoder emits `EOB0` per block rather than the
+multi-block `EOBn` runs the format permits, because the Annex K
+reference Huffman tables carry no `EOBn` codes for `n ≥ 1`.
+
+As of 0.9.0, `set_optimize_huffman(true)` composes with
+`set_progressive(true)` to close this: a two-pass encode counts symbol
+frequencies per scan, builds per-scan custom Huffman tables that
+include `EOBn` codes, emits one DHT per scan, and packs multi-block
+end-of-band runs. The optimized-progressive output ends up **smaller**
+than the corresponding baseline SOF0 — natural-like 4:2:0 q=80 at 4K
+drops from 364 KB (standard-tables progressive, +48% vs baseline) to
+~148 KB (**−40% vs the 246 KB baseline**); 1080p and 1592×1124 land at
+−37%. Default (without `set_optimize_huffman`) is unchanged from the
+table above. Size factor is content-shaped and host-independent.
 
 ---
 
