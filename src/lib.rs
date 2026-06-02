@@ -82,6 +82,24 @@
 //! the encoder's output is bit-identical to a build that doesn't
 //! know about them.
 //!
+//! 0.9.0 closes the non-perf coverage gaps with four additions:
+//! [`JpegEncoder::encode_grayscale`] / [`PixelFormat::Gray`] for
+//! 1-byte-per-pixel luma-only input and decode-side Y-plane
+//! extraction; [`JpegEncoder::encode_cmyk`] / [`PixelFormat::Cmyk`]
+//! for 4-byte CMYK pass-through (no CMYK↔RGB conversion in either
+//! direction); [`decode::Decoder::exif`] and
+//! [`decode::Decoder::icc_profile`] symmetric with the 0.8.0
+//! encoder-side pass-through (multi-segment ICC reassembled lazily,
+//! EXIF returned zero-copy with the `Exif\0\0` identifier stripped);
+//! and [`JpegEncoder::set_optimize_huffman`] composing with
+//! [`JpegEncoder::set_progressive`] (counts symbol frequencies
+//! per scan, builds per-scan custom Huffman tables that include
+//! `EOBn` symbols, packs multi-block end-of-band runs — the
+//! resulting progressive output is **smaller** than the baseline
+//! SOF0 equivalent rather than ~+45% larger). No kernel changes,
+//! no perf regression for the 8 RGB-family layouts; default
+//! behaviour is byte-identical to 0.8.0.
+//!
 //! The decoder is bundled for API symmetry — read your own JPEGs
 //! back without reaching for another crate — rather than as a speed
 //! play. It gained per-stage SIMD kernels in 0.6.0 (IDCT, YCC → RGB
@@ -91,7 +109,8 @@
 //! microarchitectures and both corpora (~1.03–1.10× on synthetic
 //! Huffman-heavy content, ~1.18–1.22× on natural-content), while
 //! matching coverage — baseline + progressive Huffman, fancy chroma
-//! upsample, all eight pixel layouts. 0.8.0 doesn't touch the
+//! upsample, all ten pixel layouts (the eight RGB-family layouts
+//! plus `Gray` and `Cmyk` added in 0.9.0). 0.8.0 doesn't touch the
 //! decoder; the above carries over. The IDCT carries DC-only and
 //! sparse-row fast paths that fire on smooth regions in natural
 //! photographs (+11–19% of total decode time on natural content,
