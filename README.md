@@ -405,6 +405,19 @@ this crate does not perform CMYK→RGB conversion.
   downstream if needed). Adobe-flavoured YCCK (APP14-signalled) is
   intentionally treated as plain CMYK regardless of the APP14
   transform byte.
+- **EXIF / ICC metadata retrieval** — `Decoder::exif()` returns the
+  raw EXIF payload (with the 6-byte `Exif\0\0` identifier stripped)
+  borrowed zero-copy from the source buffer; `Decoder::icc_profile()`
+  returns the reassembled ICC profile bytes — per-segment APP2 chunks
+  concatenated in `seq_num` order with the 14-byte `ICC_PROFILE\0` +
+  seq + total header stripped. Symmetric with the encoder's
+  `JpegEncoder::set_exif` / `set_icc_profile` so a decode → operate →
+  re-encode pipeline can preserve camera EXIF and color profile
+  end-to-end. ICC reassembly is lazy + cached on first access.
+  Malformed metadata (missing seq, mismatched `total`, seq = 0 or
+  > total) returns `None` from the accessor; pixel decode is
+  unaffected. Other APP1 flavours (Adobe XMP etc.) and APP3..APP15 /
+  COM segments are intentionally out of scope.
 - **Cross-decoder validation** — `tests/comparison_progressive.rs`
   asserts per-channel agreement with `image`'s decoder (≤ 3 / channel,
   ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,

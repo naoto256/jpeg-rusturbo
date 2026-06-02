@@ -15,6 +15,8 @@ mod progressive;
 
 pub use error::{DecodeError, Result};
 
+use std::cell::OnceCell;
+
 use crate::PixelFormat;
 use crate::arch;
 use crate::color::{PixelClass, PixelLayout};
@@ -39,6 +41,14 @@ pub struct Decoder<'a> {
     headers: DecoderHeaders,
     first_scan: ScanHeader,
     entropy_start: usize,
+    /// Lazily-assembled ICC profile (concatenated APP2 chunks in seq
+    /// order). Populated on first call to [`Decoder::icc_profile`].
+    /// `Some(Vec)` = valid reassembly, `Some(Vec::new())` is reserved
+    /// for "header said empty"; `None` inside the cell after init
+    /// means the metadata is malformed (gap / mismatch) and the
+    /// accessor returns `None`. The outer `OnceCell` distinguishes
+    /// "not yet computed" from "computed".
+    icc_cache: OnceCell<Option<Vec<u8>>>,
 }
 
 impl<'a> Decoder<'a> {
@@ -54,6 +64,7 @@ impl<'a> Decoder<'a> {
             headers,
             first_scan,
             entropy_start,
+            icc_cache: OnceCell::new(),
         })
     }
 
@@ -64,6 +75,111 @@ impl<'a> Decoder<'a> {
             components: self.headers.frame.components.len() as u8,
             progressive: self.headers.frame.progressive,
         }
+    }
+
+    /// Retained EXIF payload, with the 6-byte `Exif\0\0` identifier
+    /// stripped. Returns `None` if the stream carried no APP1 segment
+    /// with the `Exif\0\0` identifier. Per the EXIF spec a JPEG holds
+    /// at most one such segment; if multiple are present this returns
+    /// the FIRST one. Other APP1 flavours (Adobe XMP etc.) are
+    /// intentionally out of scope for this accessor — `None` here
+    /// does NOT prove the file has no XMP.
+    ///
+    /// The returned slice borrows directly from the source buffer
+    /// passed to [`Decoder::new`], so retrieval is zero-copy. The bytes
+    /// can be passed straight back to the encoder via
+    /// `JpegEncoder::set_exif` to close a decode → operate → re-encode
+    /// loop:
+    ///
+    /// ```no_run
+    /// # use jpeg_rusturbo::{decode::Decoder, JpegEncoder, PixelFormat};
+    /// # fn run(src: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    /// let decoder = Decoder::new(src)?;
+    /// let exif = decoder.exif().map(|b| b.to_vec());
+    /// let info = decoder.info();
+    /// let pixels = decoder.decode(PixelFormat::Rgb)?;
+    /// let mut out = Vec::new();
+    /// let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+    /// enc.set_exif(exif);
+    /// enc.encode_rgb(&pixels, info.width, info.height)?;
+    /// # Ok(()) }
+    /// ```
+    pub fn exif(&self) -> Option<&[u8]> {
+        let range = self.headers.metadata.exif.as_ref()?;
+        Some(&self.src[range.clone()])
+    }
+
+    /// Reassembled ICC color profile, with all per-segment APP2 chunk
+    /// headers (`ICC_PROFILE\0` + seq + total) stripped and the
+    /// chunks concatenated in `seq_num` order (1..=total). Returns
+    /// `None` if the stream carried no APP2 `ICC_PROFILE\0` segment.
+    ///
+    /// Malformed metadata also yields `None`:
+    /// - a `seq_num` of 0 or greater than `total_segs`,
+    /// - a gap in `1..=total_segs` (missing segment),
+    /// - inconsistent `total_segs` across segments.
+    ///
+    /// Duplicate `seq_num` values: the first segment seen wins,
+    /// subsequent duplicates are ignored.
+    ///
+    /// The returned slice borrows from a Vec assembled and cached on
+    /// the first call. Subsequent calls are O(1). The bytes can be
+    /// passed straight back to the encoder via
+    /// `JpegEncoder::set_icc_profile` to close the round-trip loop —
+    /// the encoder re-chunks across one or more APP2 segments per the
+    /// ICC.1 convention.
+    ///
+    /// ```no_run
+    /// # use jpeg_rusturbo::{decode::Decoder, JpegEncoder, PixelFormat};
+    /// # fn run(src: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    /// let decoder = Decoder::new(src)?;
+    /// let icc = decoder.icc_profile().map(|b| b.to_vec());
+    /// let info = decoder.info();
+    /// let pixels = decoder.decode(PixelFormat::Rgb)?;
+    /// let mut out = Vec::new();
+    /// let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+    /// enc.set_icc_profile(icc);
+    /// enc.encode_rgb(&pixels, info.width, info.height)?;
+    /// # Ok(()) }
+    /// ```
+    pub fn icc_profile(&self) -> Option<&[u8]> {
+        self.icc_cache
+            .get_or_init(|| self.assemble_icc())
+            .as_deref()
+    }
+
+    /// Reassemble the per-segment ICC chunks into a contiguous Vec.
+    /// Validates the seq_num / total contract; returns None on any
+    /// malformed-metadata condition documented on `icc_profile`.
+    fn assemble_icc(&self) -> Option<Vec<u8>> {
+        let meta = &self.headers.metadata;
+        let total = meta.icc_total?;
+        if total == 0 {
+            return None;
+        }
+        if meta.icc_chunks.len() != total as usize {
+            // Missing or excess segments (the latter happens if a
+            // sender sent a seq > total — we'd have stored it, since
+            // we don't validate at parse time to keep the marker walk
+            // simple).
+            return None;
+        }
+        let mut out = Vec::new();
+        // BTreeMap iterates in seq_num order — that's the assembly
+        // order the ICC.1 spec mandates.
+        for (i, (seq, range)) in meta.icc_chunks.iter().enumerate() {
+            let expected = (i + 1) as u8;
+            if *seq != expected {
+                // Either seq_num == 0 (sorts before 1) or a gap
+                // (e.g. {1, 3} on total=3) — malformed.
+                return None;
+            }
+            if *seq > total {
+                return None;
+            }
+            out.extend_from_slice(&self.src[range.clone()]);
+        }
+        Some(out)
     }
 
     /// Decode the stream into a tightly-packed pixel buffer at the
