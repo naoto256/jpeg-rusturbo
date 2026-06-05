@@ -295,7 +295,8 @@ impl<W: Write> JpegEncoder<W> {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `width` or `height`
-    /// is zero, if `width * height * 3` overflows `usize`, or if the
+    /// is zero, if either dimension exceeds JPEG's `u16::MAX` SOF
+    /// limit, if `width * height * 3` overflows `usize`, or if the
     /// pixel buffer is shorter than `width * height * 3`. Any I/O
     /// error from the sink is propagated as-is.
     pub fn encode_rgb(&mut self, pixels: &[u8], width: u32, height: u32) -> io::Result<()> {
@@ -325,8 +326,9 @@ impl<W: Write> JpegEncoder<W> {
     /// single-component path as [`encode_grayscale`](Self::encode_grayscale).
     ///
     /// # Errors
-    /// Same shape as [`encode_rgb`](Self::encode_rgb) / [`encode_rgba`](Self::encode_rgba),
-    /// scaled by `format`'s bytes-per-pixel.
+    /// Same shape as [`encode_rgb`](Self::encode_rgb) /
+    /// [`encode_rgba`](Self::encode_rgba), scaled by `format`'s
+    /// bytes-per-pixel.
     pub fn encode(
         &mut self,
         pixels: &[u8],
@@ -462,6 +464,18 @@ impl<W: Write> JpegEncoder<W> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "image dimensions must be non-zero",
+            ));
+        }
+        if width > u16::MAX as u32 || height > u16::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "image dimensions exceed JPEG SOF u16 limit: {}x{} (max {}x{})",
+                    width,
+                    height,
+                    u16::MAX,
+                    u16::MAX
+                ),
             ));
         }
         // `width * height * bpp` must fit in `usize`. On 64-bit hosts
@@ -1976,5 +1990,32 @@ mod tests {
         let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
         let err = enc.encode_rgb(&[], 0, 8).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_dimensions_above_jpeg_sof_limit() {
+        let mut out = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+        let pixels = vec![0u8; (u16::MAX as usize + 1) * 3];
+
+        let err = enc.encode_rgb(&pixels, u16::MAX as u32 + 1, 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = enc.encode_rgb(&pixels, 1, u16::MAX as u32 + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn max_sof_dimensions_still_use_buffer_validation() {
+        let mut out = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+        let err = enc
+            .encode_rgb(&[], u16::MAX as u32, u16::MAX as u32)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("pixel buffer too small"),
+            "unexpected error: {err}"
+        );
     }
 }
