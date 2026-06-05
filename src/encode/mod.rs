@@ -202,8 +202,9 @@ impl<W: Write> JpegEncoder<W> {
     ///
     /// Cost: a 2-byte RSTn marker + DC-predictor reset every `interval`
     /// MCUs. Typical values are 1-256 (per-row or smaller). Setting
-    /// this higher than the total MCU count produces a single RSTn at
-    /// the end of the scan, effectively a no-op.
+    /// this higher than the total MCU count emits no RSTn markers at
+    /// all (the interval is never reached), effectively a no-op aside
+    /// from the DRI segment overhead.
     pub fn set_restart_interval(&mut self, interval: u16) {
         self.restart_interval = interval;
     }
