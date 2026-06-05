@@ -9,6 +9,38 @@ do not).
 Performance figures are summarized per release; the reproducible
 breakdown lives in [BENCH.md](BENCH.md).
 
+## [0.9.1] — 2026-06-06
+
+Patch release closing three encoder input-validation gaps surfaced by
+post-0.9.0 review. No kernel changes; default behavior is byte-identical
+to 0.9.0 for all inputs that 0.9.0 already accepted.
+
+### Fixed
+
+- **Dimensions above JPEG SOF `u16::MAX`** — `encode_*` paths now
+  return `InvalidInput` for `width` or `height` greater than 65535.
+  Previously such inputs passed the buffer-size check and the SOF
+  marker silently truncated the dimension to `u16`, producing an
+  invalid JPEG with an `Ok` return. Affects RGB, optimize-Huffman,
+  progressive, grayscale, and CMYK encode paths through the common
+  `encode_inner` entry point.
+- **Zero entries in custom quantization tables** —
+  `JpegEncoder::set_quant_tables` previously accepted any `[u8; 64]`
+  and the encoder emitted DQT segments containing `0`, which is
+  invalid per T.81 (a zero divisor is rejected by every conforming
+  decoder). The API signature is unchanged; rejection now happens at
+  encode time with `InvalidInput`. Calls that already supply
+  `1..=255` see no behavior change.
+
+### Documentation
+
+- `JpegEncoder::set_restart_interval` doc reworded — the previous text
+  claimed an `interval` larger than the total MCU count produced one
+  RSTn at scan end; the implementation emits none. Behavior is
+  unchanged; only the doc was wrong.
+- README `Custom quantization tables` bullet now documents the
+  `1..=255` requirement and the encode-time `InvalidInput` rejection.
+
 ## [0.9.0] — 2026-06-02
 
 The coverage cycle — filling in the non-perf gaps left by the 0.8.0
