@@ -357,8 +357,10 @@ this crate does not perform CMYK→RGB conversion.
   `n` MCUs (DRI segment + interleaved RSTm), for error resilience or
   parallel decode by downstream readers.
 - **Custom quantization tables** — `set_quant_tables(luma, chroma)`
-  accepts two `[u8; 64]` arrays in natural (row-major) order;
-  bypasses the built-in quality-driven Annex K scaling.
+  accepts two `[u8; 64]` arrays in natural (row-major) order; entries
+  must be in `1..=255` (zero is rejected at encode time with
+  `InvalidInput` — a zero divisor is invalid per T.81). Bypasses the
+  built-in quality-driven Annex K scaling.
 - **Scalar fallback** — on every target, opt-in via the `force-scalar`
   Cargo feature, or used automatically on architectures without a
   SIMD backend.
