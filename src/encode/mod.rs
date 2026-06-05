@@ -98,6 +98,19 @@ pub struct JpegEncoder<W: Write> {
     icc_profile: Option<Vec<u8>>,
 }
 
+fn validate_custom_quant_tables(custom_quant: &Option<QuantPair>) -> io::Result<()> {
+    let Some((luma, chroma)) = custom_quant else {
+        return Ok(());
+    };
+    if luma.contains(&0) || chroma.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom quantization table contains zero (must be in 1..=255)",
+        ));
+    }
+    Ok(())
+}
+
 impl<W: Write> JpegEncoder<W> {
     /// Create an encoder at the given quality, writing to `out`.
     ///
@@ -165,8 +178,8 @@ impl<W: Write> JpegEncoder<W> {
     ///
     /// Each entry must be in `1..=255` (a zero quantizer divides DCT
     /// coefficients by zero and is rejected by every conforming
-    /// decoder). The encoder doesn't validate the range — pass values
-    /// you actually want emitted.
+    /// decoder). The encoder rejects zero entries at encode time with
+    /// [`io::ErrorKind::InvalidInput`].
     ///
     /// Intended for advanced workflows: ML-driven RDO, mozjpeg /
     /// libjpeg-turbo table replication, per-image perceptual tuning.
@@ -505,6 +518,7 @@ impl<W: Write> JpegEncoder<W> {
                 ),
             ));
         }
+        validate_custom_quant_tables(&self.custom_quant)?;
 
         // Dispatch on the layout category. Non-RGB categories use
         // dedicated single-or-non-RGB-component pipelines that skip the
@@ -2017,5 +2031,35 @@ mod tests {
             err.to_string().contains("pixel buffer too small"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_zero_custom_quant_entries() {
+        let pixels = vec![0u8; 8 * 8 * 3];
+
+        let mut out = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+        let mut luma = [1u8; 64];
+        luma[5] = 0;
+        enc.set_quant_tables(luma, [1u8; 64]);
+        let err = enc.encode_rgb(&pixels, 8, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut out = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+        let mut chroma = [1u8; 64];
+        chroma[20] = 0;
+        enc.set_quant_tables([1u8; 64], chroma);
+        let err = enc.encode_rgb(&pixels, 8, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn accepts_nonzero_custom_quant_entries() {
+        let pixels = vec![0u8; 8 * 8 * 3];
+        let mut out = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+        enc.set_quant_tables([1u8; 64], [1u8; 64]);
+        enc.encode_rgb(&pixels, 8, 8).unwrap();
     }
 }
