@@ -2,7 +2,7 @@
 //!
 //! Each backend submodule (`scalar`, `neon`, `x86_64`) re-exports the
 //! same set of inner modules — `color`, `dct`, `quant`, `huffman`,
-//! `sample` — with bit-exact-equivalent function signatures. The
+//! `sample`, `encode` — with bit-exact-equivalent function signatures. The
 //! `sample` module hosts the chroma-upsample / -downsample kernels
 //! (`h2v2_fancy_vblend`, `h2_fancy_upsample`, etc.); it joined the
 //! backend lineup with the decode-side SIMD work in 0.6.0. The crate
@@ -23,8 +23,8 @@
 //!
 //! ## Adding a new backend
 //!
-//! 1. Create `arch/<name>.rs` with five inline modules (`color`,
-//!    `dct`, `quant`, `huffman`, `sample`), each exposing the kernel
+//! 1. Create `arch/<name>.rs` with inline modules (`color`,
+//!    `dct`, `quant`, `huffman`, `sample`, `encode`), each exposing the kernel
 //!    functions named in `arch::scalar` (use
 //!    `pub use crate::arch::scalar::<kernel>::*;` for any kernel you
 //!    don't override).
