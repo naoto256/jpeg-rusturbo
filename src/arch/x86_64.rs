@@ -43,10 +43,6 @@
 
 #![allow(dead_code)]
 
-pub mod encode {
-    pub use crate::arch::scalar::encode::*;
-}
-
 // ===========================================================================
 // huffman: SSE2 nonzero bitmap for AC scan
 // ===========================================================================
@@ -99,6 +95,178 @@ pub mod huffman {
     /// when profiling shows otherwise.
     pub fn ac_magnitudes(block: &[i16; 64], sizes: &mut [u8; 64], bits_lut: &mut [u16; 64]) {
         crate::arch::scalar::huffman::ac_magnitudes(block, sizes, bits_lut)
+    }
+}
+
+// ===========================================================================
+// encode: x86_64 full-MCU encoder front-half hooks.
+// ===========================================================================
+pub mod encode {
+    use crate::color::RGB;
+    use crate::tables::Divisors;
+
+    /// Full-MCU RGB 4:2:0 front-half hook for x86_64.
+    ///
+    /// This keeps the higher-level encode pipeline shape identical to
+    /// the scalar reference, but avoids materializing the 16x16 luma
+    /// plane before splitting it into four 8x8 blocks. The hot kernels
+    /// below (`rgb_row_to_ycc`, `h2v2_downsample`, `fdct_islow`,
+    /// `quantize_natural`) still dispatch to AVX2 when available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_420_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                return quantize_mcu_420_rgb_full_avx2(
+                    pixels, width, x0, y0, div_luma, div_chroma, out,
+                );
+            }
+        }
+        quantize_mcu_420_rgb_full_scalar_kernels(pixels, width, x0, y0, div_luma, div_chroma, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_mcu_420_rgb_full_avx2(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            quantize_mcu_420_rgb_full_inner::<true>(
+                pixels, width, x0, y0, div_luma, div_chroma, out,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_mcu_420_rgb_full_scalar_kernels(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            quantize_mcu_420_rgb_full_inner::<false>(
+                pixels, width, x0, y0, div_luma, div_chroma, out,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quantize_mcu_420_rgb_full_inner<const AVX2: bool>(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(x0 + 16 <= width);
+        debug_assert!(out.len() >= 6);
+
+        let stride = width as usize * RGB.bpp;
+        let mut y_row = [0u8; 16];
+        let mut cb_full = [0u8; 16 * 16];
+        let mut cr_full = [0u8; 16 * 16];
+
+        for j in 0..16usize {
+            let row_off = (y0 as usize + j) * stride;
+            let start = row_off + x0 as usize * RGB.bpp;
+            let src = &pixels[start..start + 16 * RGB.bpp];
+            let off = j * 16;
+            if AVX2 {
+                unsafe {
+                    super::color::rgb24_16_avx2(
+                        src.as_ptr(),
+                        RGB,
+                        y_row.as_mut_ptr(),
+                        cb_full[off..].as_mut_ptr(),
+                        cr_full[off..].as_mut_ptr(),
+                    );
+                }
+            } else {
+                super::color::rgb_row_to_ycc(
+                    src,
+                    RGB,
+                    16,
+                    &mut y_row,
+                    &mut cb_full[off..off + 16],
+                    &mut cr_full[off..off + 16],
+                );
+            }
+
+            let block_row = j & 7;
+            let top = j < 8;
+            let dst_left = if top { &mut out[0] } else { &mut out[2] };
+            let dst_off = block_row * 8;
+            for i in 0..8 {
+                dst_left[dst_off + i] = y_row[i] as i16 - 128;
+            }
+
+            let dst_right = if top { &mut out[1] } else { &mut out[3] };
+            for i in 0..8 {
+                dst_right[dst_off + i] = y_row[8 + i] as i16 - 128;
+            }
+        }
+
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        super::color::h2v2_downsample(&cb_full, &mut cb_blk);
+        super::color::h2v2_downsample(&cr_full, &mut cr_blk);
+
+        for block in &mut out[..4] {
+            fdct_quantize_zigzag::<AVX2>(block, div_luma);
+        }
+        fdct_quantize_zigzag_into::<AVX2>(&mut cb_blk, div_chroma, &mut out[4]);
+        fdct_quantize_zigzag_into::<AVX2>(&mut cr_blk, div_chroma, &mut out[5]);
+    }
+
+    fn fdct_quantize_zigzag<const AVX2: bool>(block: &mut [i16; 64], div: &Divisors) {
+        let mut natural = [0i16; 64];
+        if AVX2 {
+            unsafe {
+                super::dct::fdct_avx2(block);
+                super::quant::quantize_avx2(block, div, &mut natural);
+            }
+        } else {
+            super::dct::fdct_islow(block);
+            super::quant::quantize_natural(block, div, &mut natural);
+        }
+        super::quant::zigzag_scatter(&natural, block);
+    }
+
+    fn fdct_quantize_zigzag_into<const AVX2: bool>(
+        block: &mut [i16; 64],
+        div: &Divisors,
+        out: &mut [i16; 64],
+    ) {
+        let mut natural = [0i16; 64];
+        if AVX2 {
+            unsafe {
+                super::dct::fdct_avx2(block);
+                super::quant::quantize_avx2(block, div, &mut natural);
+            }
+        } else {
+            super::dct::fdct_islow(block);
+            super::quant::quantize_natural(block, div, &mut natural);
+        }
+        super::quant::zigzag_scatter(&natural, out);
     }
 }
 
@@ -526,7 +694,7 @@ pub mod color {
     /// - `y`, `cb`, `cr` must each be writable for at least 16 bytes.
     /// - `layout.bpp` must be 3.
     #[target_feature(enable = "avx2")]
-    unsafe fn rgb24_16_avx2(
+    pub(super) unsafe fn rgb24_16_avx2(
         pixels: *const u8,
         layout: PixelLayout,
         y: *mut u8,
@@ -977,7 +1145,7 @@ pub mod quant {
     /// AVX2 must be available (the runtime gate in `quantize_natural`
     /// checks). All inputs are fixed-size references.
     #[target_feature(enable = "avx2")]
-    unsafe fn quantize_avx2(block: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) {
+    pub(super) unsafe fn quantize_avx2(block: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) {
         unsafe {
             let block_p = block.as_ptr() as *const __m256i;
             let recip_p = div.recip.as_ptr() as *const __m256i;
@@ -1474,7 +1642,7 @@ pub mod dct {
     /// AVX2 must be available (the runtime gate in `fdct_islow`
     /// checks). `data` is a fixed-size mut reference.
     #[target_feature(enable = "avx2")]
-    unsafe fn fdct_avx2(data: &mut [i16; 64]) {
+    pub(super) unsafe fn fdct_avx2(data: &mut [i16; 64]) {
         unsafe {
             let p = data.as_mut_ptr() as *mut __m256i;
             // Load 4 ymm: each carries 2 rows of 8 i16.
