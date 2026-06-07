@@ -173,6 +173,58 @@ pub mod color {
 }
 
 // ===========================================================================
+// encode: coarse encoder-side fused-stage hooks
+// ===========================================================================
+pub mod encode {
+    use crate::encode::quant;
+    use crate::tables::Divisors;
+
+    /// Full-MCU RGB 4:2:0 front-half hook.
+    ///
+    /// This scalar reference preserves the current staged behavior:
+    /// RGB→YCbCr extraction/downsample, FDCT, quantize, zig-zag. SIMD
+    /// backends can override this module with a truly fused kernel
+    /// without changing the higher-level threaded/serial scan logic.
+    ///
+    /// Preconditions are intentionally narrow: caller must pass an RGB
+    /// input whose 16x16 MCU beginning at `(x0, y0)` is fully inside the
+    /// image. Edge MCUs stay on the generic extraction fallback.
+    pub fn quantize_mcu_420_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(out.len() >= 6);
+
+        let mut y_blocks = [[0i16; 64]; 4];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        crate::color::extract_mcu_420_rgb_full(
+            pixels,
+            width,
+            x0,
+            y0,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+
+        for (i, blk) in y_blocks.iter_mut().enumerate() {
+            crate::arch::backend::dct::fdct_islow(blk);
+            out[i] = quant::quantize_and_zigzag(blk, div_luma);
+        }
+        crate::arch::backend::dct::fdct_islow(&mut cb_blk);
+        out[4] = quant::quantize_and_zigzag(&cb_blk, div_chroma);
+        crate::arch::backend::dct::fdct_islow(&mut cr_blk);
+        out[5] = quant::quantize_and_zigzag(&cr_blk, div_chroma);
+    }
+}
+
+// ===========================================================================
 // dct: integer LL&M ("islow") FDCT, 12 multiplies per pass, 13-bit consts
 // ===========================================================================
 pub mod dct {
