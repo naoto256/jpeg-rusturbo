@@ -25,7 +25,105 @@
 #![allow(dead_code)]
 
 pub mod encode {
-    pub use crate::arch::scalar::encode::*;
+    use crate::color::RGB;
+    use crate::tables::Divisors;
+
+    /// Full-MCU RGB 4:2:0 front-half hook for aarch64.
+    ///
+    /// Mirrors the x86_64 hook shape and keeps SIMD details behind the
+    /// backend boundary. AArch64 guarantees NEON, so this can call the
+    /// NEON color / FDCT / quantize kernels directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_420_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            quantize_mcu_420_rgb_full_neon(pixels, width, x0, y0, div_luma, div_chroma, out);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quantize_mcu_420_rgb_full_neon(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(x0 + 16 <= width);
+        debug_assert!(out.len() >= 6);
+
+        let stride = width as usize * RGB.bpp;
+        let mut y_row = [0u8; 16];
+        let mut cb_full = [0u8; 16 * 16];
+        let mut cr_full = [0u8; 16 * 16];
+
+        for j in 0..16usize {
+            let row_off = (y0 as usize + j) * stride;
+            let start = row_off + x0 as usize * RGB.bpp;
+            let src = &pixels[start..start + 16 * RGB.bpp];
+            let off = j * 16;
+            unsafe {
+                super::color::rgb_row_16_inner(
+                    src.as_ptr(),
+                    RGB,
+                    y_row.as_mut_ptr(),
+                    cb_full[off..].as_mut_ptr(),
+                    cr_full[off..].as_mut_ptr(),
+                );
+            }
+
+            let block_row = j & 7;
+            let top = j < 8;
+            let dst_left = if top { &mut out[0] } else { &mut out[2] };
+            let dst_off = block_row * 8;
+            for i in 0..8 {
+                dst_left[dst_off + i] = y_row[i] as i16 - 128;
+            }
+
+            let dst_right = if top { &mut out[1] } else { &mut out[3] };
+            for i in 0..8 {
+                dst_right[dst_off + i] = y_row[8 + i] as i16 - 128;
+            }
+        }
+
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        super::color::h2v2_downsample(&cb_full, &mut cb_blk);
+        super::color::h2v2_downsample(&cr_full, &mut cr_blk);
+
+        for block in &mut out[..4] {
+            fdct_quantize_zigzag(block, div_luma);
+        }
+        fdct_quantize_zigzag_into(&mut cb_blk, div_chroma, &mut out[4]);
+        fdct_quantize_zigzag_into(&mut cr_blk, div_chroma, &mut out[5]);
+    }
+
+    fn fdct_quantize_zigzag(block: &mut [i16; 64], div: &Divisors) {
+        let mut natural = [0i16; 64];
+        unsafe {
+            super::dct::fdct_islow_inner(block);
+            super::quant::quantize_inner(block, div, &mut natural);
+        }
+        super::quant::zigzag_scatter(&natural, block);
+    }
+
+    fn fdct_quantize_zigzag_into(block: &mut [i16; 64], div: &Divisors, out: &mut [i16; 64]) {
+        let mut natural = [0i16; 64];
+        unsafe {
+            super::dct::fdct_islow_inner(block);
+            super::quant::quantize_inner(block, div, &mut natural);
+        }
+        super::quant::zigzag_scatter(&natural, out);
+    }
 }
 
 // ===========================================================================
@@ -135,7 +233,7 @@ pub mod color {
     /// - `layout.bpp` must be 3 or 4.
     /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
-    unsafe fn rgb_row_16_inner(
+    pub(super) unsafe fn rgb_row_16_inner(
         inptr: *const u8,
         layout: PixelLayout,
         outy: *mut u8,
@@ -1047,7 +1145,7 @@ pub mod dct {
     /// fixed-size mut reference; no caller-side invariants beyond
     /// the standard reference rules.
     #[target_feature(enable = "neon")]
-    unsafe fn fdct_islow_inner(data: &mut [i16; 64]) {
+    pub(super) unsafe fn fdct_islow_inner(data: &mut [i16; 64]) {
         unsafe {
             let consts1 = vld1_s16(CONSTS.as_ptr());
             let consts2 = vld1_s16(CONSTS.as_ptr().add(4));
@@ -1478,7 +1576,11 @@ pub mod quant {
     /// fixed-size references; no caller-side invariants beyond the
     /// standard reference rules.
     #[target_feature(enable = "neon")]
-    unsafe fn quantize_inner(workspace: &[i16; 64], div: &Divisors, out: &mut [i16; 64]) {
+    pub(super) unsafe fn quantize_inner(
+        workspace: &[i16; 64],
+        div: &Divisors,
+        out: &mut [i16; 64],
+    ) {
         unsafe {
             let ws = workspace.as_ptr();
             let recipp = div.recip.as_ptr();
