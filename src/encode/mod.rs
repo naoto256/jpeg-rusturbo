@@ -1845,23 +1845,42 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn extract_mcu_420_rgb(
+fn quantize_mcu_420_rgb(
     pixels: &[u8],
     width: u32,
     height: u32,
     mx: u32,
     my: u32,
-    y_blocks: &mut [[i16; 64]; 4],
-    cb_blk: &mut [i16; 64],
-    cr_blk: &mut [i16; 64],
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    out: &mut [[i16; 64]],
 ) {
     let x0 = mx * Yuv420Scheme::MCU_W;
     let y0 = my * Yuv420Scheme::MCU_H;
     if x0 + Yuv420Scheme::MCU_W <= width && y0 + Yuv420Scheme::MCU_H <= height {
-        color::extract_mcu_420_rgb_full(pixels, width, x0, y0, y_blocks, cb_blk, cr_blk);
+        arch::backend::encode::quantize_mcu_420_rgb_full(
+            pixels, width, x0, y0, div_luma, div_chroma, out,
+        );
     } else {
-        color::extract_mcu_420(pixels, width, height, RGB, x0, y0, y_blocks, cb_blk, cr_blk);
+        let mut y_blocks = [[0i16; 64]; 4];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        color::extract_mcu_420(
+            pixels,
+            width,
+            height,
+            RGB,
+            x0,
+            y0,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        for (i, blk) in y_blocks.iter_mut().enumerate() {
+            out[i] = quantize_block(blk, div_luma);
+        }
+        out[4] = quantize_block(&mut cb_blk, div_chroma);
+        out[5] = quantize_block(&mut cr_blk, div_chroma);
     }
 }
 
@@ -1904,38 +1923,22 @@ fn encode_one_mcu_420_rgb<W: Write>(
     dc_chroma: &HuffmanTable,
     ac_chroma: &HuffmanTable,
 ) -> io::Result<()> {
-    let mut y_blocks = [[0i16; 64]; 4];
-    let mut cb_blk = [0i16; 64];
-    let mut cr_blk = [0i16; 64];
-    extract_mcu_420_rgb(
+    let mut blocks = [[0i16; 64]; Yuv420Scheme::BLOCKS_PER_MCU];
+    quantize_mcu_420_rgb(
         pixels,
         width,
         height,
         mx,
         my,
-        &mut y_blocks,
-        &mut cb_blk,
-        &mut cr_blk,
+        div_luma,
+        div_chroma,
+        &mut blocks,
     );
-    for blk in y_blocks.iter_mut() {
-        prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+    for blk in &blocks[..Yuv420Scheme::Y_BLOCKS_PER_MCU] {
+        prev_dc.y = encode_block(bw, blk, prev_dc.y, dc_luma, ac_luma)?;
     }
-    prev_dc.cb = encode_one_block(
-        bw,
-        &mut cb_blk,
-        div_chroma,
-        prev_dc.cb,
-        dc_chroma,
-        ac_chroma,
-    )?;
-    prev_dc.cr = encode_one_block(
-        bw,
-        &mut cr_blk,
-        div_chroma,
-        prev_dc.cr,
-        dc_chroma,
-        ac_chroma,
-    )?;
+    prev_dc.cb = encode_block(bw, &blocks[4], prev_dc.cb, dc_chroma, ac_chroma)?;
+    prev_dc.cr = encode_block(bw, &blocks[5], prev_dc.cr, dc_chroma, ac_chroma)?;
     Ok(())
 }
 
@@ -2082,24 +2085,7 @@ fn quantize_one_mcu_420_rgb(
     div_chroma: &Divisors,
     out: &mut [[i16; 64]],
 ) {
-    let mut y_blocks = [[0i16; 64]; 4];
-    let mut cb_blk = [0i16; 64];
-    let mut cr_blk = [0i16; 64];
-    extract_mcu_420_rgb(
-        pixels,
-        width,
-        height,
-        mx,
-        my,
-        &mut y_blocks,
-        &mut cb_blk,
-        &mut cr_blk,
-    );
-    for (i, blk) in y_blocks.iter_mut().enumerate() {
-        out[i] = quantize_block(blk, div_luma);
-    }
-    out[4] = quantize_block(&mut cb_blk, div_chroma);
-    out[5] = quantize_block(&mut cr_blk, div_chroma);
+    quantize_mcu_420_rgb(pixels, width, height, mx, my, div_luma, div_chroma, out);
 }
 
 /// Parallel front half of the threaded scan: for each MCU row, color

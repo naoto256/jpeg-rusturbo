@@ -24,6 +24,10 @@
 
 #![allow(dead_code)]
 
+pub mod encode {
+    pub use crate::arch::scalar::encode::*;
+}
+
 // ===========================================================================
 // color: 16-pixel-wide RGB(A) → YCbCr, chroma downsample (4:2:0 and 4:2:2 NEON)
 // ===========================================================================
