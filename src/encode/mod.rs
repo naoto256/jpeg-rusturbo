@@ -57,6 +57,27 @@ macro_rules! dispatch_scheme {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
+fn extract_block_ycbcr_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    mx: u32,
+    my: u32,
+    y_blk: &mut [i16; 64],
+    cb_blk: &mut [i16; 64],
+    cr_blk: &mut [i16; 64],
+) {
+    let x0 = mx * Yuv444Scheme::MCU_W;
+    let y0 = my * Yuv444Scheme::MCU_H;
+    if layout == RGB && x0 + Yuv444Scheme::MCU_W <= width && y0 + Yuv444Scheme::MCU_H <= height {
+        color::extract_block_ycbcr_rgb_full(pixels, width, x0, y0, y_blk, cb_blk, cr_blk);
+    } else {
+        color::extract_block_ycbcr(pixels, width, height, layout, x0, y0, y_blk, cb_blk, cr_blk);
+    }
+}
+
 /// JPEG encoder over an arbitrary [`Write`] sink.
 ///
 /// Public API mirrors [`image::codecs::jpeg::JpegEncoder`] so call
@@ -1363,16 +1384,8 @@ impl SamplingScheme for Yuv444Scheme {
         let mut y = [0i16; 64];
         let mut cb = [0i16; 64];
         let mut cr = [0i16; 64];
-        color::extract_block_ycbcr(
-            pixels,
-            width,
-            height,
-            layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
-            &mut y,
-            &mut cb,
-            &mut cr,
+        extract_block_ycbcr_rgb(
+            pixels, width, height, layout, mx, my, &mut y, &mut cb, &mut cr,
         );
         arch::backend::dct::fdct_islow(&mut y);
         y_blocks.push(quant::quantize_and_zigzag(&y, div_luma));
@@ -1401,13 +1414,13 @@ impl SamplingScheme for Yuv444Scheme {
         let mut y_blk = [0i16; 64];
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
-        color::extract_block_ycbcr(
+        extract_block_ycbcr_rgb(
             pixels,
             width,
             height,
             layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
+            mx,
+            my,
             &mut y_blk,
             &mut cb_blk,
             &mut cr_blk,
@@ -1446,13 +1459,13 @@ impl SamplingScheme for Yuv444Scheme {
         let mut y_blk = [0i16; 64];
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
-        color::extract_block_ycbcr(
+        extract_block_ycbcr_rgb(
             pixels,
             width,
             height,
             layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
+            mx,
+            my,
             &mut y_blk,
             &mut cb_blk,
             &mut cr_blk,
@@ -1617,16 +1630,8 @@ impl SamplingScheme for Yuv422Scheme {
         let mut ys = [[0i16; 64]; 2];
         let mut cb = [0i16; 64];
         let mut cr = [0i16; 64];
-        color::extract_mcu_422(
-            pixels,
-            width,
-            height,
-            layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
-            &mut ys,
-            &mut cb,
-            &mut cr,
+        extract_mcu_422_rgb(
+            pixels, width, height, layout, mx, my, &mut ys, &mut cb, &mut cr,
         );
         for y in ys.iter_mut() {
             arch::backend::dct::fdct_islow(y);
@@ -1657,13 +1662,13 @@ impl SamplingScheme for Yuv422Scheme {
         let mut y_blocks = [[0i16; 64]; 2];
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
-        color::extract_mcu_422(
+        extract_mcu_422_rgb(
             pixels,
             width,
             height,
             layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
+            mx,
+            my,
             &mut y_blocks,
             &mut cb_blk,
             &mut cr_blk,
@@ -1704,13 +1709,13 @@ impl SamplingScheme for Yuv422Scheme {
         let mut y_blocks = [[0i16; 64]; 2];
         let mut cb_blk = [0i16; 64];
         let mut cr_blk = [0i16; 64];
-        color::extract_mcu_422(
+        extract_mcu_422_rgb(
             pixels,
             width,
             height,
             layout,
-            mx * Self::MCU_W,
-            my * Self::MCU_H,
+            mx,
+            my,
             &mut y_blocks,
             &mut cb_blk,
             &mut cr_blk,
@@ -1747,6 +1752,40 @@ fn dispatch_scan<W: Write>(
     ac_chroma: &HuffmanTable,
     restart_interval: u16,
 ) -> io::Result<()> {
+    if matches!(subsampling, ChromaSubsampling::Yuv420) && layout == RGB {
+        if threads == 1 {
+            return encode_scan_420_rgb(
+                pixels,
+                width,
+                height,
+                bw,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+                restart_interval,
+            );
+        }
+
+        let mcus_x = width.div_ceil(Yuv420Scheme::MCU_W);
+        let rows = run_on_pool(threads, || {
+            parallel_quantize_rows_420_rgb(pixels, width, height, div_luma, div_chroma)
+        })?;
+
+        return serial_emit_rows::<Yuv420Scheme, _>(
+            &rows,
+            mcus_x,
+            bw,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        );
+    }
+
     if threads == 1 {
         return dispatch_scheme!(subsampling, S => encode_scan::<S, _>(
             pixels,
@@ -1804,6 +1843,153 @@ where
             .map_err(io::Error::other)?;
         Ok(pool.install(f))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_mcu_420_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    mx: u32,
+    my: u32,
+    y_blocks: &mut [[i16; 64]; 4],
+    cb_blk: &mut [i16; 64],
+    cr_blk: &mut [i16; 64],
+) {
+    let x0 = mx * Yuv420Scheme::MCU_W;
+    let y0 = my * Yuv420Scheme::MCU_H;
+    if x0 + Yuv420Scheme::MCU_W <= width && y0 + Yuv420Scheme::MCU_H <= height {
+        color::extract_mcu_420_rgb_full(pixels, width, x0, y0, y_blocks, cb_blk, cr_blk);
+    } else {
+        color::extract_mcu_420(pixels, width, height, RGB, x0, y0, y_blocks, cb_blk, cr_blk);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_mcu_422_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    mx: u32,
+    my: u32,
+    y_blocks: &mut [[i16; 64]; 2],
+    cb_blk: &mut [i16; 64],
+    cr_blk: &mut [i16; 64],
+) {
+    let x0 = mx * Yuv422Scheme::MCU_W;
+    let y0 = my * Yuv422Scheme::MCU_H;
+    if layout == RGB && x0 + Yuv422Scheme::MCU_W <= width && y0 + Yuv422Scheme::MCU_H <= height {
+        color::extract_mcu_422_rgb_full(pixels, width, x0, y0, y_blocks, cb_blk, cr_blk);
+    } else {
+        color::extract_mcu_422(
+            pixels, width, height, layout, x0, y0, y_blocks, cb_blk, cr_blk,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_one_mcu_420_rgb<W: Write>(
+    bw: &mut BitWriter<W>,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    mx: u32,
+    my: u32,
+    prev_dc: &mut DcPredictors,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+) -> io::Result<()> {
+    let mut y_blocks = [[0i16; 64]; 4];
+    let mut cb_blk = [0i16; 64];
+    let mut cr_blk = [0i16; 64];
+    extract_mcu_420_rgb(
+        pixels,
+        width,
+        height,
+        mx,
+        my,
+        &mut y_blocks,
+        &mut cb_blk,
+        &mut cr_blk,
+    );
+    for blk in y_blocks.iter_mut() {
+        prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+    }
+    prev_dc.cb = encode_one_block(
+        bw,
+        &mut cb_blk,
+        div_chroma,
+        prev_dc.cb,
+        dc_chroma,
+        ac_chroma,
+    )?;
+    prev_dc.cr = encode_one_block(
+        bw,
+        &mut cr_blk,
+        div_chroma,
+        prev_dc.cr,
+        dc_chroma,
+        ac_chroma,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_scan_420_rgb<W: Write>(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    bw: &mut BitWriter<W>,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+    restart_interval: u16,
+) -> io::Result<()> {
+    let mcus_x = width.div_ceil(Yuv420Scheme::MCU_W);
+    let mcus_y = height.div_ceil(Yuv420Scheme::MCU_H);
+    let mut prev_dc = DcPredictors::default();
+    let restart_interval = restart_interval as u32;
+    let mut mcus_since_rst: u32 = 0;
+    let mut next_rst: u8 = 0;
+    let mut mcu_count: u64 = 0;
+    let total_mcus = mcus_x as u64 * mcus_y as u64;
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            if restart_interval > 0 && mcus_since_rst == restart_interval && mcu_count < total_mcus
+            {
+                bw.write_restart(next_rst)?;
+                next_rst = (next_rst + 1) & 7;
+                mcus_since_rst = 0;
+                prev_dc = DcPredictors::default();
+            }
+            encode_one_mcu_420_rgb(
+                bw,
+                pixels,
+                width,
+                height,
+                mx,
+                my,
+                &mut prev_dc,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+            )?;
+            mcus_since_rst += 1;
+            mcu_count += 1;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1886,6 +2072,36 @@ fn quantize_block(block: &mut [i16; 64], div: &Divisors) -> [i16; 64] {
     quant::quantize_and_zigzag(block, div)
 }
 
+fn quantize_one_mcu_420_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    mx: u32,
+    my: u32,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    out: &mut [[i16; 64]],
+) {
+    let mut y_blocks = [[0i16; 64]; 4];
+    let mut cb_blk = [0i16; 64];
+    let mut cr_blk = [0i16; 64];
+    extract_mcu_420_rgb(
+        pixels,
+        width,
+        height,
+        mx,
+        my,
+        &mut y_blocks,
+        &mut cb_blk,
+        &mut cr_blk,
+    );
+    for (i, blk) in y_blocks.iter_mut().enumerate() {
+        out[i] = quantize_block(blk, div_luma);
+    }
+    out[4] = quantize_block(&mut cb_blk, div_chroma);
+    out[5] = quantize_block(&mut cr_blk, div_chroma);
+}
+
 /// Parallel front half of the threaded scan: for each MCU row, color
 /// convert + forward DCT + quantize + zigzag every MCU and return the
 /// row's quantized blocks. Pure data in / pure data out — no
@@ -1914,6 +2130,32 @@ fn parallel_quantize_rows<S: SamplingScheme>(
                 S::quantize_one_mcu(
                     pixels, width, height, layout, mx, my, div_luma, div_chroma, slot,
                 );
+            }
+            row
+        })
+        .collect()
+}
+
+fn parallel_quantize_rows_420_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+) -> Vec<Vec<[i16; 64]>> {
+    let mcus_x = width.div_ceil(Yuv420Scheme::MCU_W);
+    let mcus_y = height.div_ceil(Yuv420Scheme::MCU_H);
+    let blocks_per_mcu = Yuv420Scheme::BLOCKS_PER_MCU;
+    let blocks_per_row = (mcus_x as usize) * blocks_per_mcu;
+
+    (0..mcus_y)
+        .into_par_iter()
+        .map(|my| {
+            let mut row: Vec<[i16; 64]> = vec![[0i16; 64]; blocks_per_row];
+            for mx in 0..mcus_x {
+                let start = (mx as usize) * blocks_per_mcu;
+                let slot = &mut row[start..start + blocks_per_mcu];
+                quantize_one_mcu_420_rgb(pixels, width, height, mx, my, div_luma, div_chroma, slot);
             }
             row
         })
