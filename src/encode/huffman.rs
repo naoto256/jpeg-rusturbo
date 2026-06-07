@@ -140,12 +140,23 @@ impl<W: io::Write> BitWriter<W> {
     /// drain branch fires only when we've accumulated ≥32 queued bits.
     #[inline(always)]
     pub fn write_bits(&mut self, value: u32, n_bits: u32) -> io::Result<()> {
+        self.push_bits(value, n_bits);
+        Ok(())
+    }
+
+    /// Infallible hot-path form of `write_bits`.
+    ///
+    /// The public method keeps the existing API for progressive paths and
+    /// tests, but baseline block entropy coding can avoid threading
+    /// `io::Result` through every emitted Huffman token.
+    #[inline(always)]
+    fn push_bits(&mut self, value: u32, n_bits: u32) {
         debug_assert!(n_bits <= 27, "write_bits over-budget: {n_bits}");
         // `n_bits == 0` is allowed (used by callers when emitting a
         // zero-magnitude token); the resulting shift is well-defined
         // because we only shift by `n_bits` after masking.
         if n_bits == 0 {
-            return Ok(());
+            return;
         }
         // OR in just past the existing queue. The new bits are placed at
         // bits [63-nbits-n_bits .. 63-nbits] of `buffer`.
@@ -155,7 +166,15 @@ impl<W: io::Write> BitWriter<W> {
         if self.nbits >= 32 {
             self.drain_high32();
         }
-        Ok(())
+    }
+
+    #[inline(always)]
+    fn local_writer(&mut self) -> LocalBitWriter<'_> {
+        LocalBitWriter {
+            buf: &mut self.buf,
+            buffer: self.buffer,
+            nbits: self.nbits,
+        }
     }
 
     /// Drain the top 32 bits of the accumulator as four bytes (with
@@ -236,6 +255,77 @@ impl<W: io::Write> BitWriter<W> {
     }
 }
 
+struct LocalBitWriter<'a> {
+    buf: &'a mut Vec<u8>,
+    buffer: u64,
+    nbits: u32,
+}
+
+impl LocalBitWriter<'_> {
+    #[inline(always)]
+    fn push_bits(&mut self, value: u32, n_bits: u32) {
+        debug_assert!(n_bits <= 27, "write_bits over-budget: {n_bits}");
+        if n_bits == 0 {
+            return;
+        }
+        let shift = 64 - self.nbits - n_bits;
+        self.buffer |= (u64::from(value) & ((1u64 << n_bits) - 1)) << shift;
+        self.nbits += n_bits;
+        if self.nbits >= 32 {
+            self.drain_high32();
+        }
+    }
+
+    #[inline(always)]
+    fn push_packed(&mut self, entry: u32) {
+        self.push_bits(entry & 0xFFFF, entry >> 16);
+    }
+
+    #[inline(always)]
+    fn push_packed_with_bits(&mut self, entry: u32, bits: u32, n_bits: u32) {
+        let code = entry & 0xFFFF;
+        let len = entry >> 16;
+        self.push_bits((code << n_bits) | bits, len + n_bits);
+    }
+
+    #[inline]
+    fn drain_high32(&mut self) {
+        let high = (self.buffer >> 32) as u32;
+        // 4 data bytes + up to 4 stuffing bytes = 8.
+        self.buf.reserve(8);
+        let len = self.buf.len();
+        let mut written: usize = 0;
+        // Safety: we just reserved 8 bytes; `written ∈ 0..=8` after the
+        // loop (each byte writes 1 byte, optionally +1 for stuffing).
+        // `u8` is plain-old-data so writing through `*mut u8` and then
+        // `set_len` is sound.
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(len);
+            for &b in &[
+                (high >> 24) as u8,
+                (high >> 16) as u8,
+                (high >> 8) as u8,
+                high as u8,
+            ] {
+                *dst.add(written) = b;
+                written += 1;
+                if b == 0xFF {
+                    *dst.add(written) = 0;
+                    written += 1;
+                }
+            }
+            self.buf.set_len(len + written);
+        }
+        self.buffer <<= 32;
+        self.nbits -= 32;
+    }
+
+    #[inline(always)]
+    fn finish(self) -> (u64, u32) {
+        (self.buffer, self.nbits)
+    }
+}
+
 #[inline(always)]
 fn push_stuffed(buf: &mut Vec<u8>, byte: u8) {
     buf.push(byte);
@@ -258,6 +348,8 @@ pub fn encode_block<W: io::Write>(
     dc_tab: &HuffmanTable,
     ac_tab: &HuffmanTable,
 ) -> io::Result<i16> {
+    let mut local = bw.local_writer();
+
     // ----- DC term: difference-coded (F.1.2.1) -----
     //
     // Emit `(huff_code, magnitude_bits)` as a single fused write. JPEG
@@ -268,10 +360,7 @@ pub fn encode_block<W: io::Write>(
     let dc = block[0];
     let diff = dc as i32 - prev_dc as i32;
     let (size, bits) = magnitude_category(diff);
-    let dc_entry = dc_tab.packed[size as usize];
-    let dc_code = dc_entry & 0xFFFF;
-    let dc_len = dc_entry >> 16;
-    bw.write_bits((dc_code << size) | bits, dc_len + size as u32)?;
+    local.push_packed_with_bits(dc_tab.packed[size as usize], bits, size as u32);
 
     // ----- AC terms: run-length of zeros + magnitude (F.1.2.2) -----
     // Build a 64-bit bitmap of nonzero positions, then drive the scan
@@ -294,11 +383,16 @@ pub fn encode_block<W: io::Write>(
 
     if ac_bitmap == 0 {
         // All AC coefficients zero → emit EOB and we're done.
-        let eob = ac_tab.packed[0x00];
-        bw.write_bits(eob & 0xFFFF, eob >> 16)?;
+        local.push_packed(ac_tab.packed[0x00]);
+        let (buffer, nbits) = local.finish();
+        bw.buffer = buffer;
+        bw.nbits = nbits;
         return Ok(dc);
     }
 
+    let ac_packed = &ac_tab.packed;
+    let eob = ac_packed[0x00];
+    let zrl = ac_packed[0xF0];
     let last_nonzero = 63 - ac_bitmap.leading_zeros() as usize;
     let mut remaining = ac_bitmap;
     let mut k: usize = 1;
@@ -307,8 +401,7 @@ pub fn encode_block<W: io::Write>(
         let mut zero_run = (next_k - k) as u32;
         // ZRL (F0): emit 16-zero placeholder until run < 16.
         while zero_run >= 16 {
-            let zrl = ac_tab.packed[0xF0];
-            bw.write_bits(zrl & 0xFFFF, zrl >> 16)?;
+            local.push_packed(zrl);
             zero_run -= 16;
         }
         // (size, bits) — from the precomputed lut on aarch64, from a
@@ -323,25 +416,24 @@ pub fn encode_block<W: io::Write>(
             (s as u32, b)
         };
         let symbol = ((zero_run as usize) << 4) | (size as usize & 0x0F);
-        let entry = ac_tab.packed[symbol];
         // Fuse the Huffman code and magnitude-bits emits into one
         // `write_bits` call. AC magnitude category is bounded at 10
         // and Huffman code length at 16, so the combined width fits
         // `write_bits`' 27-bit budget. Halves the per-coefficient
         // shift / mask / OR / drain-check chain on the AC hot path.
-        let huff_code = entry & 0xFFFF;
-        let huff_nbits = entry >> 16;
-        bw.write_bits((huff_code << size) | bits, huff_nbits + size)?;
+        local.push_packed_with_bits(ac_packed[symbol], bits, size);
         remaining &= !(1u64 << next_k);
         k = next_k + 1;
     }
 
     // Trailing zeros → EOB (symbol 0x00).
     if last_nonzero < 63 {
-        let eob = ac_tab.packed[0x00];
-        bw.write_bits(eob & 0xFFFF, eob >> 16)?;
+        local.push_packed(eob);
     }
 
+    let (buffer, nbits) = local.finish();
+    bw.buffer = buffer;
+    bw.nbits = nbits;
     Ok(dc)
 }
 
@@ -418,6 +510,18 @@ mod tests {
             bw.flush_to_byte_boundary().unwrap();
         }
         assert_eq!(out, vec![0xAA, 0xAB, 0xBB, 0xCC, 0xCF]);
+    }
+
+    #[test]
+    fn bitwriter_stuffs_ff_during_high32_drain() {
+        let mut out = Vec::new();
+        {
+            let mut bw = BitWriter::new(&mut out);
+            bw.write_bits(0x12FF, 16).unwrap();
+            bw.write_bits(0x34FF, 16).unwrap();
+            bw.flush_to_byte_boundary().unwrap();
+        }
+        assert_eq!(out, vec![0x12, 0xFF, 0x00, 0x34, 0xFF, 0x00]);
     }
 
     #[test]
