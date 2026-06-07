@@ -260,6 +260,46 @@ pub fn extract_block_ycbcr(
     }
 }
 
+/// Extract a full 8x8 RGB block for 4:4:4 without padding/layout checks.
+///
+/// Caller guarantees `x0 + 8 <= width` and `y0 + 8 <= height`.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_block_ycbcr_rgb_full(
+    pixels: &[u8],
+    width: u32,
+    x0: u32,
+    y0: u32,
+    y_block: &mut [i16; 64],
+    cb_block: &mut [i16; 64],
+    cr_block: &mut [i16; 64],
+) {
+    debug_assert!(x0 + 8 <= width);
+    let stride = width as usize * RGB.bpp;
+    let mut y_row = [0u8; 8];
+    let mut cb_row = [0u8; 8];
+    let mut cr_row = [0u8; 8];
+
+    for j in 0..8 {
+        let row_off = (y0 as usize + j) * stride;
+        let start = row_off + x0 as usize * RGB.bpp;
+        let src_slice = &pixels[start..start + 8 * RGB.bpp];
+        arch::backend::color::rgb_row_to_ycc(
+            src_slice,
+            RGB,
+            8,
+            &mut y_row,
+            &mut cb_row,
+            &mut cr_row,
+        );
+        for i in 0..8 {
+            let idx = j * 8 + i;
+            y_block[idx] = (y_row[i] as i16) - 128;
+            cb_block[idx] = (cb_row[i] as i16) - 128;
+            cr_block[idx] = (cr_row[i] as i16) - 128;
+        }
+    }
+}
+
 /// Extract a 16x16 luma window with 4 luma blocks plus 4:2:0 chroma.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_mcu_420(
@@ -306,6 +346,57 @@ pub fn extract_mcu_420(
     }
 
     // Distribute luma into the four 8x8 quadrants with level shift.
+    for jq in 0..2 {
+        for iq in 0..2 {
+            let dst = &mut y_blocks[jq * 2 + iq];
+            for j in 0..8 {
+                for i in 0..8 {
+                    dst[j * 8 + i] = (y_full[(jq * 8 + j) * 16 + (iq * 8 + i)] as i16) - 128;
+                }
+            }
+        }
+    }
+
+    arch::backend::color::h2v2_downsample(&cb_full, cb_block);
+    arch::backend::color::h2v2_downsample(&cr_full, cr_block);
+}
+
+/// Extract a full 16x16 RGB MCU for 4:2:0 without padding/layout checks.
+///
+/// Caller guarantees `x0 + 16 <= width` and that `y0 + 16 <= height`.
+/// Edge MCUs should use [`extract_mcu_420`] so right/bottom replication
+/// stays centralized in the generic path.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_mcu_420_rgb_full(
+    pixels: &[u8],
+    width: u32,
+    x0: u32,
+    y0: u32,
+    y_blocks: &mut [[i16; 64]; 4],
+    cb_block: &mut [i16; 64],
+    cr_block: &mut [i16; 64],
+) {
+    debug_assert!(x0 + 16 <= width);
+    let stride = width as usize * RGB.bpp;
+    let mut y_full = [0u8; 16 * 16];
+    let mut cb_full = [0u8; 16 * 16];
+    let mut cr_full = [0u8; 16 * 16];
+
+    for j in 0..16 {
+        let row_off = (y0 as usize + j) * stride;
+        let start = row_off + x0 as usize * RGB.bpp;
+        let src_slice = &pixels[start..start + 16 * RGB.bpp];
+        let off = j * 16;
+        arch::backend::color::rgb_row_to_ycc(
+            src_slice,
+            RGB,
+            16,
+            &mut y_full[off..off + 16],
+            &mut cb_full[off..off + 16],
+            &mut cr_full[off..off + 16],
+        );
+    }
+
     for jq in 0..2 {
         for iq in 0..2 {
             let dst = &mut y_blocks[jq * 2 + iq];
@@ -384,6 +475,52 @@ pub fn extract_mcu_422(
     arch::backend::color::h2v1_downsample(&cr_full, cr_block);
 }
 
+/// Extract a full 16x8 RGB MCU for 4:2:2 without padding/layout checks.
+///
+/// Caller guarantees `x0 + 16 <= width` and `y0 + 8 <= height`.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_mcu_422_rgb_full(
+    pixels: &[u8],
+    width: u32,
+    x0: u32,
+    y0: u32,
+    y_blocks: &mut [[i16; 64]; 2],
+    cb_block: &mut [i16; 64],
+    cr_block: &mut [i16; 64],
+) {
+    debug_assert!(x0 + 16 <= width);
+    let stride = width as usize * RGB.bpp;
+    let mut y_full = [0u8; 16 * 8];
+    let mut cb_full = [0u8; 16 * 8];
+    let mut cr_full = [0u8; 16 * 8];
+
+    for j in 0..8 {
+        let row_off = (y0 as usize + j) * stride;
+        let start = row_off + x0 as usize * RGB.bpp;
+        let src_slice = &pixels[start..start + 16 * RGB.bpp];
+        let off = j * 16;
+        arch::backend::color::rgb_row_to_ycc(
+            src_slice,
+            RGB,
+            16,
+            &mut y_full[off..off + 16],
+            &mut cb_full[off..off + 16],
+            &mut cr_full[off..off + 16],
+        );
+    }
+
+    for (iq, dst) in y_blocks.iter_mut().enumerate() {
+        for j in 0..8 {
+            for i in 0..8 {
+                dst[j * 8 + i] = (y_full[j * 16 + (iq * 8 + i)] as i16) - 128;
+            }
+        }
+    }
+
+    arch::backend::color::h2v1_downsample(&cb_full, cb_block);
+    arch::backend::color::h2v1_downsample(&cr_full, cr_block);
+}
+
 /// Extract an 8x8 block of one CMYK channel (selected by `channel`,
 /// `0..=3` for C/M/Y/K) from a 4-byte/pixel CMYK buffer,
 /// level-shifted to centered i16. Edge-replicates on the right and
@@ -445,5 +582,140 @@ pub fn extract_block_gray(
             // forward DCT (T.81 A.3.1).
             y_block[j * 8 + i] = (pixels[row_off + sx] as i16) - 128;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patterned_rgb(width: usize, height: usize) -> Vec<u8> {
+        let mut pixels = vec![0u8; width * height * RGB.bpp];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * RGB.bpp;
+                pixels[i] = ((x * 17 + y * 3) & 0xFF) as u8;
+                pixels[i + 1] = ((x * 5 + y * 11 + 7) & 0xFF) as u8;
+                pixels[i + 2] = ((x * 13 + y * 19 + 23) & 0xFF) as u8;
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn extract_block_ycbcr_rgb_full_matches_generic_rgb() {
+        let width = 24;
+        let height = 24;
+        let pixels = patterned_rgb(width, height);
+
+        let mut y_generic = [0i16; 64];
+        let mut cb_generic = [0i16; 64];
+        let mut cr_generic = [0i16; 64];
+        extract_block_ycbcr(
+            &pixels,
+            width as u32,
+            height as u32,
+            RGB,
+            8,
+            8,
+            &mut y_generic,
+            &mut cb_generic,
+            &mut cr_generic,
+        );
+
+        let mut y_fast = [0i16; 64];
+        let mut cb_fast = [0i16; 64];
+        let mut cr_fast = [0i16; 64];
+        extract_block_ycbcr_rgb_full(
+            &pixels,
+            width as u32,
+            8,
+            8,
+            &mut y_fast,
+            &mut cb_fast,
+            &mut cr_fast,
+        );
+
+        assert_eq!(y_fast, y_generic);
+        assert_eq!(cb_fast, cb_generic);
+        assert_eq!(cr_fast, cr_generic);
+    }
+
+    #[test]
+    fn extract_mcu_420_rgb_full_matches_generic_rgb() {
+        let width = 32;
+        let height = 32;
+        let pixels = patterned_rgb(width, height);
+
+        let mut y_generic = [[0i16; 64]; 4];
+        let mut cb_generic = [0i16; 64];
+        let mut cr_generic = [0i16; 64];
+        extract_mcu_420(
+            &pixels,
+            width as u32,
+            height as u32,
+            RGB,
+            16,
+            16,
+            &mut y_generic,
+            &mut cb_generic,
+            &mut cr_generic,
+        );
+
+        let mut y_fast = [[0i16; 64]; 4];
+        let mut cb_fast = [0i16; 64];
+        let mut cr_fast = [0i16; 64];
+        extract_mcu_420_rgb_full(
+            &pixels,
+            width as u32,
+            16,
+            16,
+            &mut y_fast,
+            &mut cb_fast,
+            &mut cr_fast,
+        );
+
+        assert_eq!(y_fast, y_generic);
+        assert_eq!(cb_fast, cb_generic);
+        assert_eq!(cr_fast, cr_generic);
+    }
+
+    #[test]
+    fn extract_mcu_422_rgb_full_matches_generic_rgb() {
+        let width = 32;
+        let height = 16;
+        let pixels = patterned_rgb(width, height);
+
+        let mut y_generic = [[0i16; 64]; 2];
+        let mut cb_generic = [0i16; 64];
+        let mut cr_generic = [0i16; 64];
+        extract_mcu_422(
+            &pixels,
+            width as u32,
+            height as u32,
+            RGB,
+            16,
+            8,
+            &mut y_generic,
+            &mut cb_generic,
+            &mut cr_generic,
+        );
+
+        let mut y_fast = [[0i16; 64]; 2];
+        let mut cb_fast = [0i16; 64];
+        let mut cr_fast = [0i16; 64];
+        extract_mcu_422_rgb_full(
+            &pixels,
+            width as u32,
+            16,
+            8,
+            &mut y_fast,
+            &mut cb_fast,
+            &mut cr_fast,
+        );
+
+        assert_eq!(y_fast, y_generic);
+        assert_eq!(cb_fast, cb_generic);
+        assert_eq!(cr_fast, cr_generic);
     }
 }
