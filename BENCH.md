@@ -1,12 +1,13 @@
 # `jpeg-rusturbo` benchmarks
 
-All numbers below come from one coherent measurement campaign per host
-on 2026-05-30, driven by the harness in `benches/pipeline.rs` (encode +
-decode) and `benches/vs_image.rs` (vs the `image` crate). Both
-hosts ran the identical command sequence, so every table appears as a
-matched pair — one per host, same shape. The rightmost column is always
-the multiplier (speedup or ratio): scan it down a column and the win
-reads at a glance.
+All numbers below come from one coherent measurement campaign per host,
+driven by the harness in `benches/pipeline.rs` (encode + decode) and
+`benches/vs_image.rs` (vs the `image` crate). Encode-side numbers were
+refreshed on 2026-06-08 after the 0.9.x encoder hot-path work. Decode
+numbers are retained from the previous campaign because the decoder code
+was not changed in this cycle. The rightmost column is always the
+multiplier (speedup or ratio): scan it down a column and the win reads at
+a glance.
 
 Methodology is intentionally simple: a single timed batch, 50 measured
 iterations after a 3-iteration warm-up, no statistical filtering. Two
@@ -30,12 +31,14 @@ cargo bench --bench vs_image                                     # vs image crat
 ```
 
 The release profile is `lto = "fat"` + `codegen-units = 1`; all numbers
-are with that profile. Encode timings use the 4-byte RGBA input path
-(the 3-byte RGB path tracks within ~1–2% on both backends as of 0.8.0);
-the vs-`image` comparison feeds 3-byte RGB to both encoders, the fair
-input for `image`. Output bytes are byte-identical across SIMD ↔ scalar,
-across hosts, and across RGB ↔ RGBA input — the bit-exact equivalence
-the crate sets out to preserve, asserted in the unit tests.
+are with that profile. Pipeline encode timings use the 4-byte RGBA input
+path so SIMD vs scalar and thread-scaling rows isolate backend work on
+the same byte layout. The vs-`image` comparison feeds 3-byte RGB to both
+encoders, the fair input for `image`; after the 0.9.x x86 RGB hot-path
+work those RGB rows can be materially faster than the RGBA pipeline
+rows, especially at 4:4:4. Output bytes are byte-identical across SIMD ↔
+scalar, across hosts, and across RGB ↔ RGBA input — the bit-exact
+equivalence the crate sets out to preserve, asserted in the unit tests.
 
 ## Hosts
 
@@ -44,13 +47,13 @@ the crate sets out to preserve, asserted in the unit tests.
 | Apple M-series            | Apple Silicon (M-series)           | 8 P+E  | NEON (always-on) |
 | Intel Xeon (Cascade Lake) | Xeon Platinum 8272CL @ 2.60 GHz    | 4 vCPU | AVX2 + SSE2      |
 
-The Cascade Lake host was a 4-vCPU Azure `D4s_v3`. The Apple M host was
-a developer laptop on AC power; background load was light but non-zero,
-so on that host trust the *ratios* a little more than the raw ms.
+The Cascade Lake host had 4 vCPUs. The Apple M host was a developer
+laptop on AC power; background load was light but non-zero, so on that
+host trust the *ratios* a little more than the raw ms.
 
 A note on the vs-`image` ratios (third chapter): they reflect *both* our
 speed and `image`'s scalar-encoder baseline on that CPU. `image`'s
-encoder is markedly slower on the Cascade Lake VM than on the Apple M
+encoder is markedly slower on the Cascade Lake host than on the Apple M
 laptop, so the Cascade ratios run higher even though our absolute encode
 is slower there. Read each ratio as "vs `image` on this host," not as a
 cross-host hardware comparison.
@@ -71,23 +74,25 @@ per-pixel work), so the 4K row stands in for every resolution.
 
 | Subsampling (4K) | SIMD     | scalar   | speedup |
 | ---------------- | -------: | -------: | ------: |
-| 4:4:4            | 29.17 ms | 55.37 ms |   1.90× |
-| 4:2:2            | 19.69 ms | 40.34 ms |   2.05× |
-| 4:2:0            | 16.06 ms | 37.27 ms |   2.32× |
+| 4:4:4            | 28.09 ms | 54.12 ms |   1.93× |
+| 4:2:2            | 19.39 ms | 39.03 ms |   2.01× |
+| 4:2:0            | 16.43 ms | 35.31 ms |   2.15× |
 
 **Intel Xeon (Cascade Lake, AVX2)**
 
 | Subsampling (4K) | SIMD      | scalar    | speedup |
 | ---------------- | --------: | --------: | ------: |
-| 4:4:4            | 145.80 ms | 273.37 ms |   1.88× |
-| 4:2:2            |  83.82 ms | 205.57 ms |   2.45× |
-| 4:2:0            |  65.69 ms | 160.30 ms |   2.44× |
+| 4:4:4            | 142.22 ms | 274.21 ms |   1.93× |
+| 4:2:2            |  81.78 ms | 207.08 ms |   2.53× |
+| 4:2:0            |  62.58 ms | 160.79 ms |   2.57× |
 
 The win grows toward 4:2:0 as chroma downsampling shrinks the planes the
 SIMD color + DCT kernels run over. 0.8.0's encoder cycle added an unsafe
 `BitWriter::drain_high32`, fused AC code+magnitude `write_bits`, a NEON
 `vqtbl4q` zig-zag scatter, a NEON magnitude-category precompute, and an
-AVX2 3-byte RGB→YCbCr deinterleave kernel.
+AVX2 3-byte RGB→YCbCr deinterleave kernel. The 0.9.x hot-path pass then
+batched the x86 RGB front half for 4:2:0 / 4:2:2 / 4:4:4, bringing the
+Cascade Lake 4:4:4 row up to the same shape as the denser chroma modes.
 
 ## Thread scaling
 
@@ -99,18 +104,19 @@ across thread counts.
 
 | Resolution | t=1      | t=2      | t=4     | t=8     | auto    | auto vs t=1 |
 | ---------- | -------: | -------: | ------: | ------: | ------: | ----------: |
-| 1080p      |  3.90 ms |  2.63 ms | 2.08 ms | 1.96 ms | 1.90 ms |       2.05× |
-| 4K         | 16.14 ms | 10.03 ms | 7.92 ms | 7.02 ms | 6.85 ms |       2.36× |
+| 1080p      |  3.98 ms |  2.78 ms | 2.20 ms | 2.08 ms | 2.09 ms |       1.90× |
+| 4K         | 16.34 ms | 10.81 ms | 8.60 ms | 7.89 ms | 7.35 ms |       2.22× |
 
 **Intel Xeon (Cascade Lake, 4 vCPU)**
 
 | Resolution | t=1      | t=2      | t=4      | t=8      | auto     | auto vs t=1 |
 | ---------- | -------: | -------: | -------: | -------: | -------: | ----------: |
-| 1080p      | 16.69 ms | 13.70 ms | 14.40 ms | 14.69 ms | 13.71 ms |       1.22× |
-| 4K         | 66.23 ms | 54.72 ms | 56.11 ms | 53.39 ms | 53.60 ms |       1.24× |
+| 1080p      | 16.20 ms | 14.16 ms | 15.42 ms | 15.79 ms | 15.31 ms |       1.06× |
+| 4K         | 64.88 ms | 55.42 ms | 54.65 ms | 53.62 ms | 53.29 ms |       1.22× |
 
-The 4-vCPU Cascade Lake saturates at 2 threads; the 8-core Apple host
-reaches ~2.4× at 4K.
+The 4-vCPU Cascade Lake saturates by 2–4 threads and barely benefits at
+1080p after the single-thread hot path was tightened; the 8-core Apple
+host still scales past 2× at 4K.
 
 ## Optimize-huffman
 
@@ -120,14 +126,14 @@ host-independent (identical bytes everywhere), so it's one table.
 
 | Subsampling | q70    | q80    | q90    |
 | ----------- | -----: | -----: | -----: |
-| 4:4:4       | −5.74% | −5.67% | −5.62% |
-| 4:2:2       | −5.53% | −5.31% | −5.32% |
-| 4:2:0       | −5.29% | −4.89% | −4.58% |
+| 4:4:4       | −5.71% | −5.69% | −5.63% |
+| 4:2:2       | −5.50% | −5.34% | −5.29% |
+| 4:2:0       | −5.25% | −4.87% | −4.61% |
 
 Roughly −5% on synthetic content; 4–10% on natural photos, matching
 `cjpeg -optimize`. The second pass roughly doubles encode wall-clock —
-4K 4:2:0 q=80 costs **2.28×** on Apple M (16.53 → 37.67 ms) and **1.71×**
-on Cascade Lake (65.59 → 112.15 ms); the factor is larger on NEON
+4K 4:2:0 q=80 costs **2.31×** on Apple M (16.34 → 37.75 ms) and **1.70×**
+on Cascade Lake (64.86 → 110.53 ms); the factor is larger on NEON
 because its faster first pass leaves the second, largely scalar, pass
 weighing more. Opt-in for when bandwidth matters more than CPU.
 
@@ -141,19 +147,19 @@ columns are the time and size multipliers over baseline.
 
 | Resolution | baseline | progressive | time  | size  |
 | ---------- | -------: | ----------: | ----: | ----: |
-| 1592×1124  |  2.34 ms |     6.06 ms | 2.59× | 1.43× |
-| 1080p      |  2.67 ms |     6.95 ms | 2.60× | 1.44× |
-| 4K         | 11.22 ms |    27.66 ms | 2.46× | 1.48× |
+| 1592×1124  |  2.32 ms |     6.23 ms | 2.69× | 1.43× |
+| 1080p      |  2.64 ms |     7.01 ms | 2.66× | 1.44× |
+| 4K         | 13.01 ms |    29.07 ms | 2.23× | 1.48× |
 
 **Intel Xeon (Cascade Lake, AVX2)**
 
 | Resolution | baseline | progressive | time  | size  |
 | ---------- | -------: | ----------: | ----: | ----: |
-| 1592×1124  |  7.56 ms |    20.02 ms | 2.65× | 1.43× |
-| 1080p      |  8.44 ms |    23.05 ms | 2.73× | 1.44× |
-| 4K         | 34.64 ms |    92.16 ms | 2.66× | 1.48× |
+| 1592×1124  |  7.40 ms |    21.41 ms | 2.89× | 1.43× |
+| 1080p      |  7.98 ms |    24.41 ms | 3.06× | 1.44× |
+| 4K         | 33.25 ms |    97.90 ms | 2.94× | 1.48× |
 
-The ~2.5× time is spec-bound (one buffer pass + eight scan passes over
+The ~2.5–3.0× time is spec-bound (one buffer pass + eight scan passes over
 the stored coefficients). The +43–48% size is on us, not the spec: the
 standard-tables encoder emits `EOB0` per block rather than the
 multi-block `EOBn` runs the format permits, because the Annex K
@@ -217,34 +223,64 @@ sides timed on the same content from the same harness, 3-byte RGB in.
 ## Encode (RGB → JPEG, q=80)
 
 `image` only emits 4:2:0, so that's the apples-to-apples ratio; our
-4K 4:2:2 / 4:4:4 rows are reference (denser chroma, more work).
+4K 4:2:2 / 4:4:4 rows are reference (denser chroma, more work). The
+same harness prints both `threads=1` and `threads=auto` for our encoder;
+`image` has no comparable threading knob.
+
+### threads=1
 
 **Apple M-series (NEON)**
 
 | Subsampling / resolution | jpeg-rusturbo | image    | ratio |
 | ------------------------ | ------------: | -------: | ----: |
-| 4:2:0  1592×1124         |  3.50 ms | 15.79 ms | 4.51× |
-| 4:2:0  1080p             |  3.94 ms | 17.92 ms | 4.55× |
-| 4:2:0  4K                | 15.64 ms | 69.07 ms | 4.42× |
-| 4:2:2  4K                | 20.41 ms | 68.89 ms | 3.38× |
-| 4:4:4  4K                | 30.33 ms | 69.05 ms | 2.28× |
+| 4:2:0  1592×1124         |  3.06 ms | 15.58 ms | 5.10× |
+| 4:2:0  1080p             |  3.49 ms | 17.72 ms | 5.08× |
+| 4:2:0  4K                | 13.41 ms | 67.61 ms | 5.04× |
+| 4:2:2  4K                | 17.38 ms | 67.77 ms | 3.90× |
+| 4:4:4  4K                | 24.56 ms | 67.67 ms | 2.76× |
 
 **Intel Xeon (Cascade Lake, AVX2)**
 
 | Subsampling / resolution | jpeg-rusturbo | image     | ratio |
 | ------------------------ | ------------: | --------: | ----: |
-| 4:2:0  1592×1124         |  14.27 ms |  76.90 ms | 5.39× |
-| 4:2:0  1080p             |  16.19 ms |  88.62 ms | 5.48× |
-| 4:2:0  4K                |  63.40 ms | 352.09 ms | 5.55× |
-| 4:2:2  4K                |  81.62 ms | 352.08 ms | 4.31× |
-| 4:4:4  4K                | 144.91 ms | 352.08 ms | 2.43× |
+| 4:2:0  1592×1124         |  12.73 ms |  70.04 ms | 5.50× |
+| 4:2:0  1080p             |  14.57 ms |  80.75 ms | 5.54× |
+| 4:2:0  4K                |  57.27 ms | 320.93 ms | 5.60× |
+| 4:2:2  4K                |  75.01 ms | 320.91 ms | 4.28× |
+| 4:4:4  4K                | 100.19 ms | 321.26 ms | 3.21× |
 
-We lead `image`'s encoder by **4.4–4.6×** on Apple M and **5.4–5.6×** on
-Cascade Lake at 4:2:0. The Cascade ratio is higher because `image`'s
-scalar encoder is much slower on that CPU (see the cross-host note up
-top), and because 0.8.0's AVX2 3-byte RGB→YCbCr kernel removed the
-scalar-color fallback that previously capped the x86 RGB-input ratio at
-~3.7×.
+Single-thread, we lead `image`'s encoder by **~5×** on Apple M and
+**5.5–5.6×** on Cascade Lake at 4:2:0.
+
+### threads=auto
+
+**Apple M-series (NEON)**
+
+| Subsampling / resolution | jpeg-rusturbo | image    | ratio |
+| ------------------------ | ------------: | -------: | ----: |
+| 4:2:0  1592×1124         |  1.76 ms | 15.98 ms |  9.10× |
+| 4:2:0  1080p             |  1.89 ms | 17.91 ms |  9.49× |
+| 4:2:0  4K                |  6.83 ms | 68.47 ms | 10.02× |
+| 4:2:2  4K                |  9.99 ms | 68.82 ms |  6.89× |
+| 4:4:4  4K                | 14.13 ms | 68.49 ms |  4.85× |
+
+**Intel Xeon (Cascade Lake, AVX2)**
+
+| Subsampling / resolution | jpeg-rusturbo | image     | ratio |
+| ------------------------ | ------------: | --------: | ----: |
+| 4:2:0  1592×1124         |  10.28 ms |  70.03 ms | 6.81× |
+| 4:2:0  1080p             |  12.29 ms |  80.75 ms | 6.57× |
+| 4:2:0  4K                |  46.77 ms | 320.95 ms | 6.86× |
+| 4:2:2  4K                |  61.73 ms | 321.28 ms | 5.20× |
+| 4:4:4  4K                |  85.10 ms | 320.83 ms | 3.77× |
+
+With `threads=auto`, the practical 4:2:0 lead rises to **9–10×** on
+Apple M and **6.6–6.9×** on Cascade Lake. The Cascade ratio is higher
+than its single-thread ratio but does not jump as far as Apple because
+this 4-vCPU host already saturates early in the thread-scaling table.
+The x86 RGB front half now has batched hot paths for all three
+RGB-family subsampling modes, which is why 4:4:4 no longer falls back to
+the old scalar-color shape.
 
 ## Decode (JPEG → RGB, our encoder's q=80 4:2:0 output)
 
@@ -284,16 +320,22 @@ headline. The encoder is.
 
 # Where the time goes
 
-A rough per-stage breakdown for 4K 4:2:0 q=80 (estimated from
-`cargo flamegraph`, not committed to the repo):
+A rough hot-path breakdown for single-thread 4K 4:2:0 q=80 encode. The
+current sample was taken on Apple M with a tight 45-second loop around
+`encode_rgba` and `sample` at 1 ms intervals. `cargo flamegraph` could
+not run on this machine because macOS `xctrace` requires full Xcode, so
+the numbers below are top-of-stack sample buckets rather than a committed
+SVG flamegraph. LTO inlines the DCT / quantize front half heavily, so
+that work appears in the residual inlined bucket rather than as separate
+symbols.
 
 ```
 Encode side:
-  Color / downsample    ~25%   NEON ~3.0× / AVX2 ~3.0× / scalar 1.0×
-  Forward DCT           ~20%   NEON ~2.5× / AVX2 ~2.7× / scalar 1.0×
-  Quantize + zig-zag    ~10%   NEON ~1.8× / AVX2 ~2.5× / scalar 1.0×
-  Huffman (64-bit acc + bitmap)  ~30%   NEON/SSE2 bitmap ~1.4×
-  Marker writes / IO    ~15%   scalar in both
+  Huffman encode_block       ~65%  scalar entropy emit + SIMD nonzero bitmap
+  Color / downsample         ~22%  extract_mcu_420 + NEON rgb_row_to_ycc
+  Inlined DCT / quantize /
+    zig-zag / MCU plumbing   ~12%  mostly inlined by LTO into caller
+  Flush / marker / memcpy    < 1%  not a meaningful share in this sample
 
 Decode side (per-stage SIMD landed in the 0.6.0 / 0.7.x decoder cycles):
   Entropy decode        ~35%   combined AC/DC LUT + SWAR 32-bit refill
@@ -308,9 +350,12 @@ Decode side (per-stage SIMD landed in the 0.6.0 / 0.7.x decoder cycles):
   Marker walk / IO      ~5%    scalar in both
 ```
 
-Per-stage SIMD bodies hit close to expected speedups; whole-pipeline
-numbers are Amdahl-bound on the partly-scalar entropy emit/decode and the
-serial marker / IO sections.
+After the 0.9.x encoder front-half work, whole-pipeline encode is now
+mostly Amdahl-bound on the scalar entropy emitter. The SIMD color / DCT /
+quantize bodies still matter, but further front-half wins have less room
+to move the 4:2:0 single-thread needle unless they also reduce the number
+or cost of entropy-coded coefficients. Decode remains bounded by its
+scalar entropy walk plus the per-stage SIMD kernels described above.
 
 # Out of scope
 
@@ -324,9 +369,9 @@ cycle.
   64-byte table-lookup) zig-zag scatter; AVX2 has no equivalent — the
   reorder needs clunky cross-128-bit-lane word permutes, while the x86
   scalar zig-zag is already cheap (it stays hot in L1 / the store
-  buffer). Low-to-no expected gain; left scalar on x86. (This is the one
-  0.8.0 hot-path item that is NEON-only, and why the x86 encode
-  SIMD-vs-scalar ratio trails NEON's slightly at 4:4:4.)
+  buffer). Low-to-no expected gain; left scalar on x86. The current x86
+  4:4:4 encode gains come from RGB front-half batching rather than
+  zig-zag scatter.
 - **AVX2 `ac_magnitudes` precompute** (encode). Ported and bit-exact,
   but measured a *wash* (≤~1.5%, within run-to-run noise) on a Broadwell
   Xeon. AVX2 lacks per-16-bit-lane CLZ and 16-bit variable shift

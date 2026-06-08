@@ -42,12 +42,12 @@ This crate exists because a real workload needed a **fast JPEG
 encoder in pure Rust** — `image`'s bundled encoder is solid but
 purely scalar and 4:2:0-only, which leaves throughput on the table
 for pipelines that emit a lot of JPEGs. The SIMD encoder here
-lifts whole-pipeline throughput roughly **4.5× on Apple Silicon**
-and **5.5× on Intel Cascade Lake** versus `image`'s encoder at
-4:2:0 (was 2.9× / 3.3× in 0.7.5; the 0.8.0 encoder hot-path pass —
-four NEON items plus a new AVX2 3-byte RGB→YCbCr kernel — pushes
-both well past 4×, the Intel figure further because `image`'s
-scalar encoder is slower on that CPU). It supports
+lifts whole-pipeline throughput roughly **9–10× on Apple Silicon**
+and **6.6–6.9× on Intel Cascade Lake** versus `image`'s encoder at
+4:2:0 with `threads=auto` (single-thread remains ~5× / ~5.6×). The
+0.8.0 encoder hot-path pass and the 0.9.x RGB front-half work push the
+single-thread path well past 4×, and MCU-row threading adds the practical
+throughput win on multi-core hosts. It supports
 4:4:4 / 4:2:2 / 4:2:0, **progressive (SOF2) output**
 alongside baseline, **single-byte grayscale and 4-byte CMYK
 pass-through** alongside the eight RGB-family pixel formats,
@@ -80,11 +80,13 @@ coverage, not new decode SIMD.
 ## Performance
 
 50-iteration single-batch timings from `benches/pipeline.rs` and
-`benches/vs_image.rs`, q=80, 4:2:0. Two hosts: Apple M-series
-(NEON) and Intel Xeon Platinum 8272CL (Cascade Lake, AVX2). Full
-per-section breakdown in [BENCH.md](BENCH.md).
+`benches/vs_image.rs`, q=80. Two hosts: Apple M-series (NEON) and Intel
+Xeon Platinum 8272CL (Cascade Lake, AVX2). Encode-side numbers were
+refreshed on 2026-06-08 after the 0.9.x encoder hot-path work; decode
+numbers are retained because the decoder was not changed in this cycle.
+Full per-section breakdown in [BENCH.md](BENCH.md).
 
-### vs `image` crate — encode (RGB → JPEG, single thread)
+### vs `image` crate — encode (RGB → JPEG)
 
 `image`'s encoder is scalar end to end and 4:2:0-only; jpeg-rusturbo
 runs SIMD across the whole encode front end — color convert, forward
@@ -92,35 +94,42 @@ DCT, quantize + zig-zag, chroma downsample — plus a SIMD nonzero-bitmap
 Huffman path. Both encoders are fed identical 3-byte RGB and timed on
 the same harness (`benches/vs_image.rs`). That structural
 difference — vectorized pipeline vs scalar — is the gap below.
+`image` only emits 4:2:0, so the 4:2:0 rows are the apples-to-apples
+comparison; 4K 4:2:2 / 4:4:4 rows are reference rows with denser chroma.
+Both `threads=1` and `threads=auto` are shown; the headline throughput
+claim uses `threads=auto`.
 
 **Apple M-series (NEON)**
 
-| Resolution (4:2:0)          | jpeg-rusturbo | image    | ratio |
-| --------------------------- | ------------: | -------: | ----: |
-| 1592 × 1124 (session size)  |       3.50 ms | 15.79 ms | 4.51× |
-| 1920 × 1080 (1080p)         |       3.94 ms | 17.92 ms | 4.55× |
-| 3840 × 2160 (4K)            |      15.64 ms | 69.07 ms | 4.42× |
+| Threads | Subsampling / resolution   | jpeg-rusturbo | image    | ratio |
+| ------- | -------------------------- | ------------: | -------: | ----: |
+| t=1     | 4:2:0  1592 × 1124         |       3.06 ms | 15.58 ms | 5.10× |
+| t=1     | 4:2:0  1920 × 1080         |       3.49 ms | 17.72 ms | 5.08× |
+| t=1     | 4:2:0  3840 × 2160         |      13.41 ms | 67.61 ms | 5.04× |
+| auto    | 4:2:0  1592 × 1124         |       1.76 ms | 15.98 ms | 9.10× |
+| auto    | 4:2:0  1920 × 1080         |       1.89 ms | 17.91 ms | 9.49× |
+| auto    | 4:2:0  3840 × 2160         |       6.83 ms | 68.47 ms | 10.02× |
+| auto    | 4:2:2  3840 × 2160         |       9.99 ms | 68.82 ms | 6.89× |
+| auto    | 4:4:4  3840 × 2160         |      14.13 ms | 68.49 ms | 4.85× |
 
 **Intel Xeon (Cascade Lake, AVX2)**
 
-| Resolution (4:2:0)          | jpeg-rusturbo | image     | ratio |
-| --------------------------- | ------------: | --------: | ----: |
-| 1592 × 1124 (session size)  |      14.27 ms |  76.90 ms | 5.39× |
-| 1920 × 1080 (1080p)         |      16.19 ms |  88.62 ms | 5.48× |
-| 3840 × 2160 (4K)            |      63.40 ms | 352.09 ms | 5.55× |
+| Threads | Subsampling / resolution   | jpeg-rusturbo | image     | ratio |
+| ------- | -------------------------- | ------------: | --------: | ----: |
+| t=1     | 4:2:0  1592 × 1124         |      12.73 ms |  70.04 ms | 5.50× |
+| t=1     | 4:2:0  1920 × 1080         |      14.57 ms |  80.75 ms | 5.54× |
+| t=1     | 4:2:0  3840 × 2160         |      57.27 ms | 320.93 ms | 5.60× |
+| auto    | 4:2:0  1592 × 1124         |      10.28 ms |  70.03 ms | 6.81× |
+| auto    | 4:2:0  1920 × 1080         |      12.29 ms |  80.75 ms | 6.57× |
+| auto    | 4:2:0  3840 × 2160         |      46.77 ms | 320.95 ms | 6.86× |
+| auto    | 4:2:2  3840 × 2160         |      61.73 ms | 321.28 ms | 5.20× |
+| auto    | 4:4:4  3840 × 2160         |      85.10 ms | 320.83 ms | 3.77× |
 
-The lead is **4.4–4.6× on Apple M** and **5.4–5.6× on Cascade Lake**,
-and — unlike decode — it holds roughly flat across resolution: encode
-is per-pixel SIMD work end to end, with no per-call fixed-cost cliff at
-smaller sizes. The gap widened from 0.7.5's 2.9× / 3.3× through the
-0.8.0 hot-path pass: four NEON items, two of which (`drain_high32`, the
-AC code+magnitude `write_bits` fusion) also help AVX2, plus a new AVX2
-3-byte RGB→YCbCr kernel that brought RGB-input encode onto the AVX2
-color path — Cascade Lake 4K 4:2:0 dropped 95.8 → 63.4 ms, lifting its
-ratio from ~3.3× to ~5.5×. The Cascade figure runs higher than Apple's
-mainly because `image`'s scalar encoder is slower on that CPU; read
-each ratio as "vs `image` on this host." Per-item breakdown in
-[BENCH.md](BENCH.md).
+The single-thread lead is **~5× on Apple M** and **~5.5–5.6× on Cascade
+Lake** at 4:2:0; `threads=auto` lifts that to **9–10×** and **6.6–6.9×**
+respectively. The Cascade figure runs higher than Apple's mainly because
+`image`'s scalar encoder is slower on that CPU; read each ratio as "vs
+`image` on this host." Per-item breakdown in [BENCH.md](BENCH.md).
 
 ### vs `image` crate — decode (JPEG → RGB)
 
@@ -187,15 +196,15 @@ counts.
 
 | Resolution | threads=1 | threads=auto | auto vs t=1 |
 | ---------- | --------: | -----------: | ----------: |
-| 1080p      |   3.90 ms |      1.90 ms |       2.05× |
-| 4K         |  16.14 ms |      6.85 ms |       2.36× |
+| 1080p      |   3.98 ms |      2.09 ms |       1.90× |
+| 4K         |  16.34 ms |      7.35 ms |       2.22× |
 
 **Intel Xeon (Cascade Lake, 4 vCPU)**
 
 | Resolution | threads=1 | threads=auto | auto vs t=1 |
 | ---------- | --------: | -----------: | ----------: |
-| 1080p      |  16.69 ms |     13.71 ms |       1.22× |
-| 4K         |  66.23 ms |     53.60 ms |       1.24× |
+| 1080p      |  16.20 ms |     15.31 ms |       1.06× |
+| 4K         |  64.88 ms |     53.29 ms |       1.22× |
 
 `set_optimize_huffman(true)` enables a per-image two-pass Huffman
 build (T.81 K.2/K.3). Typical size reduction ~5% across
@@ -209,7 +218,7 @@ pass is faster). Opt-in for when bandwidth matters more than CPU.
 ```toml
 # Cargo.toml
 [dependencies]
-jpeg-rusturbo = "0.8"
+jpeg-rusturbo = "0.9"
 ```
 
 ### Encode
@@ -469,17 +478,20 @@ progressive Huffman JPEGs that conform to ITU-T T.81 (verified against
 `image`'s decoder on a vendored fixture corpus). Public API has
 settled but `0.x` reserves the right to evolve before `1.0`.
 
-The current release, **0.9.0**, is the coverage cycle on top of 0.8.0's
-encoder hot-path pass: optimized-Huffman composes with progressive
+The current release, **0.9.1**, is a patch release on top of the 0.9.0
+coverage cycle. 0.9.0 added optimized-Huffman progressive
 (EOBn run-packing + per-scan custom tables collapse the size cost the
 standard-tables SOF2 path normally carries vs baseline SOF0), grayscale
-encode and CMYK encode + decode land as first-class pixel formats
+encode and CMYK encode + decode as first-class pixel formats
 (`PixelFormat::Gray` / `PixelFormat::Cmyk`), and decode-side
-`Decoder::exif()` / `icc_profile()` accessors close the
+`Decoder::exif()` / `icc_profile()` accessors that close the
 decode → operate → re-encode loop with the 0.8.0 encoder-side
-`set_exif` / `set_icc_profile`. No perf regression — the 4.5× / 5.5× vs
-`image` at 4:2:0 from 0.8.0 carries forward unchanged for the existing
-RGB-family layouts; default behaviour is byte-identical to 0.8.0. The
+`set_exif` / `set_icc_profile`. 0.9.1 closes input-validation gaps
+without kernel changes. No perf regression — the current benchmark
+refresh shows 9–10× on Apple M and 6.6–6.9× on Cascade Lake versus
+`image` at 4:2:0 with `threads=auto` (single-thread remains ~5× /
+~5.6×) for the existing RGB-family layouts; default behaviour is
+byte-identical to 0.8.0 for inputs accepted by 0.8.0. The
 0.6.0 / 0.7.x cycles before that built out the decoder SIMD path. Full
 per-release history is in [CHANGELOG.md](CHANGELOG.md).
 
