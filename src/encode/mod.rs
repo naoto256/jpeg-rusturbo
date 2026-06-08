@@ -1398,7 +1398,6 @@ impl SamplingScheme for Yuv444Scheme {
             y_blocks.push(blocks[0]);
             cb_blocks.push(blocks[1]);
             cr_blocks.push(blocks[2]);
-            return;
         }
 
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -1451,7 +1450,7 @@ impl SamplingScheme for Yuv444Scheme {
             prev_dc.y = encode_block(bw, &blocks[0], prev_dc.y, dc_luma, ac_luma)?;
             prev_dc.cb = encode_block(bw, &blocks[1], prev_dc.cb, dc_chroma, ac_chroma)?;
             prev_dc.cr = encode_block(bw, &blocks[2], prev_dc.cr, dc_chroma, ac_chroma)?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -1507,7 +1506,6 @@ impl SamplingScheme for Yuv444Scheme {
             quantize_mcu_444_rgb(
                 pixels, width, height, layout, mx, my, div_luma, div_chroma, out,
             );
-            return;
         }
 
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -1908,6 +1906,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantize_mcu_420_rgb(
     pixels: &[u8],
     width: u32,
@@ -2365,6 +2364,7 @@ fn quantize_block(block: &mut [i16; 64], div: &Divisors) -> [i16; 64] {
     quant::quantize_and_zigzag(block, div)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantize_one_mcu_420_rgb(
     pixels: &[u8],
     width: u32,
