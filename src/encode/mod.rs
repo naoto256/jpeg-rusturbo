@@ -1830,6 +1830,25 @@ fn dispatch_scan<W: Write>(
         ));
     }
 
+    #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+    if matches!(subsampling, ChromaSubsampling::Yuv444) && layout == RGB {
+        let mcus_x = width.div_ceil(Yuv444Scheme::MCU_W);
+        let rows = run_on_pool(threads, || {
+            parallel_quantize_rows_444_rgb_pair(pixels, width, height, div_luma, div_chroma)
+        })?;
+
+        return serial_emit_rows::<Yuv444Scheme, _>(
+            &rows,
+            mcus_x,
+            bw,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        );
+    }
+
     // Front half on the chosen pool, back half always on the caller's
     // thread. This keeps the parallel work pool-scoped without forcing
     // `W: Send` on the bit writer.
@@ -2225,6 +2244,63 @@ fn parallel_quantize_rows<S: SamplingScheme>(
                     pixels, width, height, layout, mx, my, div_luma, div_chroma, slot,
                 );
             }
+            row
+        })
+        .collect()
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+fn parallel_quantize_rows_444_rgb_pair(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+) -> Vec<Vec<[i16; 64]>> {
+    let mcus_x = width.div_ceil(Yuv444Scheme::MCU_W);
+    let mcus_y = height.div_ceil(Yuv444Scheme::MCU_H);
+    let blocks_per_mcu = Yuv444Scheme::BLOCKS_PER_MCU;
+    let blocks_per_row = (mcus_x as usize) * blocks_per_mcu;
+
+    (0..mcus_y)
+        .into_par_iter()
+        .map(|my| {
+            let mut row: Vec<[i16; 64]> = vec![[0i16; 64]; blocks_per_row];
+            let y0 = my * Yuv444Scheme::MCU_H;
+            let mut mx = 0;
+            while mx + 1 < mcus_x {
+                let x0 = mx * Yuv444Scheme::MCU_W;
+                let start = (mx as usize) * blocks_per_mcu;
+                let slot = &mut row[start..start + blocks_per_mcu * 2];
+                if x0 + Yuv444Scheme::MCU_W * 2 <= width && y0 + Yuv444Scheme::MCU_H <= height {
+                    arch::backend::encode::quantize_mcu_444_rgb_pair_full(
+                        pixels, width, x0, y0, div_luma, div_chroma, slot,
+                    );
+                    mx += 2;
+                } else {
+                    Yuv444Scheme::quantize_one_mcu(
+                        pixels,
+                        width,
+                        height,
+                        RGB,
+                        mx,
+                        my,
+                        div_luma,
+                        div_chroma,
+                        &mut slot[..3],
+                    );
+                    mx += 1;
+                }
+            }
+
+            if mx < mcus_x {
+                let start = (mx as usize) * blocks_per_mcu;
+                let slot = &mut row[start..start + blocks_per_mcu];
+                Yuv444Scheme::quantize_one_mcu(
+                    pixels, width, height, RGB, mx, my, div_luma, div_chroma, slot,
+                );
+            }
+
             row
         })
         .collect()
