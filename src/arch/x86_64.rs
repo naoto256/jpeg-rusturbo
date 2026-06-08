@@ -130,6 +130,45 @@ pub mod encode {
         );
     }
 
+    /// Full-MCU pair RGB 4:4:4 front-half hook for x86_64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_444_rgb_pair_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        if std::arch::is_x86_feature_detected!("avx2") && x0 + 16 <= width {
+            unsafe {
+                return quantize_mcu_444_rgb_pair_full_avx2(
+                    pixels, width, x0, y0, div_luma, div_chroma, out,
+                );
+            }
+        }
+
+        crate::arch::scalar::encode::quantize_mcu_444_rgb_full(
+            pixels,
+            width,
+            x0,
+            y0,
+            div_luma,
+            div_chroma,
+            &mut out[..3],
+        );
+        crate::arch::scalar::encode::quantize_mcu_444_rgb_full(
+            pixels,
+            width,
+            x0 + 8,
+            y0,
+            div_luma,
+            div_chroma,
+            &mut out[3..6],
+        );
+    }
+
     /// Full-MCU RGB 4:2:0 front-half hook for x86_64.
     ///
     /// This keeps the higher-level encode pipeline shape identical to
@@ -221,6 +260,61 @@ pub mod encode {
             fdct_quantize_zigzag::<true>(&mut out[0], div_luma);
             fdct_quantize_zigzag::<true>(&mut out[1], div_chroma);
             fdct_quantize_zigzag::<true>(&mut out[2], div_chroma);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_mcu_444_rgb_pair_full_avx2(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            debug_assert!(x0 + 16 <= width);
+            debug_assert!(out.len() >= 6);
+
+            let stride = width as usize * RGB.bpp;
+            let level_shift = _mm256_set1_epi16(128);
+            for j in 0..8usize {
+                let row = (y0 as usize + j) * stride + x0 as usize * RGB.bpp;
+                let (cb, cr) = super::color::rgb24_16_avx2_to_luma_chroma_vectors(
+                    pixels.as_ptr().add(row),
+                    RGB,
+                    out[0].as_mut_ptr().add(j * 8),
+                    out[3].as_mut_ptr().add(j * 8),
+                );
+                let cb = _mm256_sub_epi16(cb, level_shift);
+                let cr = _mm256_sub_epi16(cr, level_shift);
+
+                _mm_storeu_si128(
+                    out[1].as_mut_ptr().add(j * 8) as *mut __m128i,
+                    _mm256_castsi256_si128(cb),
+                );
+                _mm_storeu_si128(
+                    out[2].as_mut_ptr().add(j * 8) as *mut __m128i,
+                    _mm256_castsi256_si128(cr),
+                );
+                _mm_storeu_si128(
+                    out[4].as_mut_ptr().add(j * 8) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(cb),
+                );
+                _mm_storeu_si128(
+                    out[5].as_mut_ptr().add(j * 8) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(cr),
+                );
+            }
+
+            fdct_quantize_zigzag::<true>(&mut out[0], div_luma);
+            fdct_quantize_zigzag::<true>(&mut out[1], div_chroma);
+            fdct_quantize_zigzag::<true>(&mut out[2], div_chroma);
+            fdct_quantize_zigzag::<true>(&mut out[3], div_luma);
+            fdct_quantize_zigzag::<true>(&mut out[4], div_chroma);
+            fdct_quantize_zigzag::<true>(&mut out[5], div_chroma);
         }
     }
 
