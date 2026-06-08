@@ -102,6 +102,8 @@ pub mod huffman {
 // encode: x86_64 full-MCU encoder front-half hooks.
 // ===========================================================================
 pub mod encode {
+    use core::arch::x86_64::*;
+
     use crate::color::RGB;
     use crate::tables::Divisors;
 
@@ -144,9 +146,94 @@ pub mod encode {
         out: &mut [[i16; 64]],
     ) {
         unsafe {
-            quantize_mcu_420_rgb_full_inner::<true>(
-                pixels, width, x0, y0, div_luma, div_chroma, out,
-            );
+            quantize_mcu_420_rgb_full_avx2_fused(pixels, width, x0, y0, div_luma, div_chroma, out);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quantize_mcu_420_rgb_full_avx2_fused(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            debug_assert!(x0 + 16 <= width);
+            debug_assert!(out.len() >= 6);
+
+            let stride = width as usize * RGB.bpp;
+            let mut cb_blk = [0i16; 64];
+            let mut cr_blk = [0i16; 64];
+
+            for pair in 0..8usize {
+                let j0 = pair * 2;
+                let j1 = j0 + 1;
+
+                let row0 = (y0 as usize + j0) * stride + x0 as usize * RGB.bpp;
+                let row1 = (y0 as usize + j1) * stride + x0 as usize * RGB.bpp;
+
+                let block_row0 = j0 & 7;
+                let block_row1 = j1 & 7;
+                let top0 = j0 < 8;
+                let top1 = j1 < 8;
+
+                let left0 = if top0 { 0 } else { 2 };
+                let left1 = if top1 { 0 } else { 2 };
+
+                let (cb0, cr0) = super::color::rgb24_16_avx2_to_luma_chroma_vectors(
+                    pixels.as_ptr().add(row0),
+                    RGB,
+                    (*out.as_mut_ptr().add(left0))
+                        .as_mut_ptr()
+                        .add(block_row0 * 8),
+                    (*out.as_mut_ptr().add(left0 + 1))
+                        .as_mut_ptr()
+                        .add(block_row0 * 8),
+                );
+                let (cb1, cr1) = super::color::rgb24_16_avx2_to_luma_chroma_vectors(
+                    pixels.as_ptr().add(row1),
+                    RGB,
+                    (*out.as_mut_ptr().add(left1))
+                        .as_mut_ptr()
+                        .add(block_row1 * 8),
+                    (*out.as_mut_ptr().add(left1 + 1))
+                        .as_mut_ptr()
+                        .add(block_row1 * 8),
+                );
+
+                downsample_chroma_pair(cb0, cb1, cb_blk.as_mut_ptr().add(pair * 8));
+                downsample_chroma_pair(cr0, cr1, cr_blk.as_mut_ptr().add(pair * 8));
+            }
+
+            for block in &mut out[..4] {
+                fdct_quantize_zigzag::<true>(block, div_luma);
+            }
+            fdct_quantize_zigzag_into::<true>(&mut cb_blk, div_chroma, &mut out[4]);
+            fdct_quantize_zigzag_into::<true>(&mut cr_blk, div_chroma, &mut out[5]);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn downsample_chroma_pair(row0: __m256i, row1: __m256i, dst: *mut i16) {
+        unsafe {
+            let ones = _mm256_set1_epi16(1);
+            let bias = _mm256_setr_epi32(1, 2, 1, 2, 1, 2, 1, 2);
+            let level_shift = _mm256_set1_epi32(128);
+
+            let pairs0 = _mm256_madd_epi16(row0, ones);
+            let pairs1 = _mm256_madd_epi16(row1, ones);
+            let avg =
+                _mm256_srli_epi32::<2>(_mm256_add_epi32(_mm256_add_epi32(pairs0, pairs1), bias));
+            let signed = _mm256_sub_epi32(avg, level_shift);
+
+            let packed = _mm256_packs_epi32(signed, signed);
+            let lo = _mm256_castsi256_si128(packed);
+            let hi = _mm256_extracti128_si256::<1>(packed);
+            let row = _mm_unpacklo_epi64(lo, hi);
+            _mm_storeu_si128(dst as *mut __m128i, row);
         }
     }
 
@@ -811,6 +898,48 @@ pub mod color {
             ycc_from_rgb16_to_luma_blocks(r_u16, g_u16, b_u16, y_left, y_right, cb, cr);
 
             _mm256_zeroupper();
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn rgb24_16_avx2_to_luma_chroma_vectors(
+        pixels: *const u8,
+        layout: PixelLayout,
+        y_left: *mut i16,
+        y_right: *mut i16,
+    ) -> (__m256i, __m256i) {
+        unsafe {
+            #[rustfmt::skip]
+            let m_a = _mm_setr_epi8(
+                0, 1, 2, -128, 3, 4, 5, -128,
+                6, 7, 8, -128, 9, 10, 11, -128,
+            );
+            #[rustfmt::skip]
+            let m_b = _mm_setr_epi8(
+                4, 5, 6, -128, 7, 8, 9, -128,
+                10, 11, 12, -128, 13, 14, 15, -128,
+            );
+
+            let lo0 = _mm_loadu_si128(pixels as *const __m128i);
+            let hi0 = _mm_loadu_si128(pixels.add(12) as *const __m128i);
+            let v0 = _mm256_set_m128i(hi0, lo0);
+            let p0 = _mm256_shuffle_epi8(v0, _mm256_set_m128i(m_a, m_a));
+
+            let lo1 = _mm_loadu_si128(pixels.add(24) as *const __m128i);
+            let hi1 = _mm_loadu_si128(pixels.add(32) as *const __m128i);
+            let v1 = _mm256_set_m128i(hi1, lo1);
+            let p1 = _mm256_shuffle_epi8(v1, _mm256_set_m128i(m_b, m_a));
+
+            let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
+            let (y_u16, cb_u16, cr_u16) = compute_ycc_from_rgb16(r_u16, g_u16, b_u16);
+            let y_signed = _mm256_sub_epi16(y_u16, _mm256_set1_epi16(128));
+            _mm_storeu_si128(y_left as *mut __m128i, _mm256_castsi256_si128(y_signed));
+            _mm_storeu_si128(
+                y_right as *mut __m128i,
+                _mm256_extracti128_si256::<1>(y_signed),
+            );
+
+            (cb_u16, cr_u16)
         }
     }
 
