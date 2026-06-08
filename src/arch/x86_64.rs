@@ -176,15 +176,23 @@ pub mod encode {
             let mut cb_full = [0u8; 16 * 8];
             let mut cr_full = [0u8; 16 * 8];
 
-            for j in 0..8usize {
-                let row = (y0 as usize + j) * stride + x0 as usize * RGB.bpp;
-                super::color::rgb24_16_avx2_to_luma_blocks(
-                    pixels.as_ptr().add(row),
+            for pair in 0..4usize {
+                let j0 = pair * 2;
+                let j1 = j0 + 1;
+                let row0 = (y0 as usize + j0) * stride + x0 as usize * RGB.bpp;
+                let row1 = (y0 as usize + j1) * stride + x0 as usize * RGB.bpp;
+                super::color::rgb24_16_pair_avx2_to_luma_blocks(
+                    pixels.as_ptr().add(row0),
+                    pixels.as_ptr().add(row1),
                     RGB,
-                    (*out.as_mut_ptr()).as_mut_ptr().add(j * 8),
-                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j * 8),
-                    cb_full[j * 16..].as_mut_ptr(),
-                    cr_full[j * 16..].as_mut_ptr(),
+                    (*out.as_mut_ptr()).as_mut_ptr().add(j0 * 8),
+                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j0 * 8),
+                    (*out.as_mut_ptr()).as_mut_ptr().add(j1 * 8),
+                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j1 * 8),
+                    cb_full[j0 * 16..].as_mut_ptr(),
+                    cr_full[j0 * 16..].as_mut_ptr(),
+                    cb_full[j1 * 16..].as_mut_ptr(),
+                    cr_full[j1 * 16..].as_mut_ptr(),
                 );
             }
 
@@ -966,6 +974,36 @@ pub mod color {
 
             let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
             ycc_from_rgb16_to_luma_blocks(r_u16, g_u16, b_u16, y_left, y_right, cb, cr);
+
+            _mm256_zeroupper();
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn rgb24_16_pair_avx2_to_luma_blocks(
+        pixels0: *const u8,
+        pixels1: *const u8,
+        layout: PixelLayout,
+        y0_left: *mut i16,
+        y0_right: *mut i16,
+        y1_left: *mut i16,
+        y1_right: *mut i16,
+        cb0: *mut u8,
+        cr0: *mut u8,
+        cb1: *mut u8,
+        cr1: *mut u8,
+    ) {
+        unsafe {
+            let (cb0_u16, cr0_u16) =
+                rgb24_16_avx2_to_luma_chroma_vectors(pixels0, layout, y0_left, y0_right);
+            let (cb1_u16, cr1_u16) =
+                rgb24_16_avx2_to_luma_chroma_vectors(pixels1, layout, y1_left, y1_right);
+
+            pack_and_store_u16x16(cb0_u16, cb0);
+            pack_and_store_u16x16(cr0_u16, cr0);
+            pack_and_store_u16x16(cb1_u16, cb1);
+            pack_and_store_u16x16(cr1_u16, cr1);
 
             _mm256_zeroupper();
         }
