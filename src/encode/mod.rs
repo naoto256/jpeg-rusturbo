@@ -1813,6 +1813,23 @@ fn dispatch_scan<W: Write>(
         );
     }
 
+    #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+    if threads == 1 && matches!(subsampling, ChromaSubsampling::Yuv444) && layout == RGB {
+        return encode_scan_444_rgb_pair(
+            pixels,
+            width,
+            height,
+            bw,
+            div_luma,
+            div_chroma,
+            dc_luma,
+            ac_luma,
+            dc_chroma,
+            ac_chroma,
+            restart_interval,
+        );
+    }
+
     if threads == 1 {
         return dispatch_scheme!(subsampling, S => encode_scan::<S, _>(
             pixels,
@@ -2137,6 +2154,192 @@ fn encode_scan<S: SamplingScheme, W: Write>(
             mcu_count += 1;
         }
     }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+#[allow(clippy::too_many_arguments)]
+fn encode_scan_444_rgb_pair<W: Write>(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    bw: &mut BitWriter<W>,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+    restart_interval: u16,
+) -> io::Result<()> {
+    let mcus_x = width.div_ceil(Yuv444Scheme::MCU_W);
+    let mcus_y = height.div_ceil(Yuv444Scheme::MCU_H);
+    let mut prev_dc = DcPredictors::default();
+    let restart_interval = restart_interval as u32;
+    let mut mcus_since_rst: u32 = 0;
+    let mut next_rst: u8 = 0;
+    let mut mcu_count: u64 = 0;
+    let total_mcus = mcus_x as u64 * mcus_y as u64;
+
+    for my in 0..mcus_y {
+        let y0 = my * Yuv444Scheme::MCU_H;
+        let mut mx = 0;
+        while mx + 1 < mcus_x {
+            let x0 = mx * Yuv444Scheme::MCU_W;
+            if x0 + Yuv444Scheme::MCU_W * 2 <= width && y0 + Yuv444Scheme::MCU_H <= height {
+                let mut blocks = [[0i16; 64]; 6];
+                arch::backend::encode::quantize_mcu_444_rgb_pair_full(
+                    pixels,
+                    width,
+                    x0,
+                    y0,
+                    div_luma,
+                    div_chroma,
+                    &mut blocks,
+                );
+
+                write_restart_if_needed(
+                    bw,
+                    restart_interval,
+                    &mut mcus_since_rst,
+                    &mut next_rst,
+                    &mut prev_dc,
+                    mcu_count,
+                    total_mcus,
+                )?;
+                emit_444_blocks(
+                    bw,
+                    &blocks[..3],
+                    &mut prev_dc,
+                    dc_luma,
+                    ac_luma,
+                    dc_chroma,
+                    ac_chroma,
+                )?;
+                mcus_since_rst += 1;
+                mcu_count += 1;
+
+                write_restart_if_needed(
+                    bw,
+                    restart_interval,
+                    &mut mcus_since_rst,
+                    &mut next_rst,
+                    &mut prev_dc,
+                    mcu_count,
+                    total_mcus,
+                )?;
+                emit_444_blocks(
+                    bw,
+                    &blocks[3..6],
+                    &mut prev_dc,
+                    dc_luma,
+                    ac_luma,
+                    dc_chroma,
+                    ac_chroma,
+                )?;
+                mcus_since_rst += 1;
+                mcu_count += 1;
+                mx += 2;
+            } else {
+                write_restart_if_needed(
+                    bw,
+                    restart_interval,
+                    &mut mcus_since_rst,
+                    &mut next_rst,
+                    &mut prev_dc,
+                    mcu_count,
+                    total_mcus,
+                )?;
+                Yuv444Scheme::encode_one_mcu(
+                    bw,
+                    pixels,
+                    width,
+                    height,
+                    RGB,
+                    mx,
+                    my,
+                    &mut prev_dc,
+                    div_luma,
+                    div_chroma,
+                    dc_luma,
+                    ac_luma,
+                    dc_chroma,
+                    ac_chroma,
+                )?;
+                mcus_since_rst += 1;
+                mcu_count += 1;
+                mx += 1;
+            }
+        }
+
+        while mx < mcus_x {
+            write_restart_if_needed(
+                bw,
+                restart_interval,
+                &mut mcus_since_rst,
+                &mut next_rst,
+                &mut prev_dc,
+                mcu_count,
+                total_mcus,
+            )?;
+            Yuv444Scheme::encode_one_mcu(
+                bw,
+                pixels,
+                width,
+                height,
+                RGB,
+                mx,
+                my,
+                &mut prev_dc,
+                div_luma,
+                div_chroma,
+                dc_luma,
+                ac_luma,
+                dc_chroma,
+                ac_chroma,
+            )?;
+            mcus_since_rst += 1;
+            mcu_count += 1;
+            mx += 1;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+#[allow(clippy::too_many_arguments)]
+fn write_restart_if_needed<W: Write>(
+    bw: &mut BitWriter<W>,
+    restart_interval: u32,
+    mcus_since_rst: &mut u32,
+    next_rst: &mut u8,
+    prev_dc: &mut DcPredictors,
+    mcu_count: u64,
+    total_mcus: u64,
+) -> io::Result<()> {
+    if restart_interval > 0 && *mcus_since_rst == restart_interval && mcu_count < total_mcus {
+        bw.write_restart(*next_rst)?;
+        *next_rst = (*next_rst + 1) & 7;
+        *mcus_since_rst = 0;
+        *prev_dc = DcPredictors::default();
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+#[allow(clippy::too_many_arguments)]
+fn emit_444_blocks<W: Write>(
+    bw: &mut BitWriter<W>,
+    blocks: &[[i16; 64]],
+    prev_dc: &mut DcPredictors,
+    dc_luma: &HuffmanTable,
+    ac_luma: &HuffmanTable,
+    dc_chroma: &HuffmanTable,
+    ac_chroma: &HuffmanTable,
+) -> io::Result<()> {
+    prev_dc.y = encode_block(bw, &blocks[0], prev_dc.y, dc_luma, ac_luma)?;
+    prev_dc.cb = encode_block(bw, &blocks[1], prev_dc.cb, dc_chroma, ac_chroma)?;
+    prev_dc.cr = encode_block(bw, &blocks[2], prev_dc.cr, dc_chroma, ac_chroma)?;
     Ok(())
 }
 
