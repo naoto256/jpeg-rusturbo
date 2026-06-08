@@ -441,6 +441,7 @@ pub mod color {
     /// - `layout.bpp` must be 3 or 4.
     /// - `target_arch = "aarch64"` guarantees NEON is available.
     #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn rgb_row_16_pair_to_luma_blocks_inner(
         row0: *const u8,
         row1: *const u8,
@@ -481,6 +482,7 @@ pub mod color {
     }
 
     #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn rgb_row_16_to_luma_blocks_with_consts(
         inptr: *const u8,
         layout: PixelLayout,
