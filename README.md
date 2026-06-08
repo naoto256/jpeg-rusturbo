@@ -478,22 +478,22 @@ progressive Huffman JPEGs that conform to ITU-T T.81 (verified against
 `image`'s decoder on a vendored fixture corpus). Public API has
 settled but `0.x` reserves the right to evolve before `1.0`.
 
-The current release, **0.9.1**, is a patch release on top of the 0.9.0
-coverage cycle. 0.9.0 added optimized-Huffman progressive
-(EOBn run-packing + per-scan custom tables collapse the size cost the
-standard-tables SOF2 path normally carries vs baseline SOF0), grayscale
-encode and CMYK encode + decode as first-class pixel formats
-(`PixelFormat::Gray` / `PixelFormat::Cmyk`), and decode-side
-`Decoder::exif()` / `icc_profile()` accessors that close the
-decode → operate → re-encode loop with the 0.8.0 encoder-side
+The current release, **0.9.2**, is an encoder hot-path and benchmark
+refresh on top of the 0.9.x coverage cycle. 0.9.0 added
+optimized-Huffman progressive (EOBn run-packing + per-scan custom
+tables collapse the size cost the standard-tables SOF2 path normally
+carries vs baseline SOF0), grayscale encode and CMYK encode + decode as
+first-class pixel formats (`PixelFormat::Gray` / `PixelFormat::Cmyk`),
+and decode-side `Decoder::exif()` / `icc_profile()` accessors that close
+the decode → operate → re-encode loop with the 0.8.0 encoder-side
 `set_exif` / `set_icc_profile`. 0.9.1 closes input-validation gaps
-without kernel changes. No perf regression — the current benchmark
-refresh shows 9–10× on Apple M and 6.6–6.9× on Cascade Lake versus
-`image` at 4:2:0 with `threads=auto` (single-thread remains ~5× /
-~5.6×) for the existing RGB-family layouts; default behaviour is
-byte-identical to 0.8.0 for inputs accepted by 0.8.0. The
-0.6.0 / 0.7.x cycles before that built out the decoder SIMD path. Full
-per-release history is in [CHANGELOG.md](CHANGELOG.md).
+without kernel changes. 0.9.2 tightens RGB-family encode hot paths and
+refreshes benchmark reporting: current figures show 9–10× on Apple M and
+6.6–6.9× on Cascade Lake versus `image` at 4:2:0 with `threads=auto`
+(single-thread remains ~5× / ~5.6×). Default behaviour is byte-identical
+to 0.8.0 for inputs accepted by 0.8.0. The 0.6.0 / 0.7.x cycles before
+that built out the decoder SIMD path. Full per-release history is in
+[CHANGELOG.md](CHANGELOG.md).
 
 Still under consideration for a later release: **trellis quantization**
 (mozjpeg-style RDO per-block search). Vector-SIMD Huffman decode stays

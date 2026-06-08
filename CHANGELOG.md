@@ -9,6 +9,32 @@ do not).
 Performance figures are summarized per release; the reproducible
 breakdown lives in [BENCH.md](BENCH.md).
 
+## [0.9.2] — 2026-06-08
+
+Encoder hot-path and benchmark refresh release. The public API is
+unchanged; output remains byte-identical for the existing RGB-family
+layouts.
+
+### Changed
+
+- **Faster RGB-family encode front half** — tightened 4:2:0 / 4:2:2 /
+  4:4:4 RGB-input encode paths across x86_64 and aarch64. The refresh
+  keeps `threads=1` strong while making `threads=auto` the headline
+  throughput mode for multi-core hosts.
+- **Benchmark reporting now shows both thread modes** —
+  `benches/vs_image.rs` prints `threads=1` and `threads=auto` for the
+  encoder comparison against `image`, and `BENCH.md` / README use the
+  matching figures.
+- **Realtime visual example thread toggle** — `examples/visual_realtime`
+  now lets `T` switch encoder threads between `t=1` and `t=auto`, with
+  the active mode shown in the window title.
+
+### Documentation
+
+- Refreshed encode-side benchmark tables and the hot-path breakdown.
+  Decode numbers are intentionally retained because decoder kernels were
+  not changed in this cycle.
+
 ## [0.9.1] — 2026-06-06
 
 Patch release closing three encoder input-validation gaps surfaced by
@@ -337,6 +363,8 @@ scalar reference.
   project docs (README, CONTRIBUTING, `docs/ARCHITECTURE.md`, NOTICE).
 - Rust 2024 edition with unsafe-block enforcement.
 
+[0.9.2]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.9.2
+[0.9.1]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.9.1
 [0.9.0]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.9.0
 [0.8.0]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.8.0
 [0.7.5]: https://github.com/naoto256/jpeg-rusturbo/releases/tag/v0.7.5
