@@ -1627,20 +1627,22 @@ impl SamplingScheme for Yuv422Scheme {
         cb_blocks: &mut Vec<[i16; 64]>,
         cr_blocks: &mut Vec<[i16; 64]>,
     ) {
-        let mut ys = [[0i16; 64]; 2];
-        let mut cb = [0i16; 64];
-        let mut cr = [0i16; 64];
-        extract_mcu_422_rgb(
-            pixels, width, height, layout, mx, my, &mut ys, &mut cb, &mut cr,
+        let mut blocks = [[0i16; 64]; 4];
+        quantize_mcu_422_rgb(
+            pixels,
+            width,
+            height,
+            layout,
+            mx,
+            my,
+            div_luma,
+            div_chroma,
+            &mut blocks,
         );
-        for y in ys.iter_mut() {
-            arch::backend::dct::fdct_islow(y);
-            y_blocks.push(quant::quantize_and_zigzag(y, div_luma));
-        }
-        arch::backend::dct::fdct_islow(&mut cb);
-        cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
-        arch::backend::dct::fdct_islow(&mut cr);
-        cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+        y_blocks.push(blocks[0]);
+        y_blocks.push(blocks[1]);
+        cb_blocks.push(blocks[2]);
+        cr_blocks.push(blocks[3]);
     }
 
     fn encode_one_mcu<W: Write>(
@@ -1659,39 +1661,23 @@ impl SamplingScheme for Yuv422Scheme {
         dc_chroma: &HuffmanTable,
         ac_chroma: &HuffmanTable,
     ) -> io::Result<()> {
-        let mut y_blocks = [[0i16; 64]; 2];
-        let mut cb_blk = [0i16; 64];
-        let mut cr_blk = [0i16; 64];
-        extract_mcu_422_rgb(
+        let mut blocks = [[0i16; 64]; 4];
+        quantize_mcu_422_rgb(
             pixels,
             width,
             height,
             layout,
             mx,
             my,
-            &mut y_blocks,
-            &mut cb_blk,
-            &mut cr_blk,
+            div_luma,
+            div_chroma,
+            &mut blocks,
         );
-        for blk in y_blocks.iter_mut() {
-            prev_dc.y = encode_one_block(bw, blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+        for blk in &blocks[..2] {
+            prev_dc.y = encode_block(bw, blk, prev_dc.y, dc_luma, ac_luma)?;
         }
-        prev_dc.cb = encode_one_block(
-            bw,
-            &mut cb_blk,
-            div_chroma,
-            prev_dc.cb,
-            dc_chroma,
-            ac_chroma,
-        )?;
-        prev_dc.cr = encode_one_block(
-            bw,
-            &mut cr_blk,
-            div_chroma,
-            prev_dc.cr,
-            dc_chroma,
-            ac_chroma,
-        )?;
+        prev_dc.cb = encode_block(bw, &blocks[2], prev_dc.cb, dc_chroma, ac_chroma)?;
+        prev_dc.cr = encode_block(bw, &blocks[3], prev_dc.cr, dc_chroma, ac_chroma)?;
         Ok(())
     }
 
@@ -1706,25 +1692,9 @@ impl SamplingScheme for Yuv422Scheme {
         div_chroma: &Divisors,
         out: &mut [[i16; 64]],
     ) {
-        let mut y_blocks = [[0i16; 64]; 2];
-        let mut cb_blk = [0i16; 64];
-        let mut cr_blk = [0i16; 64];
-        extract_mcu_422_rgb(
-            pixels,
-            width,
-            height,
-            layout,
-            mx,
-            my,
-            &mut y_blocks,
-            &mut cb_blk,
-            &mut cr_blk,
+        quantize_mcu_422_rgb(
+            pixels, width, height, layout, mx, my, div_luma, div_chroma, out,
         );
-        for (i, blk) in y_blocks.iter_mut().enumerate() {
-            out[i] = quantize_block(blk, div_luma);
-        }
-        out[2] = quantize_block(&mut cb_blk, div_chroma);
-        out[3] = quantize_block(&mut cr_blk, div_chroma);
     }
 }
 
@@ -1881,6 +1851,47 @@ fn quantize_mcu_420_rgb(
         }
         out[4] = quantize_block(&mut cb_blk, div_chroma);
         out[5] = quantize_block(&mut cr_blk, div_chroma);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_mcu_422_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    mx: u32,
+    my: u32,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    out: &mut [[i16; 64]],
+) {
+    let x0 = mx * Yuv422Scheme::MCU_W;
+    let y0 = my * Yuv422Scheme::MCU_H;
+    if layout == RGB && x0 + Yuv422Scheme::MCU_W <= width && y0 + Yuv422Scheme::MCU_H <= height {
+        arch::backend::encode::quantize_mcu_422_rgb_full(
+            pixels, width, x0, y0, div_luma, div_chroma, out,
+        );
+    } else {
+        let mut y_blocks = [[0i16; 64]; 2];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        extract_mcu_422_rgb(
+            pixels,
+            width,
+            height,
+            layout,
+            mx,
+            my,
+            &mut y_blocks,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        for (i, blk) in y_blocks.iter_mut().enumerate() {
+            out[i] = quantize_block(blk, div_luma);
+        }
+        out[2] = quantize_block(&mut cb_blk, div_chroma);
+        out[3] = quantize_block(&mut cr_blk, div_chroma);
     }
 }
 
