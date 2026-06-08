@@ -62,36 +62,45 @@ pub mod encode {
         debug_assert!(out.len() >= 6);
 
         let stride = width as usize * RGB.bpp;
-        let mut y_row = [0u8; 16];
         let mut cb_full = [0u8; 16 * 16];
         let mut cr_full = [0u8; 16 * 16];
 
-        for j in 0..16usize {
-            let row_off = (y0 as usize + j) * stride;
-            let start = row_off + x0 as usize * RGB.bpp;
-            let src = &pixels[start..start + 16 * RGB.bpp];
-            let off = j * 16;
+        for pair in 0..8usize {
+            let j0 = pair * 2;
+            let j1 = j0 + 1;
+
+            let row0 = (y0 as usize + j0) * stride + x0 as usize * RGB.bpp;
+            let row1 = (y0 as usize + j1) * stride + x0 as usize * RGB.bpp;
+
+            let block_row0 = j0 & 7;
+            let block_row1 = j1 & 7;
+            let top0 = j0 < 8;
+            let top1 = j1 < 8;
+
+            let left0 = if top0 { 0 } else { 2 };
+            let left1 = if top1 { 0 } else { 2 };
             unsafe {
-                super::color::rgb_row_16_inner(
-                    src.as_ptr(),
+                super::color::rgb_row_16_pair_to_luma_blocks_inner(
+                    pixels.as_ptr().add(row0),
+                    pixels.as_ptr().add(row1),
                     RGB,
-                    y_row.as_mut_ptr(),
-                    cb_full[off..].as_mut_ptr(),
-                    cr_full[off..].as_mut_ptr(),
+                    (*out.as_mut_ptr().add(left0))
+                        .as_mut_ptr()
+                        .add(block_row0 * 8),
+                    (*out.as_mut_ptr().add(left0 + 1))
+                        .as_mut_ptr()
+                        .add(block_row0 * 8),
+                    (*out.as_mut_ptr().add(left1))
+                        .as_mut_ptr()
+                        .add(block_row1 * 8),
+                    (*out.as_mut_ptr().add(left1 + 1))
+                        .as_mut_ptr()
+                        .add(block_row1 * 8),
+                    cb_full[j0 * 16..].as_mut_ptr(),
+                    cr_full[j0 * 16..].as_mut_ptr(),
+                    cb_full[j1 * 16..].as_mut_ptr(),
+                    cr_full[j1 * 16..].as_mut_ptr(),
                 );
-            }
-
-            let block_row = j & 7;
-            let top = j < 8;
-            let dst_left = if top { &mut out[0] } else { &mut out[2] };
-            let dst_off = block_row * 8;
-            for i in 0..8 {
-                dst_left[dst_off + i] = y_row[i] as i16 - 128;
-            }
-
-            let dst_right = if top { &mut out[1] } else { &mut out[3] };
-            for i in 0..8 {
-                dst_right[dst_off + i] = y_row[8 + i] as i16 - 128;
             }
         }
 
@@ -265,6 +274,93 @@ pub mod color {
             let (y_l, cb_l, cr_l) = rgb16_to_ycc(consts, bias, r_l, g_l, b_l);
             let (y_h, cb_h, cr_h) = rgb16_to_ycc(consts, bias, r_h, g_h, b_h);
             vst1q_u8(outy, vcombine_u8(vmovn_u16(y_l), vmovn_u16(y_h)));
+            vst1q_u8(outcb, vcombine_u8(vmovn_u16(cb_l), vmovn_u16(cb_h)));
+            vst1q_u8(outcr, vcombine_u8(vmovn_u16(cr_l), vmovn_u16(cr_h)));
+        }
+    }
+
+    /// # Safety
+    /// - `row0` and `row1` must each be readable for at least `16 * layout.bpp` bytes.
+    /// - `row*_y_left` and `row*_y_right` must each be writable for at least 8 `i16`s.
+    /// - `row*_cb` and `row*_cr` must each be writable for at least 16 bytes.
+    /// - `layout.bpp` must be 3 or 4.
+    /// - `target_arch = "aarch64"` guarantees NEON is available.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn rgb_row_16_pair_to_luma_blocks_inner(
+        row0: *const u8,
+        row1: *const u8,
+        layout: PixelLayout,
+        row0_y_left: *mut i16,
+        row0_y_right: *mut i16,
+        row1_y_left: *mut i16,
+        row1_y_right: *mut i16,
+        row0_cb: *mut u8,
+        row0_cr: *mut u8,
+        row1_cb: *mut u8,
+        row1_cr: *mut u8,
+    ) {
+        unsafe {
+            let consts = vld1q_u16(CONSTS.as_ptr());
+            let bias = vdupq_n_u32(CHROMA_BIAS);
+            rgb_row_16_to_luma_blocks_with_consts(
+                row0,
+                layout,
+                consts,
+                bias,
+                row0_y_left,
+                row0_y_right,
+                row0_cb,
+                row0_cr,
+            );
+            rgb_row_16_to_luma_blocks_with_consts(
+                row1,
+                layout,
+                consts,
+                bias,
+                row1_y_left,
+                row1_y_right,
+                row1_cb,
+                row1_cr,
+            );
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn rgb_row_16_to_luma_blocks_with_consts(
+        inptr: *const u8,
+        layout: PixelLayout,
+        consts: uint16x8_t,
+        bias: uint32x4_t,
+        y_left: *mut i16,
+        y_right: *mut i16,
+        outcb: *mut u8,
+        outcr: *mut u8,
+    ) {
+        unsafe {
+            let (r, g, b) = if layout.bpp == 4 {
+                let p = vld4q_u8(inptr);
+                let ch = [p.0, p.1, p.2, p.3];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
+            } else {
+                let p = vld3q_u8(inptr);
+                let ch = [p.0, p.1, p.2];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
+            };
+            let r_l = vmovl_u8(vget_low_u8(r));
+            let g_l = vmovl_u8(vget_low_u8(g));
+            let b_l = vmovl_u8(vget_low_u8(b));
+            let r_h = vmovl_u8(vget_high_u8(r));
+            let g_h = vmovl_u8(vget_high_u8(g));
+            let b_h = vmovl_u8(vget_high_u8(b));
+            let (y_l, cb_l, cr_l) = rgb16_to_ycc(consts, bias, r_l, g_l, b_l);
+            let (y_h, cb_h, cr_h) = rgb16_to_ycc(consts, bias, r_h, g_h, b_h);
+
+            let level_shift = vdupq_n_s16(128);
+            let y_l = vsubq_s16(vreinterpretq_s16_u16(y_l), level_shift);
+            let y_h = vsubq_s16(vreinterpretq_s16_u16(y_h), level_shift);
+            vst1q_s16(y_left, y_l);
+            vst1q_s16(y_right, y_h);
+
             vst1q_u8(outcb, vcombine_u8(vmovn_u16(cb_l), vmovn_u16(cb_h)));
             vst1q_u8(outcr, vcombine_u8(vmovn_u16(cr_l), vmovn_u16(cr_h)));
         }
