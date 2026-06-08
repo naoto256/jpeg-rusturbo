@@ -179,6 +179,39 @@ pub mod encode {
     use crate::encode::quant;
     use crate::tables::Divisors;
 
+    /// Full-MCU RGB 4:4:4 front-half hook.
+    pub fn quantize_mcu_444_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(out.len() >= 3);
+
+        let mut y_blk = [0i16; 64];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        crate::color::extract_block_ycbcr_rgb_full(
+            pixels,
+            width,
+            x0,
+            y0,
+            &mut y_blk,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+
+        crate::arch::backend::dct::fdct_islow(&mut y_blk);
+        out[0] = quant::quantize_and_zigzag(&y_blk, div_luma);
+        crate::arch::backend::dct::fdct_islow(&mut cb_blk);
+        out[1] = quant::quantize_and_zigzag(&cb_blk, div_chroma);
+        crate::arch::backend::dct::fdct_islow(&mut cr_blk);
+        out[2] = quant::quantize_and_zigzag(&cr_blk, div_chroma);
+    }
+
     /// Full-MCU RGB 4:2:0 front-half hook.
     ///
     /// This scalar reference preserves the current staged behavior:
