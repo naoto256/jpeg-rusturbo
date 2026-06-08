@@ -48,6 +48,22 @@ pub mod encode {
         }
     }
 
+    /// Full-MCU RGB 4:2:2 front-half hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_422_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        crate::arch::scalar::encode::quantize_mcu_422_rgb_full(
+            pixels, width, x0, y0, div_luma, div_chroma, out,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn quantize_mcu_420_rgb_full_neon(
         pixels: &[u8],

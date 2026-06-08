@@ -134,6 +134,72 @@ pub mod encode {
         quantize_mcu_420_rgb_full_scalar_kernels(pixels, width, x0, y0, div_luma, div_chroma, out);
     }
 
+    /// Full-MCU RGB 4:2:2 front-half hook for x86_64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_422_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                return quantize_mcu_422_rgb_full_avx2(
+                    pixels, width, x0, y0, div_luma, div_chroma, out,
+                );
+            }
+        }
+        crate::arch::scalar::encode::quantize_mcu_422_rgb_full(
+            pixels, width, x0, y0, div_luma, div_chroma, out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_mcu_422_rgb_full_avx2(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            debug_assert!(x0 + 16 <= width);
+            debug_assert!(out.len() >= 4);
+
+            let stride = width as usize * RGB.bpp;
+            let mut cb_full = [0u8; 16 * 8];
+            let mut cr_full = [0u8; 16 * 8];
+
+            for j in 0..8usize {
+                let row = (y0 as usize + j) * stride + x0 as usize * RGB.bpp;
+                super::color::rgb24_16_avx2_to_luma_blocks(
+                    pixels.as_ptr().add(row),
+                    RGB,
+                    (*out.as_mut_ptr()).as_mut_ptr().add(j * 8),
+                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j * 8),
+                    cb_full[j * 16..].as_mut_ptr(),
+                    cr_full[j * 16..].as_mut_ptr(),
+                );
+            }
+
+            let mut cb_blk = [0i16; 64];
+            let mut cr_blk = [0i16; 64];
+            super::color::h2v1_downsample(&cb_full, &mut cb_blk);
+            super::color::h2v1_downsample(&cr_full, &mut cr_blk);
+
+            fdct_quantize_zigzag::<true>(&mut out[0], div_luma);
+            fdct_quantize_zigzag::<true>(&mut out[1], div_luma);
+            fdct_quantize_zigzag_into::<true>(&mut cb_blk, div_chroma, &mut out[2]);
+            fdct_quantize_zigzag_into::<true>(&mut cr_blk, div_chroma, &mut out[3]);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx2")]
     unsafe fn quantize_mcu_420_rgb_full_avx2(
