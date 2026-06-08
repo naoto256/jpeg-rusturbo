@@ -9,8 +9,11 @@
 //!   - `ESC`: quit
 //!   - `P`: toggle progressive (SOF2) ↔ baseline (SOF0)
 //!   - `M`: toggle EXIF + ICC pass-through (synthetic small blobs)
+//!   - `S`: cycle subsampling 4:2:0 → 4:2:2 → 4:4:4
+//!   - `[` / `]`: decrease / increase JPEG quality by 5
+//!   - `<` / `>`: cycle FPS cap (uncapped / 30 / 60 / 120 / 250)
 //!
-//! Both toggles affect the *encoder* only — the decode path is
+//! All toggles affect the *encoder* only — the decode path is
 //! identical, so a visual divergence between modes would indicate
 //! an encoder bug.
 //!
@@ -22,6 +25,7 @@ use std::time::Instant;
 
 const W: usize = 1280;
 const H: usize = 720;
+const FPS_CAPS: [Option<usize>; 5] = [None, Some(30), Some(60), Some(120), Some(250)];
 
 fn main() {
     let mut window = Window::new(
@@ -31,7 +35,8 @@ fn main() {
         WindowOptions::default(),
     )
     .unwrap();
-    window.set_target_fps(60);
+    let mut fps_cap_idx = 2usize;
+    apply_fps_cap(&mut window, FPS_CAPS[fps_cap_idx]);
 
     let mut rgb = vec![0u8; W * H * 3];
     let mut buf = vec![0u32; W * H];
@@ -48,8 +53,15 @@ fn main() {
     // encoder bug rather than a UI sync issue.
     let mut progressive = false;
     let mut with_metadata = false;
+    let mut subsampling = ChromaSubsampling::Yuv420;
+    let mut quality = 80u8;
     let mut prev_p = false;
     let mut prev_m = false;
+    let mut prev_s = false;
+    let mut prev_lbracket = false;
+    let mut prev_rbracket = false;
+    let mut prev_comma = false;
+    let mut prev_period = false;
     // Small synthetic EXIF + ICC blobs; the encoder routes them
     // through as APP1 / APP2 segments without parsing.
     let exif: Vec<u8> = b"II\x2A\x00\x08\x00\x00\x00\x00\x00\x00\x00".to_vec();
@@ -68,6 +80,37 @@ fn main() {
             with_metadata = !with_metadata;
         }
         prev_m = m_now;
+        let s_now = window.is_key_down(Key::S);
+        if s_now && !prev_s {
+            subsampling = next_subsampling(subsampling);
+        }
+        prev_s = s_now;
+        let lbracket_now = window.is_key_down(Key::LeftBracket);
+        if lbracket_now && !prev_lbracket {
+            quality = quality.saturating_sub(5).max(1);
+        }
+        prev_lbracket = lbracket_now;
+        let rbracket_now = window.is_key_down(Key::RightBracket);
+        if rbracket_now && !prev_rbracket {
+            quality = quality.saturating_add(5).min(100);
+        }
+        prev_rbracket = rbracket_now;
+        let comma_now = window.is_key_down(Key::Comma);
+        if comma_now && !prev_comma {
+            fps_cap_idx = if fps_cap_idx == 0 {
+                FPS_CAPS.len() - 1
+            } else {
+                fps_cap_idx - 1
+            };
+            apply_fps_cap(&mut window, FPS_CAPS[fps_cap_idx]);
+        }
+        prev_comma = comma_now;
+        let period_now = window.is_key_down(Key::Period);
+        if period_now && !prev_period {
+            fps_cap_idx = (fps_cap_idx + 1) % FPS_CAPS.len();
+            apply_fps_cap(&mut window, FPS_CAPS[fps_cap_idx]);
+        }
+        prev_period = period_now;
 
         let phase = frame as f32 * 0.04;
         render(&mut rgb, W as u32, H as u32, phase);
@@ -75,8 +118,8 @@ fn main() {
         // ---- Encode (q=80 4:2:0, mode-dependent) ----
         let t0 = Instant::now();
         jpeg.clear();
-        let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
-        enc.set_subsampling(ChromaSubsampling::Yuv420);
+        let mut enc = JpegEncoder::new_with_quality(&mut jpeg, quality);
+        enc.set_subsampling(subsampling);
         enc.set_progressive(progressive);
         if with_metadata {
             enc.set_exif(Some(exif.clone()));
@@ -106,11 +149,13 @@ fn main() {
                 (true, true) => "progressive+meta",
             };
             window.set_title(&format!(
-                "jpeg-rusturbo [{mode}] (P/M toggle): enc {:.2} ms · dec {:.2} ms · JPEG {} KB ({} fps cap 60)",
+                "jpeg-rusturbo [{mode} {} q={quality}] (P/M/S/[ ]/<>): enc {:.2} ms · dec {:.2} ms · JPEG {} KB ({} fps / {})",
+                subsampling_label(subsampling),
                 t_enc_sum / n,
                 t_dec_sum / n,
                 jpeg.len() / 1024,
                 (n / last_report.elapsed().as_secs_f64()) as u32,
+                fps_cap_label(FPS_CAPS[fps_cap_idx]),
             ));
             t_enc_sum = 0.0;
             t_dec_sum = 0.0;
@@ -119,6 +164,37 @@ fn main() {
         }
         window.update_with_buffer(&buf, W, H).unwrap();
         frame = frame.wrapping_add(1);
+    }
+}
+
+fn apply_fps_cap(window: &mut Window, cap: Option<usize>) {
+    window.set_target_fps(cap.unwrap_or(0));
+}
+
+fn fps_cap_label(cap: Option<usize>) -> &'static str {
+    match cap {
+        None => "uncapped",
+        Some(30) => "cap 30 fps",
+        Some(60) => "cap 60 fps",
+        Some(120) => "cap 120 fps",
+        Some(250) => "cap 250 fps",
+        Some(_) => "cap custom fps",
+    }
+}
+
+fn next_subsampling(subsampling: ChromaSubsampling) -> ChromaSubsampling {
+    match subsampling {
+        ChromaSubsampling::Yuv420 => ChromaSubsampling::Yuv422,
+        ChromaSubsampling::Yuv422 => ChromaSubsampling::Yuv444,
+        ChromaSubsampling::Yuv444 => ChromaSubsampling::Yuv420,
+    }
+}
+
+fn subsampling_label(subsampling: ChromaSubsampling) -> &'static str {
+    match subsampling {
+        ChromaSubsampling::Yuv420 => "4:2:0",
+        ChromaSubsampling::Yuv422 => "4:2:2",
+        ChromaSubsampling::Yuv444 => "4:4:4",
     }
 }
 
