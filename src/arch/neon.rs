@@ -28,6 +28,22 @@ pub mod encode {
     use crate::color::RGB;
     use crate::tables::Divisors;
 
+    /// Full-MCU RGB 4:4:4 front-half hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_mcu_444_rgb_full(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        unsafe {
+            quantize_mcu_444_rgb_full_neon(pixels, width, x0, y0, div_luma, div_chroma, out);
+        }
+    }
+
     /// Full-MCU RGB 4:2:0 front-half hook for aarch64.
     ///
     /// Mirrors the x86_64 hook shape and keeps SIMD details behind the
@@ -62,6 +78,38 @@ pub mod encode {
         unsafe {
             quantize_mcu_422_rgb_full_neon(pixels, width, x0, y0, div_luma, div_chroma, out);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quantize_mcu_444_rgb_full_neon(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(x0 + 8 <= width);
+        debug_assert!(out.len() >= 3);
+
+        let stride = width as usize * RGB.bpp;
+        for j in 0..8usize {
+            let row = (y0 as usize + j) * stride + x0 as usize * RGB.bpp;
+            unsafe {
+                super::color::rgb_row_8_to_blocks_inner(
+                    pixels.as_ptr().add(row),
+                    RGB,
+                    out[0].as_mut_ptr().add(j * 8),
+                    out[1].as_mut_ptr().add(j * 8),
+                    out[2].as_mut_ptr().add(j * 8),
+                );
+            }
+        }
+
+        fdct_quantize_zigzag(&mut out[0], div_luma);
+        fdct_quantize_zigzag(&mut out[1], div_chroma);
+        fdct_quantize_zigzag(&mut out[2], div_chroma);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -253,6 +301,45 @@ pub mod color {
                     cr.as_mut_ptr(),
                 );
             }
+        }
+    }
+
+    /// # Safety
+    /// - `inptr` must be readable for at least `8 * layout.bpp` bytes.
+    /// - `outy`, `outcb`, `outcr` must each be writable for at least 8 `i16`s.
+    /// - `layout.bpp` must be 3 or 4.
+    /// - `target_arch = "aarch64"` guarantees NEON is available.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn rgb_row_8_to_blocks_inner(
+        inptr: *const u8,
+        layout: PixelLayout,
+        outy: *mut i16,
+        outcb: *mut i16,
+        outcr: *mut i16,
+    ) {
+        unsafe {
+            let consts = vld1q_u16(CONSTS.as_ptr());
+            let bias = vdupq_n_u32(CHROMA_BIAS);
+            let (r, g, b) = if layout.bpp == 4 {
+                let p = vld4_u8(inptr);
+                let ch = [p.0, p.1, p.2, p.3];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
+            } else {
+                let p = vld3_u8(inptr);
+                let ch = [p.0, p.1, p.2];
+                (ch[layout.r_off], ch[layout.g_off], ch[layout.b_off])
+            };
+            let r = vmovl_u8(r);
+            let g = vmovl_u8(g);
+            let b = vmovl_u8(b);
+            let (y, cb, cr) = rgb16_to_ycc(consts, bias, r, g, b);
+            let level_shift = vdupq_n_s16(128);
+            let y = vsubq_s16(vreinterpretq_s16_u16(y), level_shift);
+            let cb = vsubq_s16(vreinterpretq_s16_u16(cb), level_shift);
+            let cr = vsubq_s16(vreinterpretq_s16_u16(cr), level_shift);
+            vst1q_s16(outy, y);
+            vst1q_s16(outcb, cb);
+            vst1q_s16(outcr, cr);
         }
     }
 

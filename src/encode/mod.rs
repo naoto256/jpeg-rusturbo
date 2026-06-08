@@ -1381,18 +1381,41 @@ impl SamplingScheme for Yuv444Scheme {
         cb_blocks: &mut Vec<[i16; 64]>,
         cr_blocks: &mut Vec<[i16; 64]>,
     ) {
-        let mut y = [0i16; 64];
-        let mut cb = [0i16; 64];
-        let mut cr = [0i16; 64];
-        extract_block_ycbcr_rgb(
-            pixels, width, height, layout, mx, my, &mut y, &mut cb, &mut cr,
-        );
-        arch::backend::dct::fdct_islow(&mut y);
-        y_blocks.push(quant::quantize_and_zigzag(&y, div_luma));
-        arch::backend::dct::fdct_islow(&mut cb);
-        cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
-        arch::backend::dct::fdct_islow(&mut cr);
-        cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut blocks = [[0i16; 64]; 3];
+            quantize_mcu_444_rgb(
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
+                div_luma,
+                div_chroma,
+                &mut blocks,
+            );
+            y_blocks.push(blocks[0]);
+            cb_blocks.push(blocks[1]);
+            cr_blocks.push(blocks[2]);
+            return;
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut y = [0i16; 64];
+            let mut cb = [0i16; 64];
+            let mut cr = [0i16; 64];
+            extract_block_ycbcr_rgb(
+                pixels, width, height, layout, mx, my, &mut y, &mut cb, &mut cr,
+            );
+            arch::backend::dct::fdct_islow(&mut y);
+            y_blocks.push(quant::quantize_and_zigzag(&y, div_luma));
+            arch::backend::dct::fdct_islow(&mut cb);
+            cb_blocks.push(quant::quantize_and_zigzag(&cb, div_chroma));
+            arch::backend::dct::fdct_islow(&mut cr);
+            cr_blocks.push(quant::quantize_and_zigzag(&cr, div_chroma));
+        }
     }
 
     fn encode_one_mcu<W: Write>(
@@ -1411,38 +1434,61 @@ impl SamplingScheme for Yuv444Scheme {
         dc_chroma: &HuffmanTable,
         ac_chroma: &HuffmanTable,
     ) -> io::Result<()> {
-        let mut y_blk = [0i16; 64];
-        let mut cb_blk = [0i16; 64];
-        let mut cr_blk = [0i16; 64];
-        extract_block_ycbcr_rgb(
-            pixels,
-            width,
-            height,
-            layout,
-            mx,
-            my,
-            &mut y_blk,
-            &mut cb_blk,
-            &mut cr_blk,
-        );
-        prev_dc.y = encode_one_block(bw, &mut y_blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
-        prev_dc.cb = encode_one_block(
-            bw,
-            &mut cb_blk,
-            div_chroma,
-            prev_dc.cb,
-            dc_chroma,
-            ac_chroma,
-        )?;
-        prev_dc.cr = encode_one_block(
-            bw,
-            &mut cr_blk,
-            div_chroma,
-            prev_dc.cr,
-            dc_chroma,
-            ac_chroma,
-        )?;
-        Ok(())
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut blocks = [[0i16; 64]; 3];
+            quantize_mcu_444_rgb(
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
+                div_luma,
+                div_chroma,
+                &mut blocks,
+            );
+            prev_dc.y = encode_block(bw, &blocks[0], prev_dc.y, dc_luma, ac_luma)?;
+            prev_dc.cb = encode_block(bw, &blocks[1], prev_dc.cb, dc_chroma, ac_chroma)?;
+            prev_dc.cr = encode_block(bw, &blocks[2], prev_dc.cr, dc_chroma, ac_chroma)?;
+            return Ok(());
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut y_blk = [0i16; 64];
+            let mut cb_blk = [0i16; 64];
+            let mut cr_blk = [0i16; 64];
+            extract_block_ycbcr_rgb(
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
+                &mut y_blk,
+                &mut cb_blk,
+                &mut cr_blk,
+            );
+            prev_dc.y = encode_one_block(bw, &mut y_blk, div_luma, prev_dc.y, dc_luma, ac_luma)?;
+            prev_dc.cb = encode_one_block(
+                bw,
+                &mut cb_blk,
+                div_chroma,
+                prev_dc.cb,
+                dc_chroma,
+                ac_chroma,
+            )?;
+            prev_dc.cr = encode_one_block(
+                bw,
+                &mut cr_blk,
+                div_chroma,
+                prev_dc.cr,
+                dc_chroma,
+                ac_chroma,
+            )?;
+            Ok(())
+        }
     }
 
     fn quantize_one_mcu(
@@ -1456,23 +1502,34 @@ impl SamplingScheme for Yuv444Scheme {
         div_chroma: &Divisors,
         out: &mut [[i16; 64]],
     ) {
-        let mut y_blk = [0i16; 64];
-        let mut cb_blk = [0i16; 64];
-        let mut cr_blk = [0i16; 64];
-        extract_block_ycbcr_rgb(
-            pixels,
-            width,
-            height,
-            layout,
-            mx,
-            my,
-            &mut y_blk,
-            &mut cb_blk,
-            &mut cr_blk,
-        );
-        out[0] = quantize_block(&mut y_blk, div_luma);
-        out[1] = quantize_block(&mut cb_blk, div_chroma);
-        out[2] = quantize_block(&mut cr_blk, div_chroma);
+        #[cfg(target_arch = "aarch64")]
+        {
+            quantize_mcu_444_rgb(
+                pixels, width, height, layout, mx, my, div_luma, div_chroma, out,
+            );
+            return;
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut y_blk = [0i16; 64];
+            let mut cb_blk = [0i16; 64];
+            let mut cr_blk = [0i16; 64];
+            extract_block_ycbcr_rgb(
+                pixels,
+                width,
+                height,
+                layout,
+                mx,
+                my,
+                &mut y_blk,
+                &mut cb_blk,
+                &mut cr_blk,
+            );
+            out[0] = quantize_block(&mut y_blk, div_luma);
+            out[1] = quantize_block(&mut cb_blk, div_chroma);
+            out[2] = quantize_block(&mut cr_blk, div_chroma);
+        }
     }
 }
 
@@ -2097,6 +2154,46 @@ fn quantize_one_mcu_420_rgb(
     out: &mut [[i16; 64]],
 ) {
     quantize_mcu_420_rgb(pixels, width, height, mx, my, div_luma, div_chroma, out);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn quantize_mcu_444_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    mx: u32,
+    my: u32,
+    div_luma: &Divisors,
+    div_chroma: &Divisors,
+    out: &mut [[i16; 64]],
+) {
+    let x0 = mx * Yuv444Scheme::MCU_W;
+    let y0 = my * Yuv444Scheme::MCU_H;
+    if layout == RGB && x0 + Yuv444Scheme::MCU_W <= width && y0 + Yuv444Scheme::MCU_H <= height {
+        arch::backend::encode::quantize_mcu_444_rgb_full(
+            pixels, width, x0, y0, div_luma, div_chroma, out,
+        );
+    } else {
+        let mut y_blk = [0i16; 64];
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        extract_block_ycbcr_rgb(
+            pixels,
+            width,
+            height,
+            layout,
+            mx,
+            my,
+            &mut y_blk,
+            &mut cb_blk,
+            &mut cr_blk,
+        );
+        out[0] = quantize_block(&mut y_blk, div_luma);
+        out[1] = quantize_block(&mut cb_blk, div_chroma);
+        out[2] = quantize_block(&mut cr_blk, div_chroma);
+    }
 }
 
 /// Parallel front half of the threaded scan: for each MCU row, color
