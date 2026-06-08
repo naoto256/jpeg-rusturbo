@@ -206,11 +206,15 @@ pub mod encode {
 
                 downsample_chroma_pair(cb0, cb1, cb_blk.as_mut_ptr().add(pair * 8));
                 downsample_chroma_pair(cr0, cr1, cr_blk.as_mut_ptr().add(pair * 8));
+
+                if pair == 3 {
+                    fdct_quantize_zigzag::<true>(&mut out[0], div_luma);
+                    fdct_quantize_zigzag::<true>(&mut out[1], div_luma);
+                }
             }
 
-            for block in &mut out[..4] {
-                fdct_quantize_zigzag::<true>(block, div_luma);
-            }
+            fdct_quantize_zigzag::<true>(&mut out[2], div_luma);
+            fdct_quantize_zigzag::<true>(&mut out[3], div_luma);
             fdct_quantize_zigzag_into::<true>(&mut cb_blk, div_chroma, &mut out[4]);
             fdct_quantize_zigzag_into::<true>(&mut cr_blk, div_chroma, &mut out[5]);
         }
