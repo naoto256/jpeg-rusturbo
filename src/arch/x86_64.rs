@@ -190,12 +190,20 @@ pub mod encode {
             let start = row_off + x0 as usize * RGB.bpp;
             let src = &pixels[start..start + 16 * RGB.bpp];
             let off = j * 16;
+            let block_row = j & 7;
+            let top = j < 8;
+            let dst_off = block_row * 8;
             if AVX2 {
                 unsafe {
-                    super::color::rgb24_16_avx2(
+                    let left_idx = if top { 0 } else { 2 };
+                    let right_idx = left_idx + 1;
+                    let y_left = (*out.as_mut_ptr().add(left_idx)).as_mut_ptr().add(dst_off);
+                    let y_right = (*out.as_mut_ptr().add(right_idx)).as_mut_ptr().add(dst_off);
+                    super::color::rgb24_16_avx2_to_luma_blocks(
                         src.as_ptr(),
                         RGB,
-                        y_row.as_mut_ptr(),
+                        y_left,
+                        y_right,
                         cb_full[off..].as_mut_ptr(),
                         cr_full[off..].as_mut_ptr(),
                     );
@@ -209,19 +217,15 @@ pub mod encode {
                     &mut cb_full[off..off + 16],
                     &mut cr_full[off..off + 16],
                 );
-            }
+                let dst_left = if top { &mut out[0] } else { &mut out[2] };
+                for i in 0..8 {
+                    dst_left[dst_off + i] = y_row[i] as i16 - 128;
+                }
 
-            let block_row = j & 7;
-            let top = j < 8;
-            let dst_left = if top { &mut out[0] } else { &mut out[2] };
-            let dst_off = block_row * 8;
-            for i in 0..8 {
-                dst_left[dst_off + i] = y_row[i] as i16 - 128;
-            }
-
-            let dst_right = if top { &mut out[1] } else { &mut out[3] };
-            for i in 0..8 {
-                dst_right[dst_off + i] = y_row[8 + i] as i16 - 128;
+                let dst_right = if top { &mut out[1] } else { &mut out[3] };
+                for i in 0..8 {
+                    dst_right[dst_off + i] = y_row[8 + i] as i16 - 128;
+                }
             }
         }
 
@@ -644,7 +648,44 @@ pub mod color {
         cr: *mut u8,
     ) {
         unsafe {
-            // Build interleaved-pair ymm registers used by every component.
+            let (y_u16, cb_u16, cr_u16) = compute_ycc_from_rgb16(r_u16, g_u16, b_u16);
+            pack_and_store_u16x16(y_u16, y);
+            pack_and_store_u16x16(cb_u16, cb);
+            pack_and_store_u16x16(cr_u16, cr);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn ycc_from_rgb16_to_luma_blocks(
+        r_u16: __m256i,
+        g_u16: __m256i,
+        b_u16: __m256i,
+        y_left: *mut i16,
+        y_right: *mut i16,
+        cb: *mut u8,
+        cr: *mut u8,
+    ) {
+        unsafe {
+            let (y_u16, cb_u16, cr_u16) = compute_ycc_from_rgb16(r_u16, g_u16, b_u16);
+            let y_signed = _mm256_sub_epi16(y_u16, _mm256_set1_epi16(128));
+            _mm_storeu_si128(y_left as *mut __m128i, _mm256_castsi256_si128(y_signed));
+            _mm_storeu_si128(
+                y_right as *mut __m128i,
+                _mm256_extracti128_si256::<1>(y_signed),
+            );
+
+            pack_and_store_u16x16(cb_u16, cb);
+            pack_and_store_u16x16(cr_u16, cr);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compute_ycc_from_rgb16(
+        r_u16: __m256i,
+        g_u16: __m256i,
+        b_u16: __m256i,
+    ) -> (__m256i, __m256i, __m256i) {
+        unsafe {
             let rg_lo = _mm256_unpacklo_epi16(r_u16, g_u16);
             let rg_hi = _mm256_unpackhi_epi16(r_u16, g_u16);
             let bg_lo = _mm256_unpacklo_epi16(b_u16, g_u16);
@@ -653,15 +694,13 @@ pub mod color {
             // 0.5 * B and 0.5 * R via the (zero,X) interleave + >>1
             // trick: unpacklo_wd(0, B) places each B[i] in the high 16
             // bits of a u32 lane (= B[i] << 16); then srli 1 gives
-            // B[i] << 15 = B[i] * 32768, which is what F_0_500 would do
-            // if it fit in i16.
+            // B[i] << 15 = B[i] * 32768.
             let zero = _mm256_setzero_si256();
             let half_b_lo = _mm256_srli_epi32::<1>(_mm256_unpacklo_epi16(zero, b_u16));
             let half_b_hi = _mm256_srli_epi32::<1>(_mm256_unpackhi_epi16(zero, b_u16));
             let half_r_lo = _mm256_srli_epi32::<1>(_mm256_unpacklo_epi16(zero, r_u16));
             let half_r_hi = _mm256_srli_epi32::<1>(_mm256_unpackhi_epi16(zero, r_u16));
 
-            // Constants
             let c_y_rg = _mm256_loadu_si256(PW_F0299_F0337.0.as_ptr() as *const __m256i);
             let c_y_bg = _mm256_loadu_si256(PW_F0114_F0250.0.as_ptr() as *const __m256i);
             let c_cb_rg = _mm256_loadu_si256(PW_MF016_MF033.0.as_ptr() as *const __m256i);
@@ -669,21 +708,12 @@ pub mod color {
             let bias_y = _mm256_loadu_si256(PD_ONEHALF.0.as_ptr() as *const __m256i);
             let bias_cbcr = _mm256_loadu_si256(PD_ONEHALFM1_CJ.0.as_ptr() as *const __m256i);
 
-            // Y: madd(R,G; F_0_299, F_0_337) + madd(B,G; F_0_114, F_0_250) + 0.5
-            //    The (B, G) madd is the "extra" term.
             let y_extra_lo = _mm256_madd_epi16(bg_lo, c_y_bg);
             let y_extra_hi = _mm256_madd_epi16(bg_hi, c_y_bg);
             let y_u16 = finalize_component(rg_lo, rg_hi, c_y_rg, y_extra_lo, y_extra_hi, bias_y);
-
-            // Cb: madd(R,G; -F_0_168, -F_0_331) + 0.5*B + bias
             let cb_u16 = finalize_component(rg_lo, rg_hi, c_cb_rg, half_b_lo, half_b_hi, bias_cbcr);
-
-            // Cr: madd(B,G; -F_0_081, -F_0_418) + 0.5*R + bias
             let cr_u16 = finalize_component(bg_lo, bg_hi, c_cr_bg, half_r_lo, half_r_hi, bias_cbcr);
-
-            pack_and_store_u16x16(y_u16, y);
-            pack_and_store_u16x16(cb_u16, cb);
-            pack_and_store_u16x16(cr_u16, cr);
+            (y_u16, cb_u16, cr_u16)
         }
     }
 
@@ -741,6 +771,44 @@ pub mod color {
             let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
 
             ycc_from_rgb16(r_u16, g_u16, b_u16, y, cb, cr);
+
+            _mm256_zeroupper();
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn rgb24_16_avx2_to_luma_blocks(
+        pixels: *const u8,
+        layout: PixelLayout,
+        y_left: *mut i16,
+        y_right: *mut i16,
+        cb: *mut u8,
+        cr: *mut u8,
+    ) {
+        unsafe {
+            #[rustfmt::skip]
+            let m_a = _mm_setr_epi8(
+                0, 1, 2, -128, 3, 4, 5, -128,
+                6, 7, 8, -128, 9, 10, 11, -128,
+            );
+            #[rustfmt::skip]
+            let m_b = _mm_setr_epi8(
+                4, 5, 6, -128, 7, 8, 9, -128,
+                10, 11, 12, -128, 13, 14, 15, -128,
+            );
+
+            let lo0 = _mm_loadu_si128(pixels as *const __m128i);
+            let hi0 = _mm_loadu_si128(pixels.add(12) as *const __m128i);
+            let v0 = _mm256_set_m128i(hi0, lo0);
+            let p0 = _mm256_shuffle_epi8(v0, _mm256_set_m128i(m_a, m_a));
+
+            let lo1 = _mm_loadu_si128(pixels.add(24) as *const __m128i);
+            let hi1 = _mm_loadu_si128(pixels.add(32) as *const __m128i);
+            let v1 = _mm256_set_m128i(hi1, lo1);
+            let p1 = _mm256_shuffle_epi8(v1, _mm256_set_m128i(m_b, m_a));
+
+            let (r_u16, g_u16, b_u16) = deinterleave_pixels16(p0, p1, layout);
+            ycc_from_rgb16_to_luma_blocks(r_u16, g_u16, b_u16, y_left, y_right, cb, cr);
 
             _mm256_zeroupper();
         }
