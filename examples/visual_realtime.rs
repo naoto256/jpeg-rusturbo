@@ -12,6 +12,7 @@
 //!   - `S`: cycle subsampling 4:2:0 → 4:2:2 → 4:4:4
 //!   - `[` / `]`: decrease / increase JPEG quality by 5
 //!   - `<` / `>`: cycle FPS cap (uncapped / 30 / 60 / 120 / 250)
+//!   - `T`: toggle encoder threads 1 ↔ auto
 //!
 //! All toggles affect the *encoder* only — the decode path is
 //! identical, so a visual divergence between modes would indicate
@@ -62,6 +63,8 @@ fn main() {
     let mut prev_rbracket = false;
     let mut prev_comma = false;
     let mut prev_period = false;
+    let mut prev_t = false;
+    let mut threads = 1u32;
     // Small synthetic EXIF + ICC blobs; the encoder routes them
     // through as APP1 / APP2 segments without parsing.
     let exif: Vec<u8> = b"II\x2A\x00\x08\x00\x00\x00\x00\x00\x00\x00".to_vec();
@@ -111,6 +114,11 @@ fn main() {
             apply_fps_cap(&mut window, FPS_CAPS[fps_cap_idx]);
         }
         prev_period = period_now;
+        let t_now = window.is_key_down(Key::T);
+        if t_now && !prev_t {
+            threads = if threads == 1 { 0 } else { 1 };
+        }
+        prev_t = t_now;
 
         let phase = frame as f32 * 0.04;
         render(&mut rgb, W as u32, H as u32, phase);
@@ -120,6 +128,7 @@ fn main() {
         jpeg.clear();
         let mut enc = JpegEncoder::new_with_quality(&mut jpeg, quality);
         enc.set_subsampling(subsampling);
+        enc.set_threads(threads);
         enc.set_progressive(progressive);
         if with_metadata {
             enc.set_exif(Some(exif.clone()));
@@ -149,8 +158,9 @@ fn main() {
                 (true, true) => "progressive+meta",
             };
             window.set_title(&format!(
-                "jpeg-rusturbo [{mode} {} q={quality}] (P/M/S/[ ]/<>): enc {:.2} ms · dec {:.2} ms · JPEG {} KB ({} fps / {})",
+                "jpeg-rusturbo [{mode} {} q={quality} {}] (P/M/S/T/[ ]/<>): enc {:.2} ms · dec {:.2} ms · JPEG {} KB ({} fps / {})",
                 subsampling_label(subsampling),
+                threads_label(threads),
                 t_enc_sum / n,
                 t_dec_sum / n,
                 jpeg.len() / 1024,
@@ -196,6 +206,10 @@ fn subsampling_label(subsampling: ChromaSubsampling) -> &'static str {
         ChromaSubsampling::Yuv422 => "4:2:2",
         ChromaSubsampling::Yuv444 => "4:4:4",
     }
+}
+
+fn threads_label(threads: u32) -> &'static str {
+    if threads == 0 { "t=auto" } else { "t=1" }
 }
 
 /// Animated procedural scene: gradient sky, color bars, an orbiting

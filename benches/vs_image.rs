@@ -91,10 +91,18 @@ fn time_us<F: FnMut()>(mut f: F) -> f64 {
     elapsed.as_secs_f64() * 1e6 / ITER as f64
 }
 
-fn encode_with_ours(rgb: &[u8], w: u32, h: u32, q: u8, sub: ChromaSubsampling) -> Vec<u8> {
+fn encode_with_ours(
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    q: u8,
+    sub: ChromaSubsampling,
+    threads: u32,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity((w as usize) * (h as usize));
     let mut enc = OurEncoder::new_with_quality(&mut out, q);
     enc.set_subsampling(sub);
+    enc.set_threads(threads);
     enc.encode_rgb(rgb, w, h).unwrap();
     out
 }
@@ -131,35 +139,37 @@ fn main() {
 
     println!();
     println!(
-        "jpeg-rusturbo vs image — {} iters per case (median of single timed batch)",
+        "jpeg-rusturbo vs image — {} iters per case (mean of single timed batch)",
         ITER
     );
 
-    // `image` crate's JPEG encoder is hardcoded to 4:2:0; we vary our side only
-    // for completeness. Ratio is meaningful only on the 4:2:0 row.
-    for &(sub_label, sub) in &[
-        ("4:4:4", ChromaSubsampling::Yuv444),
-        ("4:2:2", ChromaSubsampling::Yuv422),
-        ("4:2:0", ChromaSubsampling::Yuv420),
-    ] {
-        println!();
-        println!("=== Encode (q=80, ours={sub_label} | image=4:2:0 fixed) ===");
-        println!(
-            "{:<24}  {:>12}  {:>12}  {:>7}",
-            "case", "ours (us)", "image (us)", "ratio"
-        );
-        for &(label, w, h) in &cases {
-            let rgb = make_image(w, h);
-            let ours_us = time_us(|| {
-                let buf = encode_with_ours(&rgb, w, h, 80, sub);
-                std::hint::black_box(buf);
-            });
-            let theirs_us = time_us(|| {
-                let buf = encode_with_image(&rgb, w, h, 80);
-                std::hint::black_box(buf);
-            });
-            let ratio = theirs_us / ours_us;
-            println!("{label:<24}  {ours_us:>12.1}  {theirs_us:>12.1}  {ratio:>5.2}x",);
+    for &(thread_label, threads) in &[("threads=1", 1u32), ("threads=auto", 0u32)] {
+        // `image` crate's JPEG encoder is hardcoded to 4:2:0; we vary our side only
+        // for completeness. Ratio is meaningful only on the 4:2:0 row.
+        for &(sub_label, sub) in &[
+            ("4:4:4", ChromaSubsampling::Yuv444),
+            ("4:2:2", ChromaSubsampling::Yuv422),
+            ("4:2:0", ChromaSubsampling::Yuv420),
+        ] {
+            println!();
+            println!("=== Encode (q=80, {thread_label}, ours={sub_label} | image=4:2:0 fixed) ===");
+            println!(
+                "{:<24}  {:>12}  {:>12}  {:>7}",
+                "case", "ours (us)", "image (us)", "ratio"
+            );
+            for &(label, w, h) in &cases {
+                let rgb = make_image(w, h);
+                let ours_us = time_us(|| {
+                    let buf = encode_with_ours(&rgb, w, h, 80, sub, threads);
+                    std::hint::black_box(buf);
+                });
+                let theirs_us = time_us(|| {
+                    let buf = encode_with_image(&rgb, w, h, 80);
+                    std::hint::black_box(buf);
+                });
+                let ratio = theirs_us / ours_us;
+                println!("{label:<24}  {ours_us:>12.1}  {theirs_us:>12.1}  {ratio:>5.2}x",);
+            }
         }
     }
 
@@ -187,7 +197,7 @@ fn main() {
         );
         for &(label, w, h) in &cases {
             let rgb = corpus_fn(w, h);
-            let jpeg = encode_with_ours(&rgb, w, h, 80, ChromaSubsampling::Yuv420);
+            let jpeg = encode_with_ours(&rgb, w, h, 80, ChromaSubsampling::Yuv420, 1);
             let ours_us = time_us(|| {
                 let pixels = decode_with_ours(&jpeg);
                 std::hint::black_box(pixels);
