@@ -1200,13 +1200,77 @@ pub mod quant {
     }
 
     /// Permute `natural` (DCT natural order) into `zz` (zig-zag order).
-    /// AVX2 SIMD permutation would need cross-lane shuffles (the scatter
-    /// pattern is not lane-symmetric), so for now we route to the scalar
-    /// `get_unchecked` loop — which LLVM already 4×-unrolls into a tight
-    /// `ldp/ldrh × 4/strh × 4` block. Revisit if profiling shows this is
-    /// hot on x86_64.
     pub fn zigzag_scatter(natural: &[i16; 64], zz: &mut [i16; 64]) {
-        crate::arch::scalar::quant::zigzag_scatter(natural, zz)
+        macro_rules! z {
+            ($dst:literal, $src:literal) => {
+                zz[$dst] = natural[$src];
+            };
+        }
+
+        z!(0, 0);
+        z!(1, 1);
+        z!(2, 8);
+        z!(3, 16);
+        z!(4, 9);
+        z!(5, 2);
+        z!(6, 3);
+        z!(7, 10);
+        z!(8, 17);
+        z!(9, 24);
+        z!(10, 32);
+        z!(11, 25);
+        z!(12, 18);
+        z!(13, 11);
+        z!(14, 4);
+        z!(15, 5);
+        z!(16, 12);
+        z!(17, 19);
+        z!(18, 26);
+        z!(19, 33);
+        z!(20, 40);
+        z!(21, 48);
+        z!(22, 41);
+        z!(23, 34);
+        z!(24, 27);
+        z!(25, 20);
+        z!(26, 13);
+        z!(27, 6);
+        z!(28, 7);
+        z!(29, 14);
+        z!(30, 21);
+        z!(31, 28);
+        z!(32, 35);
+        z!(33, 42);
+        z!(34, 49);
+        z!(35, 56);
+        z!(36, 57);
+        z!(37, 50);
+        z!(38, 43);
+        z!(39, 36);
+        z!(40, 29);
+        z!(41, 22);
+        z!(42, 15);
+        z!(43, 23);
+        z!(44, 30);
+        z!(45, 37);
+        z!(46, 44);
+        z!(47, 51);
+        z!(48, 58);
+        z!(49, 59);
+        z!(50, 52);
+        z!(51, 45);
+        z!(52, 38);
+        z!(53, 31);
+        z!(54, 39);
+        z!(55, 46);
+        z!(56, 53);
+        z!(57, 60);
+        z!(58, 61);
+        z!(59, 54);
+        z!(60, 47);
+        z!(61, 55);
+        z!(62, 62);
+        z!(63, 63);
     }
 
     /// # Safety
