@@ -59,9 +59,9 @@ pub mod encode {
         div_chroma: &Divisors,
         out: &mut [[i16; 64]],
     ) {
-        crate::arch::scalar::encode::quantize_mcu_422_rgb_full(
-            pixels, width, x0, y0, div_luma, div_chroma, out,
-        );
+        unsafe {
+            quantize_mcu_422_rgb_full_neon(pixels, width, x0, y0, div_luma, div_chroma, out);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -130,6 +130,58 @@ pub mod encode {
         }
         fdct_quantize_zigzag_into(&mut cb_blk, div_chroma, &mut out[4]);
         fdct_quantize_zigzag_into(&mut cr_blk, div_chroma, &mut out[5]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quantize_mcu_422_rgb_full_neon(
+        pixels: &[u8],
+        width: u32,
+        x0: u32,
+        y0: u32,
+        div_luma: &Divisors,
+        div_chroma: &Divisors,
+        out: &mut [[i16; 64]],
+    ) {
+        debug_assert!(x0 + 16 <= width);
+        debug_assert!(out.len() >= 4);
+
+        let stride = width as usize * RGB.bpp;
+        let mut cb_full = [0u8; 16 * 8];
+        let mut cr_full = [0u8; 16 * 8];
+
+        for pair in 0..4usize {
+            let j0 = pair * 2;
+            let j1 = j0 + 1;
+
+            let row0 = (y0 as usize + j0) * stride + x0 as usize * RGB.bpp;
+            let row1 = (y0 as usize + j1) * stride + x0 as usize * RGB.bpp;
+
+            unsafe {
+                super::color::rgb_row_16_pair_to_luma_blocks_inner(
+                    pixels.as_ptr().add(row0),
+                    pixels.as_ptr().add(row1),
+                    RGB,
+                    (*out.as_mut_ptr()).as_mut_ptr().add(j0 * 8),
+                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j0 * 8),
+                    (*out.as_mut_ptr()).as_mut_ptr().add(j1 * 8),
+                    (*out.as_mut_ptr().add(1)).as_mut_ptr().add(j1 * 8),
+                    cb_full[j0 * 16..].as_mut_ptr(),
+                    cr_full[j0 * 16..].as_mut_ptr(),
+                    cb_full[j1 * 16..].as_mut_ptr(),
+                    cr_full[j1 * 16..].as_mut_ptr(),
+                );
+            }
+        }
+
+        let mut cb_blk = [0i16; 64];
+        let mut cr_blk = [0i16; 64];
+        super::color::h2v1_downsample(&cb_full, &mut cb_blk);
+        super::color::h2v1_downsample(&cr_full, &mut cr_blk);
+
+        fdct_quantize_zigzag(&mut out[0], div_luma);
+        fdct_quantize_zigzag(&mut out[1], div_luma);
+        fdct_quantize_zigzag_into(&mut cb_blk, div_chroma, &mut out[2]);
+        fdct_quantize_zigzag_into(&mut cr_blk, div_chroma, &mut out[3]);
     }
 
     fn fdct_quantize_zigzag(block: &mut [i16; 64], div: &Divisors) {
