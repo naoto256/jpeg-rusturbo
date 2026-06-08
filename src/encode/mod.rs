@@ -1381,7 +1381,7 @@ impl SamplingScheme for Yuv444Scheme {
         cb_blocks: &mut Vec<[i16; 64]>,
         cr_blocks: &mut Vec<[i16; 64]>,
     ) {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             let mut blocks = [[0i16; 64]; 3];
             quantize_mcu_444_rgb(
@@ -1401,7 +1401,7 @@ impl SamplingScheme for Yuv444Scheme {
             return;
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let mut y = [0i16; 64];
             let mut cb = [0i16; 64];
@@ -1434,7 +1434,7 @@ impl SamplingScheme for Yuv444Scheme {
         dc_chroma: &HuffmanTable,
         ac_chroma: &HuffmanTable,
     ) -> io::Result<()> {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             let mut blocks = [[0i16; 64]; 3];
             quantize_mcu_444_rgb(
@@ -1454,7 +1454,7 @@ impl SamplingScheme for Yuv444Scheme {
             return Ok(());
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let mut y_blk = [0i16; 64];
             let mut cb_blk = [0i16; 64];
@@ -1502,7 +1502,7 @@ impl SamplingScheme for Yuv444Scheme {
         div_chroma: &Divisors,
         out: &mut [[i16; 64]],
     ) {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             quantize_mcu_444_rgb(
                 pixels, width, height, layout, mx, my, div_luma, div_chroma, out,
@@ -1510,7 +1510,7 @@ impl SamplingScheme for Yuv444Scheme {
             return;
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let mut y_blk = [0i16; 64];
             let mut cb_blk = [0i16; 64];
@@ -2156,7 +2156,7 @@ fn quantize_one_mcu_420_rgb(
     quantize_mcu_420_rgb(pixels, width, height, mx, my, div_luma, div_chroma, out);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn quantize_mcu_444_rgb(
     pixels: &[u8],
